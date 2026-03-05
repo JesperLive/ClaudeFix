@@ -84,6 +84,13 @@ $script:CapturedClaudeExe = $null  # set in Step 1 from running process
 # -- Logging ---------------------------------------------------------
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 $LogFile = Join-Path $LogDir ("fix_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+
+# Clean up logs older than 30 days
+try {
+    Get-ChildItem $LogDir -Filter "fix_*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
 $script:LogLines = New-Object System.Collections.ArrayList
 
 function Log {

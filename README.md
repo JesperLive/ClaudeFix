@@ -133,9 +133,13 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 3 | Hibernate | Off | Incompatible with running Hyper-V VMs |
 | 4 | USB selective suspend | Disabled (AC) | Can interrupt VM communication channels |
 | 5 | Hard disk sleep + PCI-E | Never / Off (AC) | Prevents disk spin-down and link state changes during VM I/O |
-| 6 | Watchdog task | Every 5 minutes | Auto-restarts `CoworkVMService` if it dies while Claude is running |
-| 7 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
-| 8 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
+| 6 | Fast Startup | Disabled | Prevents kernel hibernate on shutdown -- services don't reinitialise cleanly |
+| 7 | Connected Standby | Disabled | Modern Standby can enter low-power states even with sleep "disabled" |
+| 8 | Network adapter power saving | Disabled | Prevents Windows from sleeping virtual network adapters used by Hyper-V |
+| 9 | Processor minimum state | 100% (AC) | Prevents CPU throttling that can starve the VM |
+| 10 | Watchdog task | Every 5 minutes | Auto-restarts `CoworkVMService` if it dies while Claude is running |
+| 11 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
+| 12 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
 
 Battery settings are not changed -- laptop users keep normal battery behaviour.
 
@@ -147,9 +151,19 @@ This catches cases where the service simply stops. Stale VirtioFS mounts still n
 
 Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`.
 
+### Fast Startup, Connected Standby, NIC Power Saving
+
+These three settings are the most commonly overlooked causes of VirtioFS failures:
+
+**Fast Startup** (step 6) -- With Fast Startup on, a Windows "shutdown" is actually a kernel hibernate. Services like `CoworkVMService` don't fully reinitialise on the next boot, which can leave stale VM state behind. Disabling hibernate (`powercfg /h off`) usually kills Fast Startup too, but the script also explicitly sets the `HiberbootEnabled` registry key to 0 for safety.
+
+**Connected Standby / Modern Standby** (step 7) -- On newer hardware (most laptops since ~2018, some desktops), Windows uses Modern Standby instead of traditional S3 sleep. Modern Standby can enter low-power states *even when sleep is "disabled"* in the power plan. Setting `CsEnabled = 0` in the registry forces traditional power behaviour. Requires a reboot.
+
+**Network adapter power saving** (step 8) -- Windows can put physical network adapters to sleep to save power. This also affects the virtual network switch that Hyper-V uses for the VM's network bridge. The script disables power saving on all physical adapters via `PnPCapabilities`, wake-on-LAN settings, and WMI power management properties. Requires a reboot.
+
 ### The Boot-Fix Task
 
-A scheduled task runs at every user logon as SYSTEM. It executes `Fix-ClaudeDesktop.ps1 -SkipLaunch -Quiet` to ensure the VM service starts cleanly before Claude tries to use it.
+A scheduled task runs at every user logon as the current user (elevated). It executes `Fix-ClaudeDesktop.ps1 -SkipLaunch -Quiet` to ensure the VM service starts cleanly before Claude tries to use it. It runs as your user account (not SYSTEM) so that it can find Claude's data in the correct `%APPDATA%` location.
 
 The prevention script auto-detects `Fix-ClaudeDesktop.ps1` in the same folder. If it can't find it, this step is skipped with a warning.
 
@@ -178,6 +192,28 @@ Restores your original power plan, re-enables hibernate, resets sleep to 30 minu
 
 ---
 
+## Troubleshooting
+
+**The fix script says "Workspace ready" but Cowork still shows an error**
+Try running the fix script a second time. Some stale states need two cycles to fully clear. If it persists after 2-3 runs, reboot and let the boot-fix task handle it.
+
+**"Service not found -- is Cowork installed?"**
+The `CoworkVMService` Windows service is only installed when you've used Cowork mode at least once. Open Claude Desktop, start a Cowork session, let it install the VM components, then run the scripts.
+
+**The prevention script asks for admin but I don't have it**
+The prevention script genuinely needs admin for power settings, scheduled tasks, and registry changes. The fix script can run without admin, but the prevention script cannot. Ask your IT department for temporary elevation, or have them run `Prevent-ClaudeIssues.bat` for you.
+
+**Connected Standby changes didn't take effect**
+This setting requires a full reboot (not just sleep/wake). Shut down, wait 10 seconds, power on. Verify with `powercfg /a` -- if it no longer lists "Standby (S0 Low Power Idle)" then Modern Standby is disabled.
+
+**Claude launches with a duplicate taskbar icon**
+This happens when an MSIX (Microsoft Store) app is launched via its `.exe` path directly instead of through the shell protocol. The fix script handles this automatically, but if you see it, make sure you're using the latest version of the fix script.
+
+**Logs are piling up in `%APPDATA%\Claude\fix-logs\`**
+The fix script auto-cleans logs older than 30 days. You can safely delete everything in that folder manually if needed.
+
+---
+
 ## File List
 
 ```
@@ -186,6 +222,7 @@ Fix-ClaudeDesktop.ps1       -- Fix script
 Prevent-ClaudeIssues.bat    -- Prevention launcher (run once)
 Prevent-ClaudeIssues.ps1    -- Prevention script
 README.md                   -- This file
+LICENSE                     -- MIT licence
 ```
 
 ---
