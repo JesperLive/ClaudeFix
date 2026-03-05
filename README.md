@@ -180,14 +180,31 @@ Battery settings are not changed -- laptop users keep normal battery behaviour.
 A persistent background process that starts at logon and polls every 30 seconds. It monitors seven sources for VirtioFS failures:
 
 1. **Claude log files** -- scans all `*.log` files in `%APPDATA%\Claude\logs\` for error patterns like "Plan9 mount failed" and "bad address"
-2. **Service status** -- detects when `CoworkVMService` stops while `claude.exe` is still running
-3. **Windows Event Log** -- checks for recent `CoworkVMService` errors, Hyper-V Worker warnings, and VMMS errors
-4. **WinNAT health** -- detects missing NAT rules and auto-repairs them (every 60 seconds)
-5. **Hyper-V heartbeat** -- monitors the VM's Integration Services heartbeat to detect hung VMs
-6. **VM log staleness** -- catches silent hangs where the VM stops writing logs (3 consecutive stale checks = trigger)
-7. **Clock drift** -- checks NTP drift every 5 minutes and auto-resyncs if >5 seconds
+2. **Service status** -- detects when `CoworkVMService` stops while `claude.exe` is still running (2 consecutive checks)
+3. **Windows Event Log** -- checks for Claude-specific `CoworkVMService` errors and Hyper-V Worker/VMMS errors (2 consecutive checks, Claude-only matching)
+4. **WinNAT health** -- detects missing NAT rules and auto-repairs them (every 60 seconds, warning only)
+5. **Hyper-V heartbeat** -- monitors the VM's Integration Services heartbeat to detect hung VMs (3 consecutive checks)
+6. **VM log staleness** -- catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if VM was previously active)
+7. **Clock drift** -- checks NTP drift every 5 minutes and auto-resyncs if >5 seconds (warning only)
 
-When a failure is detected, it automatically runs `Fix-ClaudeDesktop.ps1 -Quiet` to kill Claude, purge the VM cache, restart the service, and relaunch -- typically within 30 seconds of the error occurring. A 3-minute cooldown prevents rapid cycling.
+### Safety Features (v3.1)
+
+The entire toolkit is designed to **never interrupt active work** — whether you're in Chat, Cowork, or Code:
+
+- **Electron-aware activity detection** -- uses `GetWindowThreadProcessId` to correctly detect Claude's Electron renderer windows (the old `MainWindowHandle` comparison failed because Electron child processes own the visible window, not the main process)
+- **Session 0 safe** -- when running as a SYSTEM scheduled task (Session 0), Win32 window/input APIs return garbage. The monitor detects this and falls back to process-only heuristics (VM log + CPU sampling)
+- **CPU sampling** -- measures actual processor time on Claude processes over 500ms. Catches active request processing even when the UI is idle (e.g., Code thinking)
+- **Extended VM log window** -- activity check uses 120s window (was 30s). Code's "thinking" phases can leave the VM log quiet for minutes; the old 30s window caused false negatives
+- **User input window** -- 3 minutes (was 2). More buffer for reading/reviewing before auto-fix considers you idle
+- **Fix script activity guard** -- `Fix-ClaudeDesktop.ps1` itself now checks for active use when called with `-Quiet` (by the monitor or boot task). Three checks: CPU sampling, VM log, user input. Blocks and exits if anything is active. Manual runs (no `-Quiet`) always proceed
+- **Boot-fix 90s delay** -- the logon task now waits 90 seconds before running, preventing a race condition where it would kill Claude Desktop as it was auto-starting at logon
+- **Startup grace period** -- heuristic checks (event log, heartbeat, staleness) are skipped for the first 90 seconds after the monitor starts, preventing false triggers from pre-existing events
+- **Consecutive-check gates** -- every heuristic trigger requires multiple consecutive failures before firing (service: 2, event log: 2, heartbeat: 3, staleness: 5). Only the log-file pattern check (actual VirtioFS error strings) triggers immediately
+- **Tightened event log matching** -- Hyper-V VMMS events must mention "claude" or "cowork" (no generic "failed"/"unexpected" matching). Worker events: Critical/Error only
+- **VM log staleness requires prior activity** -- only triggers if the VM log was previously active this session, preventing false positives in Chat mode
+- **5-minute cooldown** -- between auto-fixes
+
+When a failure is detected **and the user is idle**, it automatically runs `Fix-ClaudeDesktop.ps1 -Quiet`. If the user is active, it logs a `BLOCKED` message and waits, telling you to run the fix manually when ready.
 
 The monitor also performs continuous maintenance: re-applying vmwp.exe AboveNormal priority on every cycle, and applying deferred Dynamic Memory changes when the VM is stopped.
 
@@ -207,7 +224,7 @@ These three settings are the most commonly overlooked causes of VirtioFS failure
 
 ### The Boot-Fix Task
 
-A scheduled task runs at every user logon as the current user (elevated). It executes `Fix-ClaudeDesktop.ps1 -SkipLaunch -Quiet` to ensure the VM service starts cleanly before Claude tries to use it. It runs as your user account (not SYSTEM) so that it can find Claude's data in the correct `%APPDATA%` location.
+A scheduled task runs at every user logon as the current user (elevated). It waits **90 seconds** (to let Claude Desktop auto-start first), then executes `Fix-ClaudeDesktop.ps1 -SkipLaunch -Quiet` to ensure the VM service starts cleanly. The Fix script's own activity guard provides a second layer of protection — if Claude is already running and active after the 90s delay, the fix is blocked and exits silently.
 
 The prevention script auto-detects `Fix-ClaudeDesktop.ps1` in the same folder. If it can't find it, this step is skipped with a warning.
 

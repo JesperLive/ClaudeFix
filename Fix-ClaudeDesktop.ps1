@@ -23,7 +23,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.1.0
+    Version : 4.2.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -66,7 +66,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.1.0"
+$Version         = "4.2.0"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -366,6 +366,70 @@ if ($WhatIfPreference) {
     Log "DRY RUN -- no changes will be made" -Colour Yellow
 }
 Write-Host ""
+
+# ====================================================================
+# SAFETY GATE -- Block when called by automation while user is active
+# ====================================================================
+# When -Quiet is set (called by health monitor or boot task), check if
+# Claude Desktop is actively in use. This prevents killing Claude while
+# the user is typing, Cowork is running, or Code is doing a task.
+# Manual runs (no -Quiet) always proceed -- user explicitly wants a fix.
+if ($Quiet) {
+    $ClaudeLogDir = Join-Path $ClaudeAppData "logs"
+    $isActive = $false
+
+    # Check 1: Any Claude process burning CPU (active request processing)
+    $claudeCheck = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    foreach ($cp in $claudeCheck) {
+        try {
+            $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds
+            Start-Sleep -Milliseconds 500
+            $cp.Refresh()
+            $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
+            if (($cpu2 - $cpu1) -gt 100) { $isActive = $true; break }
+        } catch {}
+    }
+
+    # Check 2: VM log active within 120s (Code may be thinking)
+    if (-not $isActive) {
+        $vmLog = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+        if (Test-Path $vmLog) {
+            $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
+            if ($ageSec -lt 120) { $isActive = $true }
+        }
+    }
+
+    # Check 3: User input within 3 minutes (interactive sessions only)
+    if (-not $isActive) {
+        try {
+            $sessionId = (Get-Process -Id $PID -ErrorAction Stop).SessionId
+            if ($sessionId -gt 0) {
+                Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FixActivityCheck {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+}
+'@
+                $lastInput = New-Object FixActivityCheck+LASTINPUTINFO
+                $lastInput.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($lastInput)
+                if ([FixActivityCheck]::GetLastInputInfo([ref]$lastInput)) {
+                    $idleMs = [Environment]::TickCount - $lastInput.dwTime
+                    if ($idleMs -lt 180000) { $isActive = $true }
+                }
+            }
+        } catch {}
+    }
+
+    if ($isActive) {
+        $msg = "BLOCKED: User/Code appears active -- skipping automated fix"
+        Log $msg -Colour Yellow
+        Save-Log
+        exit 0
+    }
+}
 
 # ====================================================================
 # STEP 1 -- Kill all Claude processes

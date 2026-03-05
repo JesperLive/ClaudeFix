@@ -903,8 +903,12 @@ if ($Undo) {
                 Unregister-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
+            # Wrap in a delayed command: wait 90s after logon before running fix.
+            # This prevents racing with Claude Desktop's own auto-start at logon.
+            # The Fix script also has its own activity guard (-Quiet mode) as a second layer.
+            $delayedCmd = "Start-Sleep -Seconds 90; & '$fixScript' -SkipLaunch -Quiet"
             $bootAction = New-ScheduledTaskAction -Execute "PowerShell.exe" `
-                              -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$fixScript`" -SkipLaunch -Quiet"
+                              -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$delayedCmd`""
 
             $bootTrigger = New-ScheduledTaskTrigger -AtLogOn
 
@@ -930,9 +934,9 @@ if ($Undo) {
                 -Description "Runs Fix-ClaudeDesktop at logon to ensure clean VM state after boot." `
                 -Force | Out-Null
 
-            Log "Boot-fix task created (runs at every logon)" -Colour Green -Indent
+            Log "Boot-fix task created (runs 90s after logon)" -Colour Green -Indent
             Log "Task: Task Scheduler > $TaskPath$BootTaskName" -Colour DarkGray -Indent
-            Log "Runs: $fixScript -SkipLaunch -Quiet" -Colour DarkGray -Indent
+            Log "Runs: $fixScript -SkipLaunch -Quiet (after 90s delay)" -Colour DarkGray -Indent
         } catch {
             Log "[!] Could not create boot task: $($_.Exception.Message)" -Colour Red -Indent
         }

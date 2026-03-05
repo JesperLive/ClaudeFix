@@ -15,8 +15,18 @@
     - VM log staleness (hung VM detection)
     - Host clock drift (NTP/time sync)
 
-    When a failure is detected, automatically runs Fix-ClaudeDesktop.ps1
-    to reset the VM and relaunch Claude. A cooldown prevents rapid cycling.
+    SAFETY FEATURES (v3.1):
+    - Auto-fix is BLOCKED when user is active (Claude in focus, recent input, VM busy, CPU active)
+    - Electron-aware window detection (GetWindowThreadProcessId, not MainWindowHandle)
+    - Session 0 safe (falls back to process heuristics when Win32 APIs are unavailable)
+    - Startup grace period (skips first 90s to avoid matching pre-existing events)
+    - Consecutive-check requirements on all heuristic triggers
+    - Event log matching tightened to Claude-specific messages only
+    - Cooldown between fixes (default 5 min)
+    - VM log window extended to 120s (covers Code thinking phases)
+
+    When a failure is detected AND the user is idle, automatically runs
+    Fix-ClaudeDesktop.ps1 to reset the VM and relaunch Claude.
 
     Designed to run as a hidden scheduled task (installed by Prevent-ClaudeIssues.ps1)
     but can also be started manually for foreground monitoring.
@@ -25,13 +35,13 @@
     Seconds between health checks (default: 30).
 
 .PARAMETER Cooldown
-    Minutes to wait between auto-fix runs (default: 3).
+    Minutes to wait between auto-fix runs (default: 5).
 
 .PARAMETER Quiet
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 2.0.0
+    Version : 3.1.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -39,14 +49,14 @@
 [CmdletBinding()]
 param(
     [int]$PollInterval = 30,
-    [int]$Cooldown = 3,
+    [int]$Cooldown = 5,
     [switch]$Quiet
 )
 
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "2.0.0"
+$Version        = "3.1.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
 $ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
@@ -59,6 +69,34 @@ $ErrorPatterns = @(
     "failed to ensure virtiofs mount",
     "RPC error -1"
 )
+
+# -- Win32 APIs for user activity detection ------------------------------
+# NOTE: These APIs only work in interactive sessions (Session 1+).
+# In Session 0 (SYSTEM scheduled tasks), they return zero/stale data.
+# We detect this and fall back to process-only heuristics.
+$script:IsInteractiveSession = $false
+try {
+    $sessionId = (Get-Process -Id $PID -ErrorAction Stop).SessionId
+    $script:IsInteractiveSession = ($sessionId -gt 0)
+} catch {}
+
+Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class Win32Activity {
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO {
+        public uint cbSize;
+        public uint dwTime;
+    }
+
+    [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+}
+'@
 
 # -- Find Fix script -----------------------------------------------------
 $myDir = if ($PSCommandPath) { Split-Path $PSCommandPath -Parent } else { $PWD.Path }
@@ -108,13 +146,18 @@ function Update-LogFile {
 }
 
 # -- State ---------------------------------------------------------------
+$script:StartTime            = Get-Date
 $script:LastFixTime          = [datetime]::MinValue
 $script:LogBaselines         = @{}   # Track file sizes per log file
 $script:FixCount             = 0
 $script:LastNatCheckTime     = [datetime]::MinValue
 $script:LastTimeSyncCheck    = [datetime]::MinValue
 $script:LastHeartbeatStatus  = $null
+$script:HeartbeatFailCount   = 0     # Consecutive heartbeat failures
 $script:VmLogStaleCount      = 0     # Consecutive stale checks
+$script:VmLogEverActive      = $false  # Has VM log ever been active this session?
+$script:ServiceDownCount     = 0     # Consecutive service-down checks
+$script:EventLogHitCount     = 0     # Consecutive event log hits
 
 # Initialize baselines for existing log files
 if (Test-Path $ClaudeLogDir) {
@@ -125,11 +168,22 @@ if (Test-Path $ClaudeLogDir) {
 
 # -- Detection functions -------------------------------------------------
 
+function Test-StartupGracePeriod {
+    <#
+    .SYNOPSIS
+        Returns $true if the monitor just started and should skip heuristic checks.
+        Grace period: 90 seconds. This prevents matching pre-existing event log
+        entries or stale logs from before the monitor was running.
+    #>
+    return ((Get-Date) - $script:StartTime).TotalSeconds -lt 90
+}
+
 function Test-LogsForErrors {
     <#
     .SYNOPSIS
         Scans all Claude log files for new VirtioFS error messages since last check.
         Returns the error pattern found, or $null if clean.
+        This is the MOST RELIABLE trigger -- actual error strings in Claude's own logs.
     #>
     if (-not (Test-Path $ClaudeLogDir)) { return $null }
 
@@ -180,30 +234,53 @@ function Test-LogsForErrors {
 function Test-ServiceHealth {
     <#
     .SYNOPSIS
-        Returns $true if healthy (Claude not running, or service running).
-        Returns $false if Claude is running but the service has stopped.
+        Checks if CoworkVMService is running while Claude is active.
+        Returns $true if healthy, $false if unhealthy.
+        Now requires 2 CONSECUTIVE failures to avoid transient blips.
     #>
     $claude = @(Get-Process -Name "claude" -ErrorAction SilentlyContinue)
-    if ($claude.Count -eq 0) { return $true }
+    if ($claude.Count -eq 0) {
+        $script:ServiceDownCount = 0
+        return $true
+    }
 
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $svc) { return $true }
+    if (-not $svc) {
+        $script:ServiceDownCount = 0
+        return $true   # Service not installed -- not a Cowork setup
+    }
 
-    if ($svc.Status -ne "Running") { return $false }
+    if ($svc.Status -ne "Running") {
+        $script:ServiceDownCount++
+        if ($script:ServiceDownCount -ge 2) {
+            $script:ServiceDownCount = 0
+            return $false
+        }
+        Write-WatchLog "Service not running (check $($script:ServiceDownCount)/2 -- waiting to confirm)"
+        return $true   # First failure -- wait one more cycle
+    }
+
+    $script:ServiceDownCount = 0
     return $true
 }
 
 function Test-EventLogErrors {
     <#
     .SYNOPSIS
-        Checks Windows Event Log for CoworkVMService errors AND Hyper-V
-        Worker/VMMS warnings in the last PollInterval window.
-        Returns the first relevant message, or $null if clean.
+        Checks Windows Event Log for Claude-specific errors.
+        TIGHTENED in v3.0:
+        - VMMS check now requires "claude" in the message (no more "failed"/"unexpected" wildcards)
+        - Requires 2 consecutive hits before triggering
+        - Skipped during startup grace period
     #>
-    $lookback = [math]::Max($PollInterval, 60)  # at least 60s lookback
-    $since = (Get-Date).AddSeconds(-$lookback)
+    # Skip during startup grace period (avoids pre-existing events)
+    if (Test-StartupGracePeriod) { return $null }
 
-    # Check 1: CoworkVMService errors (original)
+    $lookback = [math]::Max($PollInterval, 60)
+    $since = (Get-Date).AddSeconds(-$lookback)
+    $foundIssue = $null
+
+    # Check 1: CoworkVMService errors -- only match VirtioFS patterns
     try {
         $evFilter = @{
             LogName      = "Application"
@@ -216,45 +293,62 @@ function Test-EventLogErrors {
             $msg = ($events[0].Message -split "`n")[0]
             foreach ($pattern in $ErrorPatterns) {
                 if ($msg -match [regex]::Escape($pattern)) {
-                    return "CoworkVMService: $msg"
+                    $foundIssue = "CoworkVMService: $msg"
+                    break
                 }
             }
         }
     } catch {}
 
-    # Check 2: Hyper-V Worker errors (vmwp.exe crashes / VM failures)
-    try {
-        $hvWorkerFilter = @{
-            LogName   = "Microsoft-Windows-Hyper-V-Worker-Admin"
-            Level     = @(1, 2, 3)  # Critical, Error, Warning
-            StartTime = $since
-        }
-        $hvEvents = Get-WinEvent -FilterHashtable $hvWorkerFilter -MaxEvents 1 -ErrorAction SilentlyContinue
-        if ($hvEvents) {
-            $msg = ($hvEvents[0].Message -split "`n")[0]
-            # Only trigger on messages related to our VM
-            if ($msg -match "claude" -or $msg -match "Plan9" -or $msg -match "virtio" -or $msg -match "shared memory") {
-                return "Hyper-V Worker: $msg"
+    # Check 2: Hyper-V Worker -- must mention claude/Plan9/virtio/shared memory
+    if (-not $foundIssue) {
+        try {
+            $hvWorkerFilter = @{
+                LogName   = "Microsoft-Windows-Hyper-V-Worker-Admin"
+                Level     = @(1, 2)  # Critical, Error only (dropped warnings)
+                StartTime = $since
             }
-        }
-    } catch {}
-
-    # Check 3: Hyper-V VMMS errors (VM management service issues)
-    try {
-        $vmmsFilter = @{
-            LogName   = "Microsoft-Windows-Hyper-V-VMMS-Admin"
-            Level     = @(1, 2)  # Critical, Error
-            StartTime = $since
-        }
-        $vmmsEvents = Get-WinEvent -FilterHashtable $vmmsFilter -MaxEvents 1 -ErrorAction SilentlyContinue
-        if ($vmmsEvents) {
-            $msg = ($vmmsEvents[0].Message -split "`n")[0]
-            if ($msg -match "claude" -or $msg -match "failed" -or $msg -match "unexpected") {
-                return "Hyper-V VMMS: $msg"
+            $hvEvents = Get-WinEvent -FilterHashtable $hvWorkerFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+            if ($hvEvents) {
+                $msg = ($hvEvents[0].Message -split "`n")[0]
+                if ($msg -match "claude" -or $msg -match "Plan9" -or $msg -match "virtio" -or $msg -match "shared memory") {
+                    $foundIssue = "Hyper-V Worker: $msg"
+                }
             }
-        }
-    } catch {}
+        } catch {}
+    }
 
+    # Check 3: Hyper-V VMMS -- MUST mention "claude" (no more generic "failed" matching)
+    if (-not $foundIssue) {
+        try {
+            $vmmsFilter = @{
+                LogName   = "Microsoft-Windows-Hyper-V-VMMS-Admin"
+                Level     = @(1, 2)  # Critical, Error
+                StartTime = $since
+            }
+            $vmmsEvents = Get-WinEvent -FilterHashtable $vmmsFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+            if ($vmmsEvents) {
+                $msg = ($vmmsEvents[0].Message -split "`n")[0]
+                # TIGHTENED: must specifically mention claude or cowork
+                if ($msg -match "claude" -or $msg -match "cowork") {
+                    $foundIssue = "Hyper-V VMMS: $msg"
+                }
+            }
+        } catch {}
+    }
+
+    # Require 2 consecutive event log hits before triggering
+    if ($foundIssue) {
+        $script:EventLogHitCount++
+        if ($script:EventLogHitCount -ge 2) {
+            $script:EventLogHitCount = 0
+            return $foundIssue
+        }
+        Write-WatchLog "Event log hit (check $($script:EventLogHitCount)/2): $foundIssue"
+        return $null
+    }
+
+    $script:EventLogHitCount = 0
     return $null
 }
 
@@ -265,6 +359,7 @@ function Test-WinNatHealth {
         Without NAT, the VM has no outbound connectivity, causing API calls
         and mount operations to fail silently.
         Returns $null if healthy, or a description string if unhealthy.
+        Does NOT trigger auto-fix -- logs warning only.
     #>
     # Only check every 60 seconds (NAT doesn't change that often)
     $now = Get-Date
@@ -274,24 +369,19 @@ function Test-WinNatHealth {
     try {
         $natRules = @(Get-NetNat -ErrorAction SilentlyContinue)
         if ($natRules.Count -eq 0) {
-            # No NAT rules at all -- this is bad if Claude is running
-            # Try to find the Hyper-V internal switch subnet and recreate
             $hvSwitch = Get-VMSwitch -SwitchType Internal -ErrorAction SilentlyContinue |
                         Where-Object { $_.Name -match "WSL|claude|Default|nat" } |
                         Select-Object -First 1
             if (-not $hvSwitch) {
-                # Also check for any internal switch
                 $hvSwitch = Get-VMSwitch -SwitchType Internal -ErrorAction SilentlyContinue |
                             Select-Object -First 1
             }
 
             if ($hvSwitch) {
-                # Find the adapter connected to this switch
                 $adapter = Get-NetAdapter -ErrorAction SilentlyContinue |
                            Where-Object { $_.InterfaceDescription -match "Hyper-V Virtual Ethernet Adapter" -and $_.Name -match $hvSwitch.Name } |
                            Select-Object -First 1
                 if (-not $adapter) {
-                    # Try matching by vEthernet name pattern
                     $adapter = Get-NetAdapter -Name "vEthernet ($($hvSwitch.Name))" -ErrorAction SilentlyContinue
                 }
 
@@ -299,13 +389,12 @@ function Test-WinNatHealth {
                     $ipAddr = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
                               Select-Object -First 1
                     if ($ipAddr) {
-                        # Derive the subnet (assume /24 for typical Hyper-V NAT)
                         $prefix = ($ipAddr.IPAddress -split '\.')[0..2] -join '.'
                         $subnet = "$prefix.0/24"
                         try {
                             New-NetNat -Name "CoworkNAT" -InternalIPInterfaceAddressPrefix $subnet -ErrorAction Stop | Out-Null
                             Write-WatchLog "REPAIRED: Created WinNAT rule 'CoworkNAT' for $subnet"
-                            return $null  # Fixed it
+                            return $null
                         } catch {
                             return "WinNAT missing and auto-repair failed: $($_.Exception.Message)"
                         }
@@ -324,8 +413,12 @@ function Test-VmHeartbeat {
     <#
     .SYNOPSIS
         Checks the Hyper-V Integration Services heartbeat for the Claude VM.
+        Now requires 3 CONSECUTIVE failures before triggering (was instant).
         Returns $null if healthy or unavailable, or a description if unhealthy.
     #>
+    # Skip during startup grace period
+    if (Test-StartupGracePeriod) { return $null }
+
     try {
         $claudeVm = Get-VM -ErrorAction SilentlyContinue |
                     Where-Object { $_.Name -match "claude" } |
@@ -339,19 +432,24 @@ function Test-VmHeartbeat {
 
         $status = $hb.PrimaryStatusDescription
         if ($status -eq "OK" -or $status -eq "No Contact") {
-            # "No Contact" is normal during VM boot
             if ($script:LastHeartbeatStatus -eq "Lost" -and $status -eq "OK") {
                 Write-WatchLog "Heartbeat recovered for VM '$($claudeVm.Name)'"
             }
             $script:LastHeartbeatStatus = $status
+            $script:HeartbeatFailCount = 0
             return $null
         }
 
-        # Heartbeat is not OK (could be "Error", "Lost Communication", etc.)
-        if ($script:LastHeartbeatStatus -ne "Lost") {
-            $script:LastHeartbeatStatus = "Lost"
-            return "VM heartbeat: $status (VM may be hung or unresponsive)"
+        # Heartbeat is not OK
+        $script:HeartbeatFailCount++
+        $script:LastHeartbeatStatus = "Lost"
+
+        if ($script:HeartbeatFailCount -ge 3) {
+            $script:HeartbeatFailCount = 0
+            return "VM heartbeat: $status for 3 consecutive checks (VM may be hung)"
         }
+
+        Write-WatchLog "Heartbeat issue (check $($script:HeartbeatFailCount)/3): $status"
     } catch {}
     return $null
 }
@@ -359,10 +457,12 @@ function Test-VmHeartbeat {
 function Test-VmLogStaleness {
     <#
     .SYNOPSIS
-        Checks if the VM's node log has gone stale (no updates for >2 minutes
-        while Claude is running). This catches silent VM hangs where no error
-        is logged but the VM has stopped responding.
-        Returns $null if OK, or a description if stale.
+        Checks if the VM's node log has gone stale while Cowork should be active.
+        TIGHTENED in v3.0:
+        - Stale threshold: 300s (was 120s) -- 5 minutes of silence
+        - Consecutive checks: 5 (was 3) -- 150s of confirmed stale
+        - Only triggers if the log was PREVIOUSLY active (VmLogEverActive)
+          This prevents false positives when user is in Chat mode (no Cowork)
     #>
     $vmLogFile = Join-Path $ClaudeLogDir "cowork_vm_node.log"
     if (-not (Test-Path $vmLogFile)) {
@@ -370,17 +470,34 @@ function Test-VmLogStaleness {
         return $null
     }
 
+    # Skip during startup grace period
+    if (Test-StartupGracePeriod) { return $null }
+
     try {
         $lastWrite = (Get-Item $vmLogFile -ErrorAction Stop).LastWriteTime
         $staleSec = ((Get-Date) - $lastWrite).TotalSeconds
 
-        if ($staleSec -gt 120) {
-            # Log hasn't been written to in 2+ minutes
+        # Track if the log has ever been active during this monitor session
+        if ($staleSec -lt 60) {
+            $script:VmLogEverActive = $true
+            $script:VmLogStaleCount = 0
+            return $null
+        }
+
+        # Only check staleness if the log was previously active
+        # (Prevents false triggers when user is in Chat mode, not Cowork)
+        if (-not $script:VmLogEverActive) {
+            return $null
+        }
+
+        if ($staleSec -gt 300) {
             $script:VmLogStaleCount++
-            # Require 3 consecutive stale checks (90 seconds) to avoid false positives
-            if ($script:VmLogStaleCount -ge 3) {
+            if ($script:VmLogStaleCount -ge 5) {
                 $script:VmLogStaleCount = 0
                 return "VM log stale for $([math]::Round($staleSec))s -- VM may be hung"
+            }
+            if ($script:VmLogStaleCount -eq 1) {
+                Write-WatchLog "VM log stale ($([math]::Round($staleSec))s) -- monitoring (check 1/5)"
             }
         } else {
             $script:VmLogStaleCount = 0
@@ -392,21 +509,16 @@ function Test-VmLogStaleness {
 function Test-TimeSyncHealth {
     <#
     .SYNOPSIS
-        Checks for significant host clock drift. If the host clock drifts >5 seconds,
-        Hyper-V time synchronization can't correct the guest clock, causing
-        TLS certificate validation failures and API timeouts inside the VM.
-        Only checks every 5 minutes to avoid overhead.
-        Returns $null if OK, or a description if drifted.
+        Checks for significant host clock drift. Self-repairs via NTP resync.
+        Only checks every 5 minutes. Does NOT trigger auto-fix.
     #>
     $now = Get-Date
     if (($now - $script:LastTimeSyncCheck).TotalMinutes -lt 5) { return $null }
     $script:LastTimeSyncCheck = $now
 
     try {
-        # Check if W32Time service is running
         $w32svc = Get-Service -Name "W32Time" -ErrorAction SilentlyContinue
         if ($w32svc -and $w32svc.Status -ne "Running") {
-            # Try to start it
             try {
                 Start-Service -Name "W32Time" -ErrorAction Stop
                 Write-WatchLog "REPAIRED: Started W32Time service"
@@ -415,12 +527,10 @@ function Test-TimeSyncHealth {
             }
         }
 
-        # Check actual drift via w32tm (non-blocking, quick)
         $w32tmResult = & w32tm /stripchart /computer:time.windows.com /dataonly /samples:1 2>&1
         if ($w32tmResult -match "(-?\d+\.\d+)s") {
             $drift = [math]::Abs([double]$Matches[1])
             if ($drift -gt 5.0) {
-                # Force resync
                 try {
                     & w32tm /resync /force 2>&1 | Out-Null
                     Write-WatchLog "REPAIRED: Forced NTP resync (drift was ${drift}s)"
@@ -437,12 +547,6 @@ function Test-TimeSyncHealth {
 # -- VM maintenance functions ---------------------------------------------
 
 function Set-VmWorkerPriority {
-    <#
-    .SYNOPSIS
-        Ensures all vmwp.exe (Hyper-V VM Worker) processes run at AboveNormal
-        priority. This is not persistent across reboots, so the health monitor
-        re-applies it on every poll cycle.
-    #>
     try {
         $vmwpProcs = @(Get-Process -Name "vmwp" -ErrorAction SilentlyContinue)
         foreach ($p in $vmwpProcs) {
@@ -457,11 +561,6 @@ function Set-VmWorkerPriority {
 }
 
 function Apply-DynamicMemoryFlag {
-    <#
-    .SYNOPSIS
-        If the Prevent script wrote a flag file because the VM was running,
-        check if the VM is now off and disable dynamic memory.
-    #>
     $flagFile = Join-Path $ClaudeAppData "disable-dynamic-memory.flag"
     if (-not (Test-Path $flagFile)) { return }
 
@@ -480,6 +579,85 @@ function Apply-DynamicMemoryFlag {
     } catch {}
 }
 
+# -- User activity detection ---------------------------------------------
+
+function Test-UserActivity {
+    <#
+    .SYNOPSIS
+        Returns $true if the user appears to be actively using Claude Desktop.
+        Design: false positives (blocking a fix) are cheap; false negatives
+        (killing active work) are expensive. So we err on the side of caution.
+
+        CHECKS (interactive session):
+        1. Foreground window belongs to a Claude process (via GetWindowThreadProcessId)
+        2. User input within 3 minutes + Claude running
+        3. VM log active within 120s (covers Code thinking phases)
+        4. CPU sampling -- any Claude process burning >100ms CPU in 500ms
+
+        SESSION 0 (SYSTEM scheduled tasks):
+        - Win32 APIs return zero/stale data, so we skip checks 1-2
+        - Falls back to VM log + CPU sampling only
+    #>
+    try {
+        $claudeProcs = @(Get-Process -Name "claude" -ErrorAction SilentlyContinue)
+        if ($claudeProcs.Count -eq 0) { return $false }
+
+        if ($script:IsInteractiveSession) {
+            # Check 1: Foreground window PID matches a Claude process (or its parent)
+            # Uses GetWindowThreadProcessId -- works with Electron renderer processes
+            $fgHwnd = [Win32Activity]::GetForegroundWindow()
+            if ($fgHwnd -ne [IntPtr]::Zero) {
+                $fgPid = 0
+                [Win32Activity]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid) | Out-Null
+                if ($fgPid -gt 0) {
+                    foreach ($cp in $claudeProcs) {
+                        if ($cp.Id -eq $fgPid) { return $true }
+                    }
+                    # Electron renderer → main process: check parent PID
+                    try {
+                        $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$fgPid" -ErrorAction SilentlyContinue).ParentProcessId
+                        foreach ($cp in $claudeProcs) {
+                            if ($cp.Id -eq $parentId) { return $true }
+                        }
+                    } catch {}
+                }
+            }
+
+            # Check 2: User input within 3 minutes (extended from 2)
+            $lastInput = New-Object Win32Activity+LASTINPUTINFO
+            $lastInput.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($lastInput)
+            if ([Win32Activity]::GetLastInputInfo([ref]$lastInput)) {
+                $idleMs = [Environment]::TickCount - $lastInput.dwTime
+                if ($idleMs -lt 180000) {
+                    return $true  # User active within 3 min + Claude is running
+                }
+            }
+        }
+
+        # Check 3: VM log active within 120s (was 30s -- covers Code thinking phases)
+        $vmLog = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+        if (Test-Path $vmLog) {
+            $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
+            if ($ageSec -lt 120) {
+                return $true  # VM was active recently -- Code may be thinking
+            }
+        }
+
+        # Check 4: CPU sampling -- any Claude process using >100ms CPU in 500ms
+        # Catches active request processing even when UI is idle
+        foreach ($cp in $claudeProcs) {
+            try {
+                $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds
+                Start-Sleep -Milliseconds 500
+                $cp.Refresh()
+                $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
+                if (($cpu2 - $cpu1) -gt 100) { return $true }
+            } catch {}
+        }
+    } catch {}
+    return $false
+}
+
 # -- Auto-fix function ---------------------------------------------------
 
 function Invoke-AutoFix {
@@ -493,20 +671,28 @@ function Invoke-AutoFix {
         return
     }
 
+    # ---- SAFETY: Never auto-fix while user is active ----
+    if (Test-UserActivity) {
+        Write-WatchLog ">>> BLOCKED: $Reason -- user is active (Claude in focus, recent input, or VM busy)"
+        Write-WatchLog "    Run Fix-ClaudeDesktop.ps1 manually when ready"
+        # Set cooldown so we don't spam the log every 30s -- retry in ~2 min
+        $script:LastFixTime = $now.AddMinutes(-($Cooldown - 2))
+        return
+    }
+
     $script:FixCount++
     Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) TRIGGERED: $Reason"
+    Write-WatchLog "    (User appears idle and Claude is not in focus)"
     $script:LastFixTime = $now
 
     try {
-        # Run the fix script directly (inherits elevation from scheduled task)
-        # -Quiet suppresses "Press any key" prompt
         & $fixScript -Quiet
         Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) COMPLETE"
     } catch {
         Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) FAILED: $($_.Exception.Message)"
     }
 
-    # Reset log baselines after fix (log files may have been recreated)
+    # Reset state after fix
     Start-Sleep -Seconds 10
     $script:LogBaselines = @{}
     if (Test-Path $ClaudeLogDir) {
@@ -514,12 +700,15 @@ function Invoke-AutoFix {
             $script:LogBaselines[$_.FullName] = $_.Length
         }
     }
-    # Reset stale counter
-    $script:VmLogStaleCount = 0
+    $script:VmLogStaleCount    = 0
+    $script:VmLogEverActive    = $false
+    $script:ServiceDownCount   = 0
+    $script:EventLogHitCount   = 0
+    $script:HeartbeatFailCount = 0
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v2"
+$mutexName = "Global\ClaudeHealthMonitor_v3.1"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)
@@ -540,58 +729,54 @@ Write-WatchLog "  Poll interval : ${PollInterval}s"
 Write-WatchLog "  Cooldown      : ${Cooldown} min"
 Write-WatchLog "  Fix script    : $fixScript"
 Write-WatchLog "  Log directory : $ClaudeLogDir"
-Write-WatchLog "  Monitors      : logs, service, events, NAT, heartbeat, staleness, time sync"
+Write-WatchLog "  Safety        : user-activity block, 90s grace period, consecutive-check gates"
+Write-WatchLog "  Monitors      : logs, service(x2), events(x2), NAT, heartbeat(x3), staleness(x5), time sync"
 Write-WatchLog "================================================================"
 
 try {
     while ($true) {
         try {
-            # Rotate log file at midnight
             Update-LogFile
 
-            # Only monitor when Claude is actually running
             $claudeRunning = @(Get-Process -Name "claude" -ErrorAction SilentlyContinue).Count -gt 0
 
             if ($claudeRunning) {
                 # ---- Critical checks (trigger auto-fix) ----
 
-                # Check 1: VirtioFS errors in log files (most reliable)
+                # Check 1: VirtioFS errors in log files (most reliable -- no consecutive gate needed)
                 $logError = Test-LogsForErrors
                 if ($logError) {
                     Invoke-AutoFix -Reason "Log error: $logError"
                     continue
                 }
 
-                # Check 2: Service died while Claude is running
+                # Check 2: Service died while Claude is running (2 consecutive checks)
                 if (-not (Test-ServiceHealth)) {
-                    Invoke-AutoFix -Reason "CoworkVMService stopped while Claude is running"
+                    Invoke-AutoFix -Reason "CoworkVMService stopped while Claude is running (confirmed)"
                     continue
                 }
 
-                # Check 3: Event Log errors (catches errors not in log files)
+                # Check 3: Event Log errors (2 consecutive checks, grace period, tightened filters)
                 $eventError = Test-EventLogErrors
                 if ($eventError) {
                     Invoke-AutoFix -Reason "Event Log: $eventError"
                     continue
                 }
 
-                # Check 4: WinNAT connectivity (VM has no network without it)
+                # Check 4: WinNAT connectivity (warning only -- does NOT auto-fix)
                 $natIssue = Test-WinNatHealth
                 if ($natIssue) {
-                    # NAT issues are self-repaired when possible; only trigger fix
-                    # if repair failed (the function returns $null on successful repair)
                     Write-WatchLog "NAT WARNING: $natIssue"
-                    # Don't auto-fix for NAT -- it may self-recover after repair
                 }
 
-                # Check 5: Hyper-V heartbeat (detects hung VMs)
+                # Check 5: Hyper-V heartbeat (3 consecutive checks, grace period)
                 $hbIssue = Test-VmHeartbeat
                 if ($hbIssue) {
                     Invoke-AutoFix -Reason $hbIssue
                     continue
                 }
 
-                # Check 6: VM log staleness (catches silent hangs)
+                # Check 6: VM log staleness (5 consecutive checks, 300s threshold, must have been active)
                 $staleIssue = Test-VmLogStaleness
                 if ($staleIssue) {
                     Invoke-AutoFix -Reason $staleIssue
@@ -599,18 +784,14 @@ try {
                 }
 
                 # ---- Maintenance (non-fix actions) ----
-
-                # Keep vmwp.exe at elevated priority
                 Set-VmWorkerPriority
 
-                # Check time sync health (auto-repairs drift)
                 $timeIssue = Test-TimeSyncHealth
                 if ($timeIssue) {
                     Write-WatchLog "TIME WARNING: $timeIssue"
                 }
             }
 
-            # Maintenance: apply deferred dynamic memory flag (VM must be off)
             Apply-DynamicMemoryFlag
         } catch {
             Write-WatchLog "MONITOR ERROR: $($_.Exception.Message)"
