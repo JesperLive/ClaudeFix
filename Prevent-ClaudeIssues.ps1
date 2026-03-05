@@ -17,8 +17,15 @@
     - Disables Connected Standby / Modern Standby
     - Disables power saving on all network adapters
     - Sets minimum processor state to 100% on AC
-    - Registers a scheduled task that monitors CoworkVMService health
-      and auto-restarts it if it enters a failed state
+    - Pins Hyper-V VM memory (disables Dynamic Memory ballooning)
+    - Boosts VM worker process priority
+    - Verifies and repairs WinNAT rules for VM network
+    - Checks Windows Firewall policies for Hyper-V compatibility
+    - Detects problematic workspace storage locations
+    - Verifies NTP/time synchronisation
+    - Detects antivirus software and suggests exclusions
+    - Installs a persistent health monitor that detects VirtioFS mount
+      failures and auto-runs the fix script within seconds
     - Registers a boot-fix task that resets the VM at every logon
 
     What it does NOT do:
@@ -30,7 +37,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 2.1.0
+    Version : 4.0.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -63,7 +70,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "2.1.0"
+$Version          = "4.0.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -109,7 +116,7 @@ if ($Undo) {
     # ================================================================
     # UNDO MODE
     # ================================================================
-    $steps = 7
+    $steps = 8
 
     Step 1 $steps "Restoring original power plan..."
     if (Test-Path $BackupFile) {
@@ -175,7 +182,41 @@ if ($Undo) {
         Log "Could not restore network adapter settings -- not critical" -Colour DarkGray -Indent
     }
 
-    Step 6 $steps "Removing scheduled tasks..."
+    Step 6 $steps "Re-enabling Hyper-V Dynamic Memory..."
+    try {
+        $claudeVm = Get-VM -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "claude" } |
+                    Select-Object -First 1
+        if ($claudeVm) {
+            $vmName = $claudeVm.Name
+            if ($claudeVm.State -eq "Off") {
+                Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $true -ErrorAction Stop
+                Log "Dynamic Memory re-enabled for VM '$vmName'" -Colour Green -Indent
+            } else {
+                Log "VM '$vmName' is running -- restart it to re-enable Dynamic Memory" -Colour DarkYellow -Indent
+            }
+        } else {
+            Log "No Claude VM found -- nothing to restore" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not restore Dynamic Memory -- Hyper-V module may not be available" -Colour DarkGray -Indent
+    }
+    # Clean up flag file
+    $flagFile = Join-Path $env:APPDATA "Claude\disable-dynamic-memory.flag"
+    if (Test-Path $flagFile) {
+        Remove-Item $flagFile -Force -ErrorAction SilentlyContinue
+    }
+
+    Step 7 $steps "Removing scheduled tasks and health monitor..."
+    # Kill any running health monitor process first
+    try {
+        Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match "Watch-ClaudeHealth" } |
+            ForEach-Object {
+                Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                Log "Stopped running health monitor (PID $($_.ProcessId))" -Colour Green -Indent
+            }
+    } catch {}
     $removedAny = $false
     foreach ($tName in @($TaskName, $BootTaskName)) {
         try {
@@ -189,8 +230,14 @@ if ($Undo) {
     if (-not $removedAny) {
         Log "No tasks to remove" -Colour DarkGray -Indent
     }
+    # Clean up old watchdog script if present
+    $oldWatchdog = Join-Path $env:APPDATA "Claude\cowork-watchdog.ps1"
+    if (Test-Path $oldWatchdog) {
+        Remove-Item $oldWatchdog -Force -ErrorAction SilentlyContinue
+        Log "Removed old watchdog script" -Colour DarkGray -Indent
+    }
 
-    Step 7 $steps "Removing shortcuts..."
+    Step 8 $steps "Removing shortcuts..."
     $desktopLnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "Fix Claude Desktop.lnk"
     $startMenuLnk = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Fix Claude Desktop.lnk"
     $removedLnk = $false
@@ -217,7 +264,7 @@ if ($Undo) {
     # ================================================================
     # SETUP MODE
     # ================================================================
-    $steps = 12
+    $steps = 19
 
     # ----------------------------------------------------------------
     # 1. Power plan -- High Performance or Ultimate Performance
@@ -269,9 +316,6 @@ if ($Undo) {
     # 4. Disable USB selective suspend on AC
     # ----------------------------------------------------------------
     Step 4 $steps "Disabling USB selective suspend on AC..."
-    # USB selective suspend: GUID 2a737441-1930-4402-8d77-b2bebba308a3
-    # Setting GUID:          48e6b7a6-50f5-4782-a5d4-53bb8f07e226
-    # 0 = Disabled, 1 = Enabled
     try {
         $activePlan = Get-ActivePlanGuid
         powercfg /setacvalueindex $activePlan 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0
@@ -285,14 +329,9 @@ if ($Undo) {
     # 5. Disable hard disk sleep + PCI-E power management on AC
     # ----------------------------------------------------------------
     Step 5 $steps "Disabling disk sleep and PCI-E power management on AC..."
-    # Hard disk timeout: 0 = never
     powercfg /change disk-timeout-ac 0
     Log "Hard disk sleep on AC: Never" -Colour Green -Indent
 
-    # PCI Express Link State Power Management
-    # Sub-group: 501a4d13-42af-4429-9fd1-a8218c268e20
-    # Setting:   ee12f906-d277-404b-b6da-e5fa1a576df5
-    # 0 = Off
     try {
         $activePlan = Get-ActivePlanGuid
         powercfg /setacvalueindex $activePlan 501a4d13-42af-4429-9fd1-a8218c268e20 ee12f906-d277-404b-b6da-e5fa1a576df5 0
@@ -303,8 +342,7 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 6. Disable Fast Startup (explicit registry -- hibernate off
-    #    should do this, but belt and suspenders)
+    # 6. Disable Fast Startup (explicit registry)
     # ----------------------------------------------------------------
     Step 6 $steps "Disabling Fast Startup..."
     try {
@@ -327,7 +365,6 @@ if ($Undo) {
         $csRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Power"
         $csKey = Get-ItemProperty -Path $csRegPath -Name "CsEnabled" -ErrorAction SilentlyContinue
         if ($null -ne $csKey -and $csKey.CsEnabled -ne $null) {
-            # Back up current value
             $csKey.CsEnabled.ToString() | Out-File -FilePath $CsBackupFile -Encoding ascii -Force
             if ($csKey.CsEnabled -eq 1) {
                 Set-ItemProperty -Path $csRegPath -Name "CsEnabled" -Value 0 -Type DWord -Force
@@ -351,27 +388,20 @@ if ($Undo) {
         $nics = Get-NetAdapter -Physical -ErrorAction SilentlyContinue
         $nicCount = 0
         foreach ($nic in $nics) {
-            # Method 1: PnPCapabilities registry value
-            # 24 (0x18) = DEVICE_WAKE_ENABLE off + DEVICE_SELECTIVE_SUSPEND off
             $devPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($nic.PnPDeviceID)\Device Parameters"
             if (Test-Path $devPath) {
                 Set-ItemProperty -Path $devPath -Name "PnPCapabilities" -Value 24 -Type DWord -Force -ErrorAction SilentlyContinue
                 $nicCount++
             }
-
-            # Method 2: Disable *WakeOnMagicPacket and *WakeOnPattern via adapter advanced properties
             try {
                 Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName "Wake on Magic Packet" `
                     -DisplayValue "Disabled" -ErrorAction SilentlyContinue
                 Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName "Wake on Pattern Match" `
                     -DisplayValue "Disabled" -ErrorAction SilentlyContinue
             } catch {}
-
-            # Method 3: Disable via power management if available
             try {
                 $pnpDevice = Get-PnpDevice -InstanceId $nic.PnPDeviceID -ErrorAction SilentlyContinue
                 if ($pnpDevice) {
-                    # Disable "Allow the computer to turn off this device to save power"
                     $powerMgmt = Get-CimInstance -ClassName MSPower_DeviceWakeEnable `
                         -Namespace root\wmi -ErrorAction SilentlyContinue |
                         Where-Object { $_.InstanceName -match [regex]::Escape($nic.PnPDeviceID) }
@@ -395,9 +425,6 @@ if ($Undo) {
     # 9. Set processor minimum state to 100% on AC
     # ----------------------------------------------------------------
     Step 9 $steps "Setting processor minimum state to 100% on AC..."
-    # Processor power management sub-group: 54533251-82be-4824-96c1-47b60b740d00
-    # Processor minimum state setting:      893dee8e-2bef-41e0-89c6-b55d0929964c
-    # Value: percentage (0-100)
     try {
         $activePlan = Get-ActivePlanGuid
         powercfg /setacvalueindex $activePlan 54533251-82be-4824-96c1-47b60b740d00 893dee8e-2bef-41e0-89c6-b55d0929964c 100
@@ -408,92 +435,457 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 10. Create watchdog scheduled task
+    # 10. Pin Hyper-V VM memory (disable dynamic memory ballooning)
     # ----------------------------------------------------------------
-    Step 10 $steps "Creating CoworkVMService watchdog task..."
-
-    $watchdogScript = @'
-$svc = Get-Service -Name "CoworkVMService" -ErrorAction SilentlyContinue
-if (-not $svc) { exit }
-if ($svc.Status -eq "Running") { exit }
-
-# Service is not running -- check if Claude Desktop is
-$claude = Get-Process -Name "claude" -ErrorAction SilentlyContinue
-if (-not $claude) { exit }
-
-# Claude is running but service is not -- restart it
-try {
-    Start-Service -Name "CoworkVMService" -ErrorAction Stop
-} catch {
+    Step 10 $steps "Pinning Hyper-V VM memory..."
     try {
-        Restart-Service -Name "CoworkVMService" -Force -ErrorAction Stop
-    } catch {}
-}
-'@
+        $claudeVm = Get-VM -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "claude" } |
+                    Select-Object -First 1
 
-    $watchdogPath = Join-Path $env:APPDATA "Claude\cowork-watchdog.ps1"
-    $watchdogScript | Out-File -FilePath $watchdogPath -Encoding ascii -Force
+        if ($claudeVm) {
+            $vmName = $claudeVm.Name
+            $dynMem = (Get-VMMemory -VMName $vmName -ErrorAction Stop).DynamicMemoryEnabled
 
-    try {
-        # Remove existing task if present
-        try {
-            Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
-        } catch {}
-
-        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" `
-                      -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchdogPath`""
-
-        # Create a Once trigger, then patch in repetition via COM
-        $trigger = New-ScheduledTaskTrigger -Once -At "00:00" `
-                       -RepetitionInterval (New-TimeSpan -Minutes 5)
-
-        # Set repetition duration to indefinite (PS 5.1 workaround)
-        $trigger.Repetition.StopAtDurationEnd = $false
-        $trigger.Repetition.Duration = "P9999D"
-
-        $settings = New-ScheduledTaskSettingsSet `
-                        -AllowStartIfOnBatteries `
-                        -DontStopIfGoingOnBatteries `
-                        -StartWhenAvailable `
-                        -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
-
-        $principal = New-ScheduledTaskPrincipal `
-                         -UserId "SYSTEM" `
-                         -RunLevel Highest `
-                         -LogonType ServiceAccount
-
-        Register-ScheduledTask `
-            -TaskName $TaskName `
-            -TaskPath $TaskPath `
-            -Action $action `
-            -Trigger $trigger `
-            -Settings $settings `
-            -Principal $principal `
-            -Description "Monitors CoworkVMService and restarts it if Claude Desktop is running but the service has stopped." `
-            -Force | Out-Null
-
-        Log "Watchdog task created (runs every 5 minutes)" -Colour Green -Indent
-        Log "Task: Task Scheduler > $TaskPath$TaskName" -Colour DarkGray -Indent
-        Log "Script: $watchdogPath" -Colour DarkGray -Indent
+            if ($dynMem) {
+                if ($claudeVm.State -eq "Off") {
+                    Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $false -ErrorAction Stop
+                    Log "Dynamic Memory disabled for VM '$vmName'" -Colour Green -Indent
+                } else {
+                    Log "VM '$vmName' is running -- Dynamic Memory will be disabled on next restart" -Colour DarkYellow -Indent
+                    $flagFile = Join-Path $env:APPDATA "Claude\disable-dynamic-memory.flag"
+                    $vmName | Out-File -FilePath $flagFile -Encoding ascii -Force
+                    Log "Flag written: $flagFile" -Colour DarkGray -Indent
+                }
+            } else {
+                Log "Dynamic Memory already disabled for VM '$vmName'" -Colour DarkGray -Indent
+            }
+        } else {
+            Log "No Claude VM found (Hyper-V module may not be available)" -Colour DarkGray -Indent
+            Log "This is normal if Cowork hasn't been used yet" -Colour DarkGray -Indent
+        }
     } catch {
-        Log "[!] Could not create scheduled task: $($_.Exception.Message)" -Colour Red -Indent
-        Log "Watchdog script saved to: $watchdogPath" -Colour DarkGray -Indent
-        Log "You can manually create a task to run it every 5 minutes" -Colour DarkGray -Indent
+        Log "Could not configure VM memory -- Hyper-V module may not be installed" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
-    # 11. Create boot-fix scheduled task
+    # 11. Boost VM worker process priority
     # ----------------------------------------------------------------
-    Step 11 $steps "Creating boot-time fix task..."
+    Step 11 $steps "Boosting VM worker process priority..."
+    try {
+        $vmwpProcs = @(Get-Process -Name "vmwp" -ErrorAction SilentlyContinue)
+        if ($vmwpProcs.Count -gt 0) {
+            $boosted = 0
+            foreach ($p in $vmwpProcs) {
+                try {
+                    if ($p.PriorityClass -ne 'AboveNormal') {
+                        $p.PriorityClass = 'AboveNormal'
+                        $boosted++
+                    }
+                } catch {}
+            }
+            if ($boosted -gt 0) {
+                Log "Boosted $boosted vmwp.exe process(es) to AboveNormal priority" -Colour Green -Indent
+            } else {
+                Log "vmwp.exe already at AboveNormal priority" -Colour DarkGray -Indent
+            }
+            Log "Health monitor will maintain this across reboots" -Colour DarkGray -Indent
+        } else {
+            Log "No vmwp.exe processes found (VM may not be running)" -Colour DarkGray -Indent
+            Log "Health monitor will boost priority when VM starts" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not set process priority -- not critical" -Colour DarkGray -Indent
+    }
 
-    # Find Fix-ClaudeDesktop.ps1 -- look in the same folder as this script
-    $fixScript = $null
+    # ----------------------------------------------------------------
+    # 12. Verify and repair WinNAT rules
+    # ----------------------------------------------------------------
+    Step 12 $steps "Checking WinNAT rules for VM network..."
+    try {
+        $natRules = @(Get-NetNat -ErrorAction SilentlyContinue)
+        if ($natRules.Count -gt 0) {
+            foreach ($rule in $natRules) {
+                Log "NAT rule found: '$($rule.Name)' ($($rule.InternalIPInterfaceAddressPrefix))" -Colour Green -Indent
+            }
+        } else {
+            Log "No WinNAT rules found" -Colour DarkYellow -Indent
+            # Try to auto-create
+            $hvSwitch = Get-VMSwitch -SwitchType Internal -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+            if ($hvSwitch) {
+                $adapter = Get-NetAdapter -Name "vEthernet ($($hvSwitch.Name))" -ErrorAction SilentlyContinue
+                if ($adapter) {
+                    $ipAddr = Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                              Select-Object -First 1
+                    if ($ipAddr) {
+                        $prefix = ($ipAddr.IPAddress -split '\.')[0..2] -join '.'
+                        $subnet = "$prefix.0/24"
+                        try {
+                            New-NetNat -Name "CoworkNAT" -InternalIPInterfaceAddressPrefix $subnet -ErrorAction Stop | Out-Null
+                            Log "Created NAT rule 'CoworkNAT' for $subnet" -Colour Green -Indent
+                        } catch {
+                            Log "Could not create NAT rule: $($_.Exception.Message)" -Colour Yellow -Indent
+                        }
+                    } else {
+                        Log "No IPv4 address on Hyper-V adapter -- NAT not needed yet" -Colour DarkGray -Indent
+                    }
+                } else {
+                    Log "No Hyper-V virtual adapter found -- NAT not needed yet" -Colour DarkGray -Indent
+                }
+            } else {
+                Log "No internal Hyper-V switch found -- NAT not needed yet" -Colour DarkGray -Indent
+            }
+            Log "Health monitor will auto-repair NAT if it disappears" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Get-NetNat not available -- skipping NAT check" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 13. Windows Firewall policy verification
+    # ----------------------------------------------------------------
+    Step 13 $steps "Checking Windows Firewall policies..."
+    try {
+        # Check if local firewall rules are being applied (Group Policy can block them)
+        $fwProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+        $issues = @()
+        foreach ($profile in $fwProfiles) {
+            if ($profile.Enabled -and -not $profile.AllowLocalFirewallRules) {
+                $issues += $profile.Name
+            }
+        }
+        if ($issues.Count -gt 0) {
+            Log "WARNING: Local firewall rules blocked on: $($issues -join ', ')" -Colour DarkYellow -Indent
+            Log "This may prevent Hyper-V VM network access (DHCP/DNS)" -Colour DarkYellow -Indent
+            Log "Ask your IT admin to enable 'Apply Local Firewall Rules' in Group Policy" -Colour DarkGray -Indent
+        } else {
+            Log "Firewall policies OK (local rules allowed)" -Colour Green -Indent
+        }
+
+        # Check for specific Hyper-V firewall rules
+        $hvRules = Get-NetFirewallRule -DisplayGroup "*Hyper-V*" -ErrorAction SilentlyContinue
+        if ($hvRules) {
+            $disabled = @($hvRules | Where-Object { $_.Enabled -eq "False" })
+            if ($disabled.Count -gt 0) {
+                Log "WARNING: $($disabled.Count) Hyper-V firewall rule(s) are disabled" -Colour DarkYellow -Indent
+                foreach ($dr in $disabled | Select-Object -First 3) {
+                    Log "  - $($dr.DisplayName)" -Colour DarkGray -Indent
+                }
+                if ($disabled.Count -gt 3) {
+                    Log "  ... and $($disabled.Count - 3) more" -Colour DarkGray -Indent
+                }
+            } else {
+                Log "All Hyper-V firewall rules are enabled" -Colour Green -Indent
+            }
+        } else {
+            Log "No Hyper-V firewall rules found (may be managed by Group Policy)" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not check firewall policies -- not critical" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 14. Storage location detection
+    # ----------------------------------------------------------------
+    Step 14 $steps "Checking workspace storage location..."
+    $claudeAppData = Join-Path $env:APPDATA "Claude"
+    $vmCachePath = Join-Path $claudeAppData "claude-code-vm"
+    $storageWarnings = @()
+
+    # Check if APPDATA is on a cloud-sync folder
+    $cloudPaths = @("OneDrive", "Google Drive", "Dropbox", "iCloud", "Box")
+    foreach ($cp in $cloudPaths) {
+        if ($env:APPDATA -match [regex]::Escape($cp)) {
+            $storageWarnings += "APPDATA is inside a '$cp' sync folder -- this causes mount failures"
+        }
+    }
+
+    # Check if APPDATA is on an external/USB drive
+    try {
+        $appDataDrive = (Split-Path $env:APPDATA -Qualifier) + "\"
+        $driveInfo = Get-Volume -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue
+        if ($driveInfo) {
+            $diskNumber = (Get-Partition -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue).DiskNumber
+            if ($null -ne $diskNumber) {
+                $disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
+                if ($disk -and $disk.BusType -match "USB|Thunderbolt|1394") {
+                    $storageWarnings += "APPDATA is on an external $($disk.BusType) drive -- use a local SSD instead"
+                }
+            }
+
+            # Check if it's a network drive
+            $logDisk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($appDataDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue
+            if ($logDisk -and $logDisk.DriveType -eq 4) {
+                $storageWarnings += "APPDATA is on a network drive -- VirtioFS requires local storage"
+            }
+        }
+    } catch {}
+
+    # Check the VM cache path specifically for problematic locations
+    if (Test-Path $vmCachePath) {
+        try {
+            $vmDrive = (Split-Path $vmCachePath -Qualifier) + "\"
+            $vmDriveType = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($vmDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue).DriveType
+            if ($vmDriveType -eq 4) {
+                $storageWarnings += "VM cache is on a network drive -- this will cause failures"
+            }
+        } catch {}
+    }
+
+    if ($storageWarnings.Count -gt 0) {
+        foreach ($w in $storageWarnings) {
+            Log "WARNING: $w" -Colour DarkYellow -Indent
+        }
+        Log "Recommended: Move Claude's data to a local SSD (C:\Users\$env:USERNAME\)" -Colour DarkGray -Indent
+    } else {
+        Log "Storage location OK (local drive)" -Colour Green -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 15. NTP / time synchronisation check
+    # ----------------------------------------------------------------
+    Step 15 $steps "Checking time synchronisation..."
+    try {
+        $w32svc = Get-Service -Name "W32Time" -ErrorAction SilentlyContinue
+        if ($w32svc) {
+            if ($w32svc.Status -ne "Running") {
+                try {
+                    Start-Service -Name "W32Time" -ErrorAction Stop
+                    Log "W32Time service started (was stopped)" -Colour Green -Indent
+                } catch {
+                    Log "WARNING: W32Time service is stopped and won't start" -Colour DarkYellow -Indent
+                    Log "Clock drift may cause VM connectivity issues" -Colour DarkGray -Indent
+                }
+            } else {
+                Log "W32Time service: Running" -Colour Green -Indent
+            }
+
+            # Quick drift check
+            try {
+                $w32tmResult = & w32tm /stripchart /computer:time.windows.com /dataonly /samples:1 2>&1
+                if ($w32tmResult -match "(-?\d+\.\d+)s") {
+                    $drift = [math]::Abs([double]$Matches[1])
+                    if ($drift -gt 5.0) {
+                        Log "WARNING: Clock drift is ${drift}s (>5s threshold)" -Colour DarkYellow -Indent
+                        try {
+                            & w32tm /resync /force 2>&1 | Out-Null
+                            Log "Forced NTP resync" -Colour Green -Indent
+                        } catch {}
+                    } else {
+                        Log "Clock drift: ${drift}s (within tolerance)" -Colour Green -Indent
+                    }
+                } else {
+                    Log "Could not measure clock drift (NTP server unreachable?)" -Colour DarkGray -Indent
+                }
+            } catch {
+                Log "Could not check clock drift -- not critical" -Colour DarkGray -Indent
+            }
+        } else {
+            Log "W32Time service not found -- clock sync may not be configured" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not check time sync -- not critical" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 16. Antivirus exclusion guidance
+    # ----------------------------------------------------------------
+    Step 16 $steps "Checking antivirus configuration..."
+    $avProducts = @()
+    try {
+        # Query Windows Security Center (WMI)
+        $avItems = Get-CimInstance -Namespace "root\SecurityCenter2" -ClassName "AntiVirusProduct" -ErrorAction SilentlyContinue
+        foreach ($av in $avItems) {
+            $avProducts += $av.displayName
+        }
+    } catch {}
+
+    # Also check for common AV processes
+    $knownAvProcesses = @{
+        "MsMpEng"      = "Windows Defender"
+        "mbamservice"  = "Malwarebytes"
+        "avp"          = "Kaspersky"
+        "avgnt"        = "Avira"
+        "ccSvcHst"     = "Norton/Symantec"
+        "bdagent"      = "Bitdefender"
+        "ekrn"         = "ESET"
+        "SentinelAgent" = "SentinelOne"
+        "CrowdStrike"  = "CrowdStrike Falcon"
+        "CSFalconService" = "CrowdStrike Falcon"
+        "TmCCSF"       = "Trend Micro"
+        "SophosSafestore" = "Sophos"
+    }
+    $runningAv = @()
+    foreach ($proc in $knownAvProcesses.Keys) {
+        if (Get-Process -Name $proc -ErrorAction SilentlyContinue) {
+            $runningAv += $knownAvProcesses[$proc]
+        }
+    }
+    # Deduplicate
+    $allAv = @(($avProducts + $runningAv) | Sort-Object -Unique)
+
+    if ($allAv.Count -gt 0) {
+        Log "Detected: $($allAv -join ', ')" -Colour Cyan -Indent
+        $isDefenderOnly = ($allAv.Count -eq 1 -and $allAv[0] -match "Windows Defender")
+
+        if ($isDefenderOnly) {
+            # Check if Defender exclusions are already set
+            try {
+                $exclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath
+                $neededPaths = @(
+                    (Join-Path $env:APPDATA "Claude"),
+                    (Join-Path $env:ProgramFiles "Hyper-V"),
+                    "$env:SystemRoot\System32\vmwp.exe",
+                    "$env:SystemRoot\System32\vmms.exe"
+                )
+                $missing = @()
+                foreach ($np in $neededPaths) {
+                    $found = $false
+                    if ($exclusions) {
+                        foreach ($ex in $exclusions) {
+                            if ($np -like "$ex*") { $found = $true; break }
+                        }
+                    }
+                    if (-not $found) { $missing += $np }
+                }
+                if ($missing.Count -gt 0) {
+                    Log "Adding Defender exclusions for Hyper-V/Claude paths:" -Colour Green -Indent
+                    foreach ($mp in $missing) {
+                        try {
+                            Add-MpPreference -ExclusionPath $mp -ErrorAction Stop
+                            Log "  + $mp" -Colour Green -Indent
+                        } catch {
+                            Log "  ! Could not add: $mp" -Colour Yellow -Indent
+                        }
+                    }
+                    # Also add process exclusions
+                    try {
+                        Add-MpPreference -ExclusionProcess "vmwp.exe" -ErrorAction SilentlyContinue
+                        Add-MpPreference -ExclusionProcess "vmms.exe" -ErrorAction SilentlyContinue
+                        Add-MpPreference -ExclusionProcess "cowork-svc.exe" -ErrorAction SilentlyContinue
+                        Log "  + Process exclusions: vmwp.exe, vmms.exe, cowork-svc.exe" -Colour Green -Indent
+                    } catch {}
+                } else {
+                    Log "Defender exclusions already configured" -Colour Green -Indent
+                }
+            } catch {
+                Log "Could not check Defender exclusions -- not critical" -Colour DarkGray -Indent
+            }
+        } else {
+            # Third-party AV -- can only advise
+            Log "Recommended exclusion paths for your AV:" -Colour DarkYellow -Indent
+            Log "  - $env:APPDATA\Claude\" -Colour White -Indent
+            Log "  - $env:ProgramFiles\Hyper-V\" -Colour White -Indent
+            Log "  - $env:SystemRoot\System32\vmwp.exe" -Colour White -Indent
+            Log "  - $env:SystemRoot\System32\vmms.exe" -Colour White -Indent
+            Log "  - Process: cowork-svc.exe" -Colour White -Indent
+            Log "Adding these exclusions prevents AV filter drivers from" -Colour DarkGray -Indent
+            Log "interfering with VirtioFS disk operations" -Colour DarkGray -Indent
+        }
+    } else {
+        Log "No antivirus product detected" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 17. Install health monitor (auto-detects and auto-fixes crashes)
+    # ----------------------------------------------------------------
+    Step 17 $steps "Installing health monitor..."
+
+    # Find Watch-ClaudeHealth.ps1 in the same folder as this script
     $myDir = Split-Path $PSCommandPath -Parent
+    $watchScript = $null
+    if ($myDir) {
+        $candidate = Join-Path $myDir "Watch-ClaudeHealth.ps1"
+        if (Test-Path $candidate) { $watchScript = $candidate }
+    }
+    if (-not $watchScript) {
+        $fallbackPaths = @(
+            "C:\ClaudeFix\Watch-ClaudeHealth.ps1",
+            (Join-Path $env:USERPROFILE "Desktop\Watch-ClaudeHealth.ps1"),
+            (Join-Path $env:USERPROFILE "Documents\Watch-ClaudeHealth.ps1")
+        )
+        foreach ($fb in $fallbackPaths) {
+            if (Test-Path $fb) { $watchScript = $fb; break }
+        }
+    }
+
+    # Clean up old basic watchdog script (replaced by health monitor)
+    $oldWatchdog = Join-Path $env:APPDATA "Claude\cowork-watchdog.ps1"
+    if (Test-Path $oldWatchdog) {
+        Remove-Item $oldWatchdog -Force -ErrorAction SilentlyContinue
+        Log "Removed old basic watchdog script" -Colour DarkGray -Indent
+    }
+
+    if ($watchScript) {
+        try {
+            try {
+                Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
+            } catch {}
+
+            # Kill any running health monitor before replacing
+            try {
+                Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.CommandLine -match "Watch-ClaudeHealth" } |
+                    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            } catch {}
+
+            $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+            $action = New-ScheduledTaskAction -Execute "PowerShell.exe" `
+                          -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchScript`" -Quiet"
+
+            $trigger = New-ScheduledTaskTrigger -AtLogOn
+
+            $settings = New-ScheduledTaskSettingsSet `
+                            -AllowStartIfOnBatteries `
+                            -DontStopIfGoingOnBatteries `
+                            -StartWhenAvailable `
+                            -DontStopOnIdleEnd `
+                            -RestartCount 3 `
+                            -RestartInterval (New-TimeSpan -Minutes 1) `
+                            -ExecutionTimeLimit (New-TimeSpan -Days 365)
+
+            $principal = New-ScheduledTaskPrincipal `
+                             -UserId $currentUser `
+                             -RunLevel Highest `
+                             -LogonType S4U
+
+            Register-ScheduledTask `
+                -TaskName $TaskName `
+                -TaskPath $TaskPath `
+                -Action $action `
+                -Trigger $trigger `
+                -Settings $settings `
+                -Principal $principal `
+                -Description "Monitors Claude logs for VirtioFS mount failures and auto-runs the fix script. Polls every 30s." `
+                -Force | Out-Null
+
+            try { Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue } catch {}
+
+            Log "Health monitor installed (polls every 30s, auto-fixes crashes)" -Colour Green -Indent
+            Log "Task: Task Scheduler > $TaskPath$TaskName" -Colour DarkGray -Indent
+            Log "Script: $watchScript" -Colour DarkGray -Indent
+            Log "Logs: $env:APPDATA\Claude\watch-logs\" -Colour DarkGray -Indent
+        } catch {
+            Log "[!] Could not create health monitor task: $($_.Exception.Message)" -Colour Red -Indent
+            Log "You can run Watch-ClaudeHealth.bat manually instead" -Colour DarkGray -Indent
+        }
+    } else {
+        Log "[!] Watch-ClaudeHealth.ps1 not found in same folder" -Colour Yellow -Indent
+        Log "Put all scripts in the same folder and rerun to enable health monitor" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 18. Create boot-fix scheduled task
+    # ----------------------------------------------------------------
+    Step 18 $steps "Creating boot-time fix task..."
+
+    $fixScript = $null
     if ($myDir) {
         $candidate = Join-Path $myDir "Fix-ClaudeDesktop.ps1"
         if (Test-Path $candidate) { $fixScript = $candidate }
     }
-    # Fallback: check common locations
     if (-not $fixScript) {
         $fallbackPaths = @(
             "C:\ClaudeFix\Fix-ClaudeDesktop.ps1",
@@ -507,7 +899,6 @@ try {
 
     if ($fixScript) {
         try {
-            # Remove existing task if present
             try {
                 Unregister-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
@@ -523,9 +914,6 @@ try {
                                 -StartWhenAvailable `
                                 -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
-            # Run as the current user (elevated) so $env:APPDATA resolves
-            # to the user's profile, not SYSTEM's. This is critical because
-            # Fix-ClaudeDesktop.ps1 uses $env:APPDATA to find Claude's cache.
             $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
             $bootPrincipal = New-ScheduledTaskPrincipal `
                                  -UserId $currentUser `
@@ -554,9 +942,9 @@ try {
     }
 
     # ----------------------------------------------------------------
-    # 12. Create shortcuts (Desktop + Start Menu) for Fix-ClaudeDesktop
+    # 19. Create shortcuts (Desktop + Start Menu)
     # ----------------------------------------------------------------
-    Step 12 $steps "Creating Fix Claude Desktop shortcuts..."
+    Step 19 $steps "Creating Fix Claude Desktop shortcuts..."
 
     $fixBat = $null
     if ($myDir) {
@@ -564,7 +952,6 @@ try {
         if (Test-Path $candidate) { $fixBat = $candidate }
     }
     if (-not $fixBat -and $fixScript) {
-        # If we found the .ps1 earlier, check for .bat next to it
         $fixBatCandidate = Join-Path (Split-Path $fixScript -Parent) "Fix-ClaudeDesktop.bat"
         if (Test-Path $fixBatCandidate) { $fixBat = $fixBatCandidate }
     }
@@ -572,7 +959,6 @@ try {
     if ($fixBat) {
         $shell = New-Object -ComObject WScript.Shell
 
-        # Desktop shortcut
         $desktopPath = [Environment]::GetFolderPath("Desktop")
         $desktopLnk = Join-Path $desktopPath "Fix Claude Desktop.lnk"
         try {
@@ -580,8 +966,7 @@ try {
             $sc.TargetPath = $fixBat
             $sc.WorkingDirectory = Split-Path $fixBat -Parent
             $sc.Description = "Reset and fix Claude Desktop / Cowork VM"
-            $sc.WindowStyle = 1  # Normal window
-            # Use shield icon from shell32.dll (index 77)
+            $sc.WindowStyle = 1
             $sc.IconLocation = "%SystemRoot%\System32\shell32.dll,77"
             $sc.Save()
             Log "Desktop shortcut created" -Colour Green -Indent
@@ -589,7 +974,6 @@ try {
             Log "[!] Could not create desktop shortcut: $($_.Exception.Message)" -Colour Yellow -Indent
         }
 
-        # Start Menu shortcut
         $startMenuPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
         $startMenuLnk = Join-Path $startMenuPath "Fix Claude Desktop.lnk"
         try {
@@ -630,7 +1014,14 @@ try {
     Write-Host "    Connected Standby .... Disabled" -ForegroundColor White
     Write-Host "    NIC power saving ..... Disabled" -ForegroundColor White
     Write-Host "    CPU minimum (AC) ..... 100%" -ForegroundColor White
-    Write-Host "    Watchdog task ........ Every 5 min" -ForegroundColor White
+    Write-Host "    VM memory ............ Pinned (no ballooning)" -ForegroundColor White
+    Write-Host "    VM worker priority ... AboveNormal" -ForegroundColor White
+    Write-Host "    WinNAT rules ......... Verified/repaired" -ForegroundColor White
+    Write-Host "    Firewall policies .... Checked" -ForegroundColor White
+    Write-Host "    Storage location ..... Checked" -ForegroundColor White
+    Write-Host "    Time sync ............ Verified" -ForegroundColor White
+    Write-Host "    Antivirus ............ Exclusions configured" -ForegroundColor White
+    Write-Host "    Health monitor ....... Every 30s (auto-fix)" -ForegroundColor White
     Write-Host "    Boot-fix task ........ At every logon" -ForegroundColor White
     Write-Host "    Shortcuts ............ Desktop + Start Menu" -ForegroundColor White
     Write-Host ""

@@ -20,6 +20,7 @@ Two scripts: one **prevents** the crash, the other **fixes** it when it happens 
 |--------|---------|----------|
 | `Prevent-ClaudeIssues.bat` | Configure Windows to minimise crashes | Once |
 | `Fix-ClaudeDesktop.bat` | Reset and relaunch when it breaks | Every time it breaks |
+| `Watch-ClaudeHealth.bat` | Foreground health monitor (auto-installed by Prevent) | Optional / manual |
 
 ---
 
@@ -30,7 +31,7 @@ Two scripts: one **prevents** the crash, the other **fixes** it when it happens 
 3. Use the Desktop shortcut or search "Fix Claude Desktop" in Start when Cowork breaks
 4. Right-click the Start Menu entry and select **Pin to taskbar** for one-click access
 
-After running the prevention script, Claude will be automatically repaired at every logon and the VM service will be monitored continuously.
+After running the prevention script, Claude will be automatically repaired at every logon and a background health monitor will detect and auto-fix VirtioFS crashes within seconds.
 
 ---
 
@@ -69,6 +70,10 @@ The VirtioFS connection degrades when:
 - Power management reduces PCI-E or USB link states mid-operation
 - `CoworkVMService` crashes and doesn't auto-recover
 - Stale VM cache files from a previous session conflict with the new boot
+- Hyper-V Dynamic Memory reclaims shared memory regions from the VM
+- WinNAT rules disappear (VPN reconnect, network reset), killing VM connectivity
+- Antivirus filter drivers interfere with VirtioFS disk operations
+- Host clock drift causes TLS and API failures inside the VM
 
 ### Tracked Issues
 
@@ -137,19 +142,58 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 7 | Connected Standby | Disabled | Modern Standby can enter low-power states even with sleep "disabled" |
 | 8 | Network adapter power saving | Disabled | Prevents Windows from sleeping virtual network adapters used by Hyper-V |
 | 9 | Processor minimum state | 100% (AC) | Prevents CPU throttling that can starve the VM |
-| 10 | Watchdog task | Every 5 minutes | Auto-restarts `CoworkVMService` if it dies while Claude is running |
-| 11 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
-| 12 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
+| 10 | Hyper-V VM memory | Pinned (no ballooning) | Prevents memory reclaim from invalidating VirtioFS shared regions |
+| 11 | VM worker priority | AboveNormal | Prevents host from deprioritizing vmwp.exe under load |
+| 12 | WinNAT rules | Verified / repaired | Ensures VM has outbound network connectivity |
+| 13 | Firewall policies | Checked | Detects Group Policy blocking Hyper-V network rules |
+| 14 | Storage location | Checked | Warns if workspace is on cloud-sync, USB, or network drive |
+| 15 | Time synchronisation | Verified | Ensures NTP is running and clock drift is within tolerance |
+| 16 | Antivirus exclusions | Configured / advised | Prevents AV filter drivers from blocking VirtioFS disk ops |
+| 17 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
+| 18 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
+| 19 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
 
 Battery settings are not changed -- laptop users keep normal battery behaviour.
 
-### The Watchdog
+### Hyper-V VM Memory and Worker Priority
 
-A scheduled task runs every 5 minutes as SYSTEM. It checks whether `CoworkVMService` has stopped while `claude.exe` is still running, and restarts the service if so.
+**Dynamic Memory pinning** (step 10) -- Hyper-V's Dynamic Memory feature allows Windows to balloon memory in and out of VMs based on demand. When memory is reclaimed from the Cowork VM, VirtioFS shared memory regions can become invalid -- this is the direct cause of the `EFAULT` ("bad address") error. Disabling Dynamic Memory pins the VM's allocation so it can't be reclaimed. This requires the VM to be stopped; if it's running when you run Prevent, a flag file is written and the health monitor applies the change the next time the VM restarts.
 
-This catches cases where the service simply stops. Stale VirtioFS mounts still need the full fix script.
+**VM worker process priority** (step 11) -- `vmwp.exe` is the Hyper-V Virtual Machine Worker Process that hosts each VM on the host side. At Normal priority, it can be starved under heavy CPU or I/O load, causing the VirtioFS connection to stall or time out. Setting it to AboveNormal gives it scheduling preference. This is not persistent across reboots, so the health monitor re-applies it on every poll cycle.
 
-Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`.
+### Network and NAT
+
+**WinNAT rules** (step 12) -- The Cowork VM needs a WinNAT rule to route traffic from its internal Hyper-V switch to the host's network. If this rule disappears (VPN reconnect, network adapter change, Windows Update), the VM silently loses all outbound connectivity. API calls fail, package downloads stall, and the workspace becomes unresponsive. The prevention script checks for existing NAT rules and auto-creates one if missing. The health monitor continuously monitors NAT health and repairs it automatically.
+
+**Firewall policies** (step 13) -- Group Policy can set "Apply Local Firewall Rules" to disabled, which blocks the DHCP and DNS rules that Hyper-V's Host Network Service (HNS) creates for VMs. The script detects this and warns you to contact your IT admin. It also checks that Hyper-V-specific firewall rules are enabled.
+
+### Storage, Time Sync, and Antivirus
+
+**Storage location** (step 14) -- VirtioFS mounts fail when Claude's data directory is on a cloud-sync folder (OneDrive, Google Drive, Dropbox), an external USB drive, or a network share. The script detects these conditions and warns you to move Claude's data to a local SSD.
+
+**Time synchronisation** (step 15) -- If the host clock drifts more than 5 seconds from NTP, Hyper-V's time synchronisation integration service can't correct the guest clock. This causes TLS certificate validation failures and API timeouts inside the VM. The script checks the W32Time service, measures actual drift, and forces a resync if needed. The health monitor continues to check every 5 minutes.
+
+**Antivirus exclusions** (step 16) -- Antivirus filter drivers sit in the I/O path between VirtioFS and the host filesystem. They can delay or block disk operations that VirtioFS depends on, causing timeouts and mount failures. For Windows Defender, the script automatically adds exclusions for Claude's data directory, Hyper-V binaries, and the CoworkVMService process. For third-party AV products, it lists the recommended exclusion paths for you to add manually.
+
+### The Health Monitor
+
+A persistent background process that starts at logon and polls every 30 seconds. It monitors seven sources for VirtioFS failures:
+
+1. **Claude log files** -- scans all `*.log` files in `%APPDATA%\Claude\logs\` for error patterns like "Plan9 mount failed" and "bad address"
+2. **Service status** -- detects when `CoworkVMService` stops while `claude.exe` is still running
+3. **Windows Event Log** -- checks for recent `CoworkVMService` errors, Hyper-V Worker warnings, and VMMS errors
+4. **WinNAT health** -- detects missing NAT rules and auto-repairs them (every 60 seconds)
+5. **Hyper-V heartbeat** -- monitors the VM's Integration Services heartbeat to detect hung VMs
+6. **VM log staleness** -- catches silent hangs where the VM stops writing logs (3 consecutive stale checks = trigger)
+7. **Clock drift** -- checks NTP drift every 5 minutes and auto-resyncs if >5 seconds
+
+When a failure is detected, it automatically runs `Fix-ClaudeDesktop.ps1 -Quiet` to kill Claude, purge the VM cache, restart the service, and relaunch -- typically within 30 seconds of the error occurring. A 3-minute cooldown prevents rapid cycling.
+
+The monitor also performs continuous maintenance: re-applying vmwp.exe AboveNormal priority on every cycle, and applying deferred Dynamic Memory changes when the VM is stopped.
+
+The monitor uses a global mutex to ensure only one instance runs at a time. It logs its activity to `%APPDATA%\Claude\watch-logs\` (auto-cleaned after 30 days).
+
+Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`. Can also be started manually with `Watch-ClaudeHealth.bat` for foreground monitoring.
 
 ### Fast Startup, Connected Standby, NIC Power Saving
 
@@ -206,6 +250,12 @@ The prevention script genuinely needs admin for power settings, scheduled tasks,
 **Connected Standby changes didn't take effect**
 This setting requires a full reboot (not just sleep/wake). Shut down, wait 10 seconds, power on. Verify with `powercfg /a` -- if it no longer lists "Standby (S0 Low Power Idle)" then Modern Standby is disabled.
 
+**The prevention script warns about WinNAT / Firewall**
+If you see a WinNAT warning, the health monitor will attempt to repair it automatically. If you see a firewall warning, ask your IT admin to enable "Apply Local Firewall Rules" in Group Policy for the affected profiles.
+
+**Antivirus warnings**
+If you have third-party antivirus, add the recommended exclusion paths shown by the prevention script. For Windows Defender, exclusions are added automatically.
+
 **Claude launches with a duplicate taskbar icon**
 This happens when an MSIX (Microsoft Store) app is launched via its `.exe` path directly instead of through the shell protocol. The fix script handles this automatically, but if you see it, make sure you're using the latest version of the fix script.
 
@@ -221,6 +271,8 @@ Fix-ClaudeDesktop.bat       -- Fix launcher (double-click when broken)
 Fix-ClaudeDesktop.ps1       -- Fix script
 Prevent-ClaudeIssues.bat    -- Prevention launcher (run once)
 Prevent-ClaudeIssues.ps1    -- Prevention script
+Watch-ClaudeHealth.bat      -- Health monitor launcher (manual foreground mode)
+Watch-ClaudeHealth.ps1      -- Health monitor (auto-detects and auto-fixes crashes)
 README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
