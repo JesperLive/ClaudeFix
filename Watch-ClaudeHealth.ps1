@@ -15,7 +15,7 @@
     - VM log staleness (hung VM detection)
     - Host clock drift (NTP/time sync)
 
-    SAFETY FEATURES (v3.1):
+    SAFETY FEATURES (v3.2):
     - Auto-fix is BLOCKED when user is active (Claude in focus, recent input, VM busy, CPU active)
     - Electron-aware window detection (GetWindowThreadProcessId, not MainWindowHandle)
     - Session 0 safe (falls back to process heuristics when Win32 APIs are unavailable)
@@ -41,7 +41,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 3.1.0
+    Version : 3.2.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -56,7 +56,7 @@ param(
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "3.1.0"
+$Version        = "3.2.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
 $ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
@@ -367,10 +367,15 @@ function Test-WinNatHealth {
     $script:LastNatCheckTime = $now
 
     try {
+        # The Hyper-V "Default Switch" provides NAT natively through HNS
+        # without requiring a WinNAT (Get-NetNat) rule. If it exists, NAT is fine.
+        $defaultSwitch = Get-VMSwitch -Name "Default Switch" -ErrorAction SilentlyContinue
+        if ($defaultSwitch) { return $null }
+
         $natRules = @(Get-NetNat -ErrorAction SilentlyContinue)
         if ($natRules.Count -eq 0) {
             $hvSwitch = Get-VMSwitch -SwitchType Internal -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -match "WSL|claude|Default|nat" } |
+                        Where-Object { $_.Name -match "WSL|claude|nat" } |
                         Select-Object -First 1
             if (-not $hvSwitch) {
                 $hvSwitch = Get-VMSwitch -SwitchType Internal -ErrorAction SilentlyContinue |
@@ -680,9 +685,117 @@ function Invoke-AutoFix {
         return
     }
 
+    # ---- PRE-FIX WARNING: 30s grace period with notification ----
+    # Show a balloon tip so the user knows what's about to happen.
+    # The notification says "open Claude to cancel" because we only cancel
+    # if Claude becomes actively used -- not just because the mouse moved.
+    # This way, a genuinely hung VM still gets fixed even if the user is
+    # browsing, gaming, or otherwise using the PC.
+    Write-WatchLog ">>> PRE-FIX WARNING: $Reason -- auto-fix in 30s (open Claude to cancel)"
+    $notifyIcon = $null
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+        $notifyIcon.Icon = [System.Drawing.SystemIcons]::Warning
+        $notifyIcon.Visible = $true
+        $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
+        $notifyIcon.BalloonTipTitle = "Claude Health Monitor"
+        $notifyIcon.BalloonTipText = "VM appears hung. Auto-fix in 30s.`nSwitch to Claude to cancel."
+        $notifyIcon.ShowBalloonTip(30000)
+        # Play the Windows "Exclamation" sound so the user hears it even if not looking
+        [System.Media.SystemSounds]::Exclamation.Play()
+    } catch {
+        # Notification failed (Session 0, missing assemblies) -- proceed without
+    }
+
+    Start-Sleep -Seconds 30
+
+    # Dismiss notification
+    try { if ($notifyIcon) { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } } catch {}
+
+    # Re-check: only cancel if Claude is ACTIVELY being used.
+    # We check Claude-specific signals (foreground, CPU, VM log) but NOT
+    # general user input -- the user may be at the keyboard in another app
+    # while Claude's VM is genuinely dead.
+    $cancelFix = $false
+    $cancelReason = ""
+    $claudeProcs = @(Get-Process -Name "claude" -ErrorAction SilentlyContinue)
+    if ($claudeProcs.Count -gt 0) {
+        # Cancel if Claude is the foreground window
+        if ($script:IsInteractiveSession) {
+            try {
+                $fgHwnd = [Win32Activity]::GetForegroundWindow()
+                if ($fgHwnd -ne [IntPtr]::Zero) {
+                    $fgPid = 0
+                    [Win32Activity]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid) | Out-Null
+                    if ($fgPid -gt 0) {
+                        foreach ($cp in $claudeProcs) {
+                            if ($cp.Id -eq $fgPid) { $cancelFix = $true; $cancelReason = "Claude is now in focus"; break }
+                        }
+                        if (-not $cancelFix) {
+                            try {
+                                $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$fgPid" -ErrorAction SilentlyContinue).ParentProcessId
+                                foreach ($cp in $claudeProcs) {
+                                    if ($cp.Id -eq $parentId) { $cancelFix = $true; $cancelReason = "Claude is now in focus"; break }
+                                }
+                            } catch {}
+                        }
+                    }
+                }
+            } catch {}
+        }
+
+        # Cancel if any Claude process is burning CPU
+        if (-not $cancelFix) {
+            foreach ($cp in $claudeProcs) {
+                try {
+                    $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds
+                    Start-Sleep -Milliseconds 500
+                    $cp.Refresh()
+                    $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
+                    if (($cpu2 - $cpu1) -gt 100) { $cancelFix = $true; $cancelReason = "Claude CPU active"; break }
+                } catch {}
+            }
+        }
+    }
+
+    # Cancel if VM log became active during the 30s window
+    if (-not $cancelFix) {
+        $vmLog = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+        if (Test-Path $vmLog) {
+            $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
+            if ($ageSec -lt 120) { $cancelFix = $true; $cancelReason = "VM log became active" }
+        }
+    }
+
+    if ($cancelFix) {
+        Write-WatchLog ">>> CANCELLED: $cancelReason during 30s grace period"
+
+        # Tell the user the VM may still need repair -- they came back to Claude
+        # but the underlying issue hasn't gone away.
+        try {
+            $cancelNotify = New-Object System.Windows.Forms.NotifyIcon
+            $cancelNotify.Icon = [System.Drawing.SystemIcons]::Information
+            $cancelNotify.Visible = $true
+            $cancelNotify.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+            $cancelNotify.BalloonTipTitle = "Claude Health Monitor"
+            $cancelNotify.BalloonTipText = "Auto-fix cancelled (you're using Claude).`nIf Cowork is broken, run Fix-ClaudeDesktop.bat"
+            $cancelNotify.ShowBalloonTip(15000)
+            [System.Media.SystemSounds]::Asterisk.Play()
+            # Clean up after a delay so the balloon stays visible
+            Start-Sleep -Seconds 16
+            $cancelNotify.Visible = $false
+            $cancelNotify.Dispose()
+        } catch {}
+
+        $script:LastFixTime = $now.AddMinutes(-($Cooldown - 2))
+        return
+    }
+
     $script:FixCount++
     Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) TRIGGERED: $Reason"
-    Write-WatchLog "    (User appears idle and Claude is not in focus)"
+    Write-WatchLog "    (Claude still inactive after 30s warning)"
     $script:LastFixTime = $now
 
     try {
@@ -708,7 +821,7 @@ function Invoke-AutoFix {
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v3.1"
+$mutexName = "Global\ClaudeHealthMonitor_v3.2"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)

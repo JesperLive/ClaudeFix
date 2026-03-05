@@ -187,7 +187,7 @@ A persistent background process that starts at logon and polls every 30 seconds.
 6. **VM log staleness** -- catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if VM was previously active)
 7. **Clock drift** -- checks NTP drift every 5 minutes and auto-resyncs if >5 seconds (warning only)
 
-### Safety Features (v3.1)
+### Safety Features (v3.2)
 
 The entire toolkit is designed to **never interrupt active work** — whether you're in Chat, Cowork, or Code:
 
@@ -203,8 +203,11 @@ The entire toolkit is designed to **never interrupt active work** — whether yo
 - **Tightened event log matching** -- Hyper-V VMMS events must mention "claude" or "cowork" (no generic "failed"/"unexpected" matching). Worker events: Critical/Error only
 - **VM log staleness requires prior activity** -- only triggers if the VM log was previously active this session, preventing false positives in Chat mode
 - **5-minute cooldown** -- between auto-fixes
+- **30s pre-fix warning with notification** -- before any auto-fix, a Windows balloon notification with an audible chime warns you. You have 30 seconds to switch to Claude to cancel. If you don't, the fix proceeds. If you do switch to Claude, the fix cancels and a second notification tells you to run Fix-ClaudeDesktop.bat manually if Cowork is broken
+- **Smart cancellation** -- the 30s grace period only cancels if Claude is *actively being used* (foreground window, CPU activity, or VM log alive). General mouse/keyboard activity in other apps does **not** cancel the fix — so a genuinely hung VM still gets repaired while you're browsing or gaming
+- **Default Switch NAT awareness** -- the NAT health check now recognises Hyper-V's "Default Switch" as providing NAT natively (via HNS), eliminating false "WinNAT missing" warnings on standard configurations
 
-When a failure is detected **and the user is idle**, it automatically runs `Fix-ClaudeDesktop.ps1 -Quiet`. If the user is active, it logs a `BLOCKED` message and waits, telling you to run the fix manually when ready.
+When a failure is detected **and the user is idle**, it shows a warning notification with a 30-second countdown, then runs `Fix-ClaudeDesktop.ps1 -Quiet`. If you switch to Claude during the countdown, the fix cancels and you're notified to run it manually. If the user was already detected as active before the countdown, it logs a `BLOCKED` message and waits.
 
 The monitor also performs continuous maintenance: re-applying vmwp.exe AboveNormal priority on every cycle, and applying deferred Dynamic Memory changes when the VM is stopped.
 
