@@ -15,8 +15,10 @@
     - VM log staleness (hung VM detection)
     - Host clock drift (NTP/time sync)
 
-    SAFETY FEATURES (v3.2):
+    SAFETY FEATURES (v3.3):
     - Auto-fix is BLOCKED when user is active (Claude in focus, recent input, VM busy, CPU active)
+    - Claude Code session awareness (detects active Code sessions via session files + renderer logs)
+    - Extended CPU sampling (3 samples over 3s to catch bursty API-wait patterns)
     - Electron-aware window detection (GetWindowThreadProcessId, not MainWindowHandle)
     - Session 0 safe (falls back to process heuristics when Win32 APIs are unavailable)
     - Startup grace period (skips first 90s to avoid matching pre-existing events)
@@ -56,7 +58,7 @@ param(
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "3.2.0"
+$Version        = "3.3.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
 $ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
@@ -586,6 +588,47 @@ function Apply-DynamicMemoryFlag {
 
 # -- User activity detection ---------------------------------------------
 
+function Test-ClaudeCodeActive {
+    <#
+    .SYNOPSIS
+        Returns $true if a Claude Code session appears to be active.
+        Claude Code runs INSIDE Claude Desktop but does NOT use the Cowork VM.
+        It communicates directly with the Anthropic API, so VM staleness is
+        expected and normal during Code usage.
+
+        CHECKS:
+        1. Session files: claude-code-sessions folder for recently-modified files (10 min)
+        2. Renderer logs: unknown-window*.log or claude.ai-web*.log recently written (10 min)
+           These logs show LOCAL_SESSION activity when Code is streaming/processing.
+    #>
+    try {
+        # Check 1: Claude Code session persistence files
+        # Code writes session state to: %AppData%\Claude\claude-code-sessions\{accountId}\{orgId}\
+        $codeSessionDir = Join-Path $ClaudeAppData "claude-code-sessions"
+        if (Test-Path $codeSessionDir) {
+            # Find any .json file modified in the last 10 minutes (Code writes as it works)
+            $recentFiles = Get-ChildItem -Path $codeSessionDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { ((Get-Date) - $_.LastWriteTime).TotalMinutes -lt 10 } |
+                Select-Object -First 1
+            if ($recentFiles) { return $true }
+        }
+
+        # Check 2: Renderer log recency
+        # When Code is active, the renderer writes LOCAL_SESSION messages to these logs.
+        # Even during quiet API-wait periods, messages appear every few minutes.
+        $rendererLogs = @(
+            Get-ChildItem -Path $ClaudeLogDir -Filter "unknown-window*.log" -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $ClaudeLogDir -Filter "claude.ai-web*.log" -ErrorAction SilentlyContinue
+        )
+        foreach ($rLog in $rendererLogs) {
+            if ($rLog -and ((Get-Date) - $rLog.LastWriteTime).TotalMinutes -lt 10) {
+                return $true
+            }
+        }
+    } catch {}
+    return $false
+}
+
 function Test-UserActivity {
     <#
     .SYNOPSIS
@@ -598,10 +641,11 @@ function Test-UserActivity {
         2. User input within 3 minutes + Claude running
         3. VM log active within 120s (covers Code thinking phases)
         4. CPU sampling -- any Claude process burning >100ms CPU in 500ms
+        5. Active Claude Code session (session files or renderer logs)
 
         SESSION 0 (SYSTEM scheduled tasks):
         - Win32 APIs return zero/stale data, so we skip checks 1-2
-        - Falls back to VM log + CPU sampling only
+        - Falls back to VM log + CPU sampling + Code session detection
     #>
     try {
         $claudeProcs = @(Get-Process -Name "claude" -ErrorAction SilentlyContinue)
@@ -659,6 +703,12 @@ function Test-UserActivity {
                 if (($cpu2 - $cpu1) -gt 100) { return $true }
             } catch {}
         }
+
+        # Check 5: Active Claude Code session
+        # Code runs inside Claude Desktop but doesn't use the VM.
+        # During API-wait periods, CPU can be near zero for minutes.
+        # Session files and renderer logs are more reliable indicators.
+        if (Test-ClaudeCodeActive) { return $true }
     } catch {}
     return $false
 }
@@ -701,7 +751,7 @@ function Invoke-AutoFix {
         $notifyIcon.Visible = $true
         $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Warning
         $notifyIcon.BalloonTipTitle = "Claude Health Monitor"
-        $notifyIcon.BalloonTipText = "VM appears hung. Auto-fix in 30s.`nSwitch to Claude to cancel."
+        $notifyIcon.BalloonTipText = "VM appears hung. Auto-fix in 30s.`nSwitch to Claude or use Code to cancel."
         $notifyIcon.ShowBalloonTip(30000)
         # Play the Windows "Exclamation" sound so the user hears it even if not looking
         [System.Media.SystemSounds]::Exclamation.Play()
@@ -747,15 +797,20 @@ function Invoke-AutoFix {
         }
 
         # Cancel if any Claude process is burning CPU
+        # Extended sampling: 3 checks × 1s to catch bursty Code patterns
+        # (Code has near-zero CPU during API waits but spikes during processing)
         if (-not $cancelFix) {
-            foreach ($cp in $claudeProcs) {
-                try {
-                    $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds
-                    Start-Sleep -Milliseconds 500
-                    $cp.Refresh()
-                    $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
-                    if (($cpu2 - $cpu1) -gt 100) { $cancelFix = $true; $cancelReason = "Claude CPU active"; break }
-                } catch {}
+            for ($sample = 1; $sample -le 3; $sample++) {
+                if ($cancelFix) { break }
+                foreach ($cp in $claudeProcs) {
+                    try {
+                        $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds
+                        Start-Sleep -Milliseconds 1000
+                        $cp.Refresh()
+                        $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
+                        if (($cpu2 - $cpu1) -gt 50) { $cancelFix = $true; $cancelReason = "Claude CPU active (sample $sample/3)"; break }
+                    } catch {}
+                }
             }
         }
     }
@@ -767,6 +822,13 @@ function Invoke-AutoFix {
             $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
             if ($ageSec -lt 120) { $cancelFix = $true; $cancelReason = "VM log became active" }
         }
+    }
+
+    # Cancel if a Claude Code session is active
+    # This is the critical check: Code doesn't use the VM, so VM staleness
+    # is expected during Code usage. Killing Claude kills the Code session.
+    if (-not $cancelFix) {
+        if (Test-ClaudeCodeActive) { $cancelFix = $true; $cancelReason = "Claude Code session active" }
     }
 
     if ($cancelFix) {
@@ -821,7 +883,7 @@ function Invoke-AutoFix {
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v3.2"
+$mutexName = "Global\ClaudeHealthMonitor_v3.3"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)
