@@ -37,7 +37,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.0.0
+    Version : 4.2.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -70,7 +70,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.0.0"
+$Version          = "4.2.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -116,7 +116,7 @@ if ($Undo) {
     # ================================================================
     # UNDO MODE
     # ================================================================
-    $steps = 8
+    $steps = 10
 
     Step 1 $steps "Restoring original power plan..."
     if (Test-Path $BackupFile) {
@@ -252,6 +252,79 @@ if ($Undo) {
         Log "No shortcuts found" -Colour DarkGray -Indent
     }
 
+    Step 9 $steps "Removing Claude elevation config..."
+    try {
+        # Remove the LaunchClaudeAdmin scheduled task
+        try {
+            Unregister-ScheduledTask -TaskName "LaunchClaudeAdmin" -TaskPath $TaskPath -Confirm:$false -ErrorAction Stop
+            Log "Removed LaunchClaudeAdmin scheduled task" -Colour Green -Indent
+        } catch {
+            Log "LaunchClaudeAdmin task not found" -Colour DarkGray -Indent
+        }
+        # Remove RUNASADMIN compat flag for any Claude.exe entries
+        $layersPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+        if (Test-Path $layersPath) {
+            $layers = Get-ItemProperty -Path $layersPath -ErrorAction SilentlyContinue
+            $removedFlag = $false
+            foreach ($prop in $layers.PSObject.Properties) {
+                if ($prop.Name -match "Claude\.exe" -and $prop.Value -match "RUNASADMIN") {
+                    Remove-ItemProperty -Path $layersPath -Name $prop.Name -Force -ErrorAction SilentlyContinue
+                    Log "Removed RUNASADMIN flag: $($prop.Name)" -Colour Green -Indent
+                    $removedFlag = $true
+                }
+            }
+            if (-not $removedFlag) {
+                Log "No RUNASADMIN flags found" -Colour DarkGray -Indent
+            }
+        }
+        # Remove admin shortcut
+        $adminLnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "Claude (Admin).lnk"
+        if (Test-Path $adminLnk) {
+            Remove-Item $adminLnk -Force -ErrorAction SilentlyContinue
+            Log "Removed: $adminLnk" -Colour Green -Indent
+        }
+        # Remove launcher scripts
+        $launcherCmd = Join-Path $env:APPDATA "Claude\Launch-Claude-Admin.cmd"
+        $launcherPs1 = Join-Path $env:APPDATA "Claude\Launch-Claude-Admin.ps1"
+        foreach ($lf in @($launcherCmd, $launcherPs1)) {
+            if (Test-Path $lf) {
+                Remove-Item $lf -Force -ErrorAction SilentlyContinue
+                Log "Removed launcher: $lf" -Colour Green -Indent
+            }
+        }
+    } catch {
+        Log "Could not fully remove elevation config -- not critical" -Colour DarkGray -Indent
+    }
+
+    Step 10 $steps "Reverting admin token policy..."
+    try {
+        $policyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        $reverted = $false
+        try {
+            $latfp = (Get-ItemProperty -Path $policyPath -ErrorAction Stop).LocalAccountTokenFilterPolicy
+            if ($null -ne $latfp -and $latfp -eq 1) {
+                Remove-ItemProperty -Path $policyPath -Name "LocalAccountTokenFilterPolicy" -Force -ErrorAction Stop
+                Log "LocalAccountTokenFilterPolicy: Removed (restored default filtering)" -Colour Green -Indent
+                $reverted = $true
+            }
+        } catch {}
+        try {
+            $fat = (Get-ItemProperty -Path $policyPath -ErrorAction Stop).FilterAdministratorToken
+            if ($null -ne $fat -and $fat -eq 0) {
+                Remove-ItemProperty -Path $policyPath -Name "FilterAdministratorToken" -Force -ErrorAction Stop
+                Log "FilterAdministratorToken: Removed (restored default)" -Colour Green -Indent
+                $reverted = $true
+            }
+        } catch {}
+        if (-not $reverted) {
+            Log "Token policy was not modified by this script" -Colour DarkGray -Indent
+        } else {
+            Log "A reboot is required for token policy changes to take effect" -Colour DarkYellow -Indent
+        }
+    } catch {
+        Log "Could not revert token policy -- not critical" -Colour DarkGray -Indent
+    }
+
     Write-Host ""
     Write-Host "  +----------------------------------------------+" -ForegroundColor Green
     Write-Host "  |           UNDO COMPLETE                       |" -ForegroundColor Green
@@ -264,7 +337,7 @@ if ($Undo) {
     # ================================================================
     # SETUP MODE
     # ================================================================
-    $steps = 19
+    $steps = 21
 
     # ----------------------------------------------------------------
     # 1. Power plan -- High Performance or Ultimate Performance
@@ -998,6 +1071,167 @@ if ($Undo) {
         Log "Put all scripts in the same folder and rerun to create shortcuts" -Colour DarkGray -Indent
     }
 
+    # ----------------------------------------------------------------
+    # 20. Set Claude Desktop to launch elevated (MSIX-aware)
+    # ----------------------------------------------------------------
+    Step 20 $steps "Configuring Claude Desktop to launch elevated..."
+    try {
+        # Scheduled task registration requires admin -- skip gracefully if not elevated
+        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        if (-not $isAdmin) {
+            Log "Skipped -- requires admin privileges (run as Administrator to enable)" -Colour DarkYellow -Indent
+            throw "SKIP"
+        }
+        # MSIX apps block all direct .exe access from WindowsApps (ACLs, -Verb RunAs,
+        # dir enumeration all fail). The only reliable way to launch an MSIX app with
+        # full admin privileges is a scheduled task with RunLevel=Highest + Interactive
+        # logon. The task gets a full unfiltered admin token, no UAC prompt, and the
+        # GUI is visible in the user's desktop session.
+        #
+        # The task action finds Claude at runtime via three methods:
+        #   1) Get-AppxPackage (MSIX installs from Store/winget)
+        #   2) Common install paths (traditional .exe installer)
+        #   3) Running process fallback (any install method)
+        # This survives version updates and works with any install type.
+
+        $elevTaskName = "LaunchClaudeAdmin"
+
+        # Remove old task if present
+        try { Unregister-ScheduledTask -TaskName $elevTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+
+        # PowerShell command that finds and launches Claude
+        # Priority: 1) MSIX via Get-AppxPackage  2) Traditional .exe install paths  3) Running process
+        $launchCmd = @'
+$exe = $null
+# 1. MSIX install (Windows Store / winget MSIX)
+$p = Get-AppxPackage | Where-Object { $_.Name -eq 'Claude' -or $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
+if ($p) { $e = Join-Path $p.InstallLocation 'app\Claude.exe'; if (Test-Path $e) { $exe = $e } }
+# 2. Traditional installer paths
+if (-not $exe) {
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Programs\claude-desktop\Claude.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Claude Desktop\Claude.exe'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'),
+        (Join-Path ${env:ProgramFiles} 'Claude Desktop\Claude.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Claude Desktop\Claude.exe')
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { $exe = $c; break } }
+}
+# 3. Fallback: find from running process
+if (-not $exe) {
+    $proc = Get-Process -Name Claude -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($proc -and $proc.MainModule) { $exe = $proc.MainModule.FileName }
+}
+if ($exe) { Start-Process $exe } else { throw 'Claude Desktop not found. Is it installed?' }
+'@
+
+        # Encode as Base64 for -EncodedCommand (handles multi-line safely in task XML)
+        $encodedCmd = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launchCmd))
+
+        $elevAction = New-ScheduledTaskAction -Execute "PowerShell.exe" `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCmd"
+
+        $elevSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $elevPrincipal = New-ScheduledTaskPrincipal `
+            -UserId $currentUser `
+            -RunLevel Highest `
+            -LogonType Interactive
+
+        Register-ScheduledTask `
+            -TaskName $elevTaskName `
+            -TaskPath $TaskPath `
+            -Action $elevAction `
+            -Settings $elevSettings `
+            -Principal $elevPrincipal `
+            -Description "Launches Claude Desktop with full admin privileges. Triggered by the 'Claude (Admin)' shortcut." `
+            -Force | Out-Null
+
+        Log "Scheduled task created: $TaskPath$elevTaskName (Highest + Interactive)" -Colour Green -Indent
+
+        # Create a launcher .cmd that triggers the task (one-liner, no $, no PS needed)
+        $launcherDir = Join-Path $env:APPDATA "Claude"
+        $launcherCmd = Join-Path $launcherDir "Launch-Claude-Admin.cmd"
+        $cmdContent = @"
+@echo off
+REM -- Claude Desktop (Admin) Launcher
+REM -- Auto-generated by Prevent-ClaudeIssues.ps1 v$Version
+REM -- Triggers the LaunchClaudeAdmin scheduled task (runs with full admin token).
+schtasks /run /tn "\Claude\LaunchClaudeAdmin" >nul 2>&1
+if errorlevel 1 (
+    echo The LaunchClaudeAdmin scheduled task was not found.
+    echo Run Prevent-ClaudeIssues.bat to set it up.
+    pause
+)
+"@
+        Set-Content -Path $launcherCmd -Value $cmdContent -Encoding ASCII -Force
+        Log "Launcher CMD created: $launcherCmd" -Colour Green -Indent
+
+        # Create desktop shortcut pointing to the launcher
+        $desktopPath = [Environment]::GetFolderPath("Desktop")
+
+        # Remove any old broken shortcuts
+        $oldLnk = Join-Path $desktopPath "Claude (Admin).lnk"
+        if (Test-Path $oldLnk) {
+            Remove-Item $oldLnk -Force -ErrorAction SilentlyContinue
+        }
+
+        $adminLnkPath = Join-Path $desktopPath "Claude (Admin).lnk"
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($adminLnkPath)
+        $sc.TargetPath = $launcherCmd
+        $sc.WorkingDirectory = $launcherDir
+        $sc.Description = "Claude Desktop (Elevated via scheduled task)"
+        $sc.IconLocation = "%SystemRoot%\System32\shell32.dll,77"
+        $sc.Save()
+        Log "Admin shortcut created: $adminLnkPath" -Colour Green -Indent
+        Log "No UAC prompt -- task runs with full admin token automatically" -Colour DarkGray -Indent
+        Log "Survives Claude updates (detects MSIX, traditional install, or running process)" -Colour DarkGray -Indent
+
+    } catch {
+        Log "Could not configure elevation -- not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 21. Admin token filtering (LocalAccountTokenFilterPolicy)
+    # ----------------------------------------------------------------
+    Step 21 $steps "Configuring admin token policy..."
+    try {
+        $policyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        $current = Get-ItemProperty -Path $policyPath -ErrorAction Stop
+
+        $latfp = try { $current.LocalAccountTokenFilterPolicy } catch { $null }
+        $fat   = try { $current.FilterAdministratorToken } catch { $null }
+
+        $changed = $false
+        if ($latfp -ne 1) {
+            Set-ItemProperty -Path $policyPath -Name "LocalAccountTokenFilterPolicy" -Value 1 -Type DWord -Force
+            Log "LocalAccountTokenFilterPolicy: Set to 1 (no token filtering)" -Colour Green -Indent
+            $changed = $true
+        } else {
+            Log "LocalAccountTokenFilterPolicy: Already set to 1" -Colour DarkGray -Indent
+        }
+
+        if ($fat -ne 0) {
+            Set-ItemProperty -Path $policyPath -Name "FilterAdministratorToken" -Value 0 -Type DWord -Force
+            Log "FilterAdministratorToken: Set to 0 (admin gets full token)" -Colour Green -Indent
+            $changed = $true
+        } else {
+            Log "FilterAdministratorToken: Already set to 0" -Colour DarkGray -Indent
+        }
+
+        if ($changed) {
+            Log "A reboot is required for token policy changes to take effect" -Colour DarkYellow -Indent
+        }
+        Log "EnableLUA remains 1 (UAC stays on -- Store apps keep working)" -Colour DarkGray -Indent
+    } catch {
+        Log "Could not configure token policy -- not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
+    }
+
     # ================================================================
     # Summary
     # ================================================================
@@ -1028,6 +1262,8 @@ if ($Undo) {
     Write-Host "    Health monitor ....... Every 30s (auto-fix)" -ForegroundColor White
     Write-Host "    Boot-fix task ........ At every logon" -ForegroundColor White
     Write-Host "    Shortcuts ............ Desktop + Start Menu" -ForegroundColor White
+    Write-Host "    Claude elevation ..... Scheduled task (full admin, no UAC prompt)" -ForegroundColor White
+    Write-Host "    Admin token policy ... Full admin token for local accounts" -ForegroundColor White
     Write-Host ""
     Write-Host "  TIP: Right-click 'Fix Claude Desktop' in Start Menu" -ForegroundColor DarkGray
     Write-Host "       and select 'Pin to taskbar' for quick access." -ForegroundColor DarkGray

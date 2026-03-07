@@ -39,15 +39,19 @@ After running the prevention script, Claude will be automatically repaired at ev
 
 | | Supported |
 |---|---|
-| Windows 10 (1607+) | Yes |
+| Windows 10 (build 19041+) | Yes |
 | Windows 11 | Yes |
-| Admin privileges | Optional (recommended) |
+| Windows 7 / 8 / 8.1 | No (Cowork requires Hyper-V, Claude requires Win 10 19041+) |
 | MSIX / Microsoft Store install | Yes |
 | Traditional (.exe) install | Yes |
 | PowerShell 5.1 | Yes (ships with Windows) |
 | PowerShell 7+ | Yes |
 
-**Admin privileges are requested but not required.** If you decline UAC, the fix script still works -- it just can't control the Windows service directly. Claude handles that automatically when it launches.
+| Script | Admin required? |
+|--------|----------------|
+| `Fix-ClaudeDesktop` | No (recommended, but works without -- uses force-kill instead of service control) |
+| `Prevent-ClaudeIssues` | **Yes** (power settings, registry, scheduled tasks all require admin) |
+| `Watch-ClaudeHealth` | No (auto-installed as elevated task by Prevent) |
 
 ---
 
@@ -152,6 +156,8 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 17 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
 | 18 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
 | 19 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
+| 20 | Claude elevation | Scheduled task (full admin, no UAC prompt) | Ensures Claude Desktop (and its child processes like MCP servers) launch with full admin privileges |
+| 21 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering -- complementary to Step 20 for tools that use COM or WMI elevation |
 
 Battery settings are not changed -- laptop users keep normal battery behaviour.
 
@@ -217,6 +223,12 @@ The monitor uses a global mutex to ensure only one instance runs at a time. It l
 
 Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`. Can also be started manually with `Watch-ClaudeHealth.bat` for foreground monitoring.
 
+### Claude Elevation and Admin Token Policy
+
+**Claude elevation** (step 20) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`.
+
+**Admin token policy** (step 21) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 20 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
+
 ### Fast Startup, Connected Standby, NIC Power Saving
 
 These three settings are the most commonly overlooked causes of VirtioFS failures:
@@ -245,16 +257,17 @@ Creates a "Fix Claude Desktop" shortcut on the Desktop and in the Start Menu. Yo
 .\Prevent-ClaudeIssues.ps1 -Undo
 ```
 
-Restores your original power plan, re-enables hibernate, resets sleep to 30 minutes, removes both scheduled tasks, and deletes the shortcuts.
+Restores your original power plan, re-enables hibernate, resets sleep to 30 minutes, removes all scheduled tasks (Watchdog, BootFix, LaunchClaudeAdmin), deletes the shortcuts and launcher scripts, removes the RUNASADMIN registry flags, and reverts admin token policy changes.
 
 ---
 
 ## Requirements
 
-- Windows 10 (1607+) or Windows 11
+- Windows 10 (build 19041+) or Windows 11
 - Claude Desktop with Cowork mode
+- Hyper-V capable edition (Pro, Enterprise, Education -- not Home)
 - PowerShell 5.1+ (included with Windows)
-- Admin privileges: optional but recommended
+- Admin privileges: required for Prevent, optional for Fix
 
 ---
 
