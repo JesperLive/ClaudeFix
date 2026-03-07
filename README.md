@@ -39,8 +39,9 @@ After running the prevention script, Claude will be automatically repaired at ev
 
 | | Supported |
 |---|---|
-| Windows 10 (build 19041+) | Yes |
-| Windows 11 | Yes |
+| Windows 10 Pro/Enterprise/Education (build 19041+) | Yes |
+| Windows 11 Pro/Enterprise/Education | Yes |
+| Windows 10/11 Home | No (Cowork requires Hyper-V, which is not available on Home) |
 | Windows 7 / 8 / 8.1 | No (Cowork requires Hyper-V, Claude requires Win 10 19041+) |
 | MSIX / Microsoft Store install | Yes |
 | Traditional (.exe) install | Yes |
@@ -225,7 +226,7 @@ Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`. Can also be star
 
 ### Claude Elevation and Admin Token Policy
 
-**Claude elevation** (step 20) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`.
+**Claude elevation** (step 20) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`. **Note:** MSIX installs will show a second Claude icon on the taskbar when launched elevated. This is unavoidable -- Windows enforces medium integrity for all shell-activated MSIX apps, so the only way to get a full admin token is to launch the `.exe` directly, which bypasses the MSIX app model's icon grouping.
 
 **Admin token policy** (step 21) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 20 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
 
@@ -292,7 +293,7 @@ If you see a WinNAT warning, the health monitor will attempt to repair it automa
 If you have third-party antivirus, add the recommended exclusion paths shown by the prevention script. For Windows Defender, exclusions are added automatically.
 
 **Claude launches with a duplicate taskbar icon**
-This happens when an MSIX (Microsoft Store) app is launched via its `.exe` path directly instead of through the shell protocol. The fix script handles this automatically, but if you see it, make sure you're using the latest version of the fix script.
+When using the "Claude (Admin)" shortcut, MSIX installs will show a second Claude icon on the taskbar. This is expected -- Windows enforces medium integrity for MSIX apps launched through the shell protocol (`shell:AppsFolder`), so the only way to get a full admin token is to launch the `.exe` directly, which bypasses icon grouping. Close the non-admin Claude first if you want a single icon. The regular fix script (`Fix-ClaudeDesktop`) uses the shell protocol and does not have this issue.
 
 **Logs are piling up in `%APPDATA%\Claude\fix-logs\`**
 The fix script auto-cleans logs older than 30 days. You can safely delete everything in that folder manually if needed.

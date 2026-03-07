@@ -1101,6 +1101,11 @@ if ($Undo) {
 
         # PowerShell command that finds and launches Claude
         # Priority: 1) MSIX via Get-AppxPackage  2) Traditional .exe install paths  3) Running process
+        # NOTE: We MUST use direct .exe launch (Start-Process $exe) to inherit the
+        # task's elevated token. shell:AppsFolder routes through the non-elevated desktop
+        # shell and the app gets medium integrity -- defeating the entire purpose.
+        # Trade-off: MSIX installs will show a second taskbar icon. This is unavoidable
+        # because Windows enforces medium integrity for all shell-activated MSIX apps.
         $launchCmd = @'
 $exe = $null
 # 1. MSIX install (Windows Store / winget MSIX)
