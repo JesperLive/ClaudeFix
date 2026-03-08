@@ -30,7 +30,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.5.0
+    Version : 4.6.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -75,7 +75,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.5.0"
+$Version         = "4.6.0"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -360,7 +360,8 @@ function Test-RecentHcsErrors {
     <#
     .SYNOPSIS
         Checks for recent HCS (Host Compute Service) errors.
-        Returns $true if HCS-specific errors found in the last 5 minutes.
+        Returns $null if clean, "json_corruption" if 0xC037010D detected,
+        or "hcs_error" for other HCS errors.
     #>
     # Check 1: HCS Compute event log
     try {
@@ -369,8 +370,16 @@ function Test-RecentHcsErrors {
             Level     = @(1, 2)  # Critical, Error
             StartTime = (Get-Date).AddMinutes(-5)
         }
-        $hcsEvents = Get-WinEvent -FilterHashtable $hcsFilter -MaxEvents 1 -ErrorAction SilentlyContinue
-        if ($hcsEvents) { return $true }
+        $hcsEvents = @(Get-WinEvent -FilterHashtable $hcsFilter -MaxEvents 10 -ErrorAction SilentlyContinue)
+        if ($hcsEvents) {
+            foreach ($evt in $hcsEvents) {
+                $xml = $evt.ToXml()
+                if ($xml -match "0xC037010D" -or $xml -match "Invalid JSON document") {
+                    return "json_corruption"
+                }
+            }
+            return "hcs_error"
+        }
     } catch {}
 
     # Check 2: Claude log files for HCS error patterns
@@ -385,14 +394,14 @@ function Test-RecentHcsErrors {
                     $content = Get-Content $logFile.FullName -Tail 50 -ErrorAction SilentlyContinue
                     $text = $content -join "`n"
                     foreach ($pattern in $hcsPatterns) {
-                        if ($text -match [regex]::Escape($pattern)) { return $true }
+                        if ($text -match [regex]::Escape($pattern)) { return "hcs_error" }
                     }
                 } catch {}
             }
         } catch {}
     }
 
-    return $false
+    return $null
 }
 
 # ====================================================================
@@ -407,6 +416,20 @@ Write-Host "  |  CLAUDE DESKTOP / COWORK -- RESET & FIX   |" -ForegroundColor Cy
 Write-Host "  |  v$Version                                  |" -ForegroundColor DarkGray
 Write-Host "  +-------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
+
+# -- Prevent concurrent Fix runs ----------------------------------------
+$fixMutexName = "Global\ClaudeDesktopFix_v4.6"
+$fixMutex = $null
+try {
+    $fixMutex = [System.Threading.Mutex]::new($false, $fixMutexName)
+    if (-not $fixMutex.WaitOne(0)) {
+        Log "Another Fix instance is already running -- exiting" -Colour DarkGray
+        Save-Log
+        exit 0
+    }
+} catch {
+    # Mutex creation failed -- continue anyway
+}
 
 if (-not $script:IsAdmin) {
     Log "Running without admin (limited service control)" -Colour DarkGray
@@ -562,6 +585,22 @@ Log "[3/9] Checking HCS service health..." -Colour Yellow
 
 try {
     $hcsDetected = Test-RecentHcsErrors
+    if ($hcsDetected -eq "json_corruption") {
+        Log "CRITICAL: HCS JSON corruption detected (0xC037010D)" -Colour Red -Indent
+        Log "This error is NOT recoverable by restarting vmcompute." -Colour Red -Indent
+        Log "Required fix: Hyper-V nuclear reset" -Colour Yellow -Indent
+        Log "  1. Open admin PowerShell" -Colour White -Indent
+        Log "  2. dism /online /disable-feature /featurename:Microsoft-Hyper-V-All" -Colour White -Indent
+        Log "  3. Reboot" -Colour White -Indent
+        Log "  4. dism /online /enable-feature /featurename:Microsoft-Hyper-V-All" -Colour White -Indent
+        Log "  5. Reboot" -Colour White -Indent
+        if (-not $Quiet) {
+            Log "" -Colour White
+            Log "The script will still attempt a vmcompute restart, but it is" -Colour DarkGray -Indent
+            Log "unlikely to resolve JSON corruption. If Cowork fails to start" -Colour DarkGray -Indent
+            Log "after this fix, perform the nuclear reset above." -Colour DarkGray -Indent
+        }
+    }
     if ($hcsDetected) {
         if ($script:IsAdmin) {
             Log "HCS errors detected -- restarting vmcompute service" -Colour DarkYellow -Indent
@@ -1085,6 +1124,10 @@ Save-Log
     Write-Host "  Line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkGray
     Write-Host ""
     Save-Log
+} finally {
+    if ($fixMutex) {
+        try { $fixMutex.ReleaseMutex(); $fixMutex.Dispose() } catch {}
+    }
 }
 
 # -- Always pause unless -Quiet --------------------------------------

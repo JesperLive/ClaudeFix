@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.5.0
+    Version : 4.6.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -73,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.5.0"
+$Version          = "4.6.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -966,8 +966,9 @@ if ($Undo) {
 
             $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
+            $delayedWatchCmd = "Start-Sleep -Seconds 120; & '$watchScript' -Quiet"
             $action = New-ScheduledTaskAction -Execute "PowerShell.exe" `
-                          -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$watchScript`" -Quiet"
+                          -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$delayedWatchCmd`""
 
             $trigger = New-ScheduledTaskTrigger -AtLogOn
 
@@ -997,7 +998,7 @@ if ($Undo) {
 
             try { Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue } catch {}
 
-            Log "Health monitor installed (polls every 30s, auto-fixes crashes)" -Colour Green -Indent
+            Log "Health monitor installed (starts 120s after logon, polls every 30s)" -Colour Green -Indent
             Log "Task: Task Scheduler > $TaskPath$TaskName" -Colour DarkGray -Indent
             Log "Script: $watchScript" -Colour DarkGray -Indent
             Log "Logs: $env:APPDATA\Claude\watch-logs\" -Colour DarkGray -Indent
@@ -1037,10 +1038,10 @@ if ($Undo) {
                 Unregister-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
-            # Wrap in a delayed command: wait 90s after logon before running fix.
+            # Wrap in a delayed command: wait 180s after logon before running fix.
             # This prevents racing with Claude Desktop's own auto-start at logon.
             # The Fix script also has its own activity guard (-Quiet mode) as a second layer.
-            $delayedCmd = "Start-Sleep -Seconds 90; & '$fixScript' -SkipLaunch -Quiet"
+            $delayedCmd = "Start-Sleep -Seconds 180; & '$fixScript' -SkipLaunch -Quiet"
             $bootAction = New-ScheduledTaskAction -Execute "PowerShell.exe" `
                               -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$delayedCmd`""
 
@@ -1068,9 +1069,9 @@ if ($Undo) {
                 -Description "Runs Fix-ClaudeDesktop at logon to ensure clean VM state after boot." `
                 -Force | Out-Null
 
-            Log "Boot-fix task created (runs 90s after logon)" -Colour Green -Indent
+            Log "Boot-fix task created (runs 180s after logon)" -Colour Green -Indent
             Log "Task: Task Scheduler > $TaskPath$BootTaskName" -Colour DarkGray -Indent
-            Log "Runs: $fixScript -SkipLaunch -Quiet (after 90s delay)" -Colour DarkGray -Indent
+            Log "Runs: $fixScript -SkipLaunch -Quiet (after 180s delay)" -Colour DarkGray -Indent
         } catch {
             Log "[!] Could not create boot task: $($_.Exception.Message)" -Colour Red -Indent
         }

@@ -247,8 +247,8 @@ The entire toolkit is designed to **never interrupt active work** — whether yo
 - **Extended VM log window** -- activity check uses 120s window (was 30s). Code's "thinking" phases can leave the VM log quiet for minutes; the old 30s window caused false negatives
 - **User input window** -- 3 minutes (was 2). More buffer for reading/reviewing before auto-fix considers you idle
 - **Fix script activity guard** -- `Fix-ClaudeDesktop.ps1` itself now checks for active use when called with `-Quiet` (by the monitor or boot task). Three checks: CPU sampling, VM log, user input. Blocks and exits if anything is active. Manual runs (no `-Quiet`) always proceed
-- **Boot-fix 90s delay** -- the logon task now waits 90 seconds before running, preventing a race condition where it would kill Claude Desktop as it was auto-starting at logon
-- **Startup grace period** -- heuristic checks (event log, heartbeat, staleness) are skipped for the first 90 seconds after the monitor starts, preventing false triggers from pre-existing events
+- **Boot-fix 180s delay** -- the logon task waits 180 seconds before running, preventing a race condition where it would kill Claude Desktop as it was auto-starting at logon
+- **Startup grace period** -- all heuristic checks (including log scanning, event log, heartbeat, staleness) are skipped for the first 180 seconds after the monitor starts, preventing false triggers from pre-existing events
 - **Consecutive-check gates** -- every heuristic trigger requires multiple consecutive failures before firing (service: 2, event log: 2, heartbeat: 3, staleness: 5). Only the log-file pattern check (actual VirtioFS error strings) triggers immediately
 - **Tightened event log matching** -- Hyper-V VMMS events must mention "claude" or "cowork" (no generic "failed"/"unexpected" matching). Worker events: Critical/Error only
 - **VM log staleness requires prior activity** -- only triggers if the VM log was previously active this session, preventing false positives in Chat mode
@@ -283,7 +283,7 @@ These three settings are the most commonly overlooked causes of VirtioFS failure
 
 ### The Boot-Fix Task
 
-A scheduled task runs at every user logon as the current user (elevated). It waits **90 seconds** (to let Claude Desktop auto-start first), then executes `Fix-ClaudeDesktop.ps1 -SkipLaunch -Quiet` to ensure the VM service starts cleanly. The Fix script's own activity guard provides a second layer of protection — if Claude is already running and active after the 90s delay, the fix is blocked and exits silently.
+A scheduled task runs at every user logon as the current user (elevated). It waits **180 seconds** (to let Claude Desktop auto-start first), then executes `Fix-ClaudeDesktop.ps1 -SkipLaunch -Quiet` to ensure the VM service starts cleanly. The Fix script's own activity guard provides a second layer of protection — if Claude is already running and active after the 180s delay, the fix is blocked and exits silently.
 
 The prevention script auto-detects `Fix-ClaudeDesktop.ps1` in the same folder. If it can't find it, this step is skipped with a warning.
 
@@ -360,7 +360,21 @@ README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
 
-Current versions: Fix 4.5.0, Watch 4.4.0, Prevent 4.5.0
+Current versions: Fix 4.6.0, Watch 4.6.0, Prevent 4.6.0
+
+---
+
+## Changelog
+
+### v4.6.0 — Race Condition & Escalation Fixes (2026-03-08)
+
+- **Startup grace period covers ALL watchdog checks** -- `Test-LogsForErrors` is now gated by `Test-StartupGracePeriod`, preventing stale log entries from triggering a fix before the monitor has settled
+- **Grace period increased from 90s to 180s** -- gives Claude's VM more time to initialise before heuristic checks start
+- **Persistent failure backoff** -- if the fix script runs 3+ times within 30 minutes and the problem persists, the watchdog stops retrying and shows a notification with Hyper-V nuclear reset instructions (DISM disable/enable)
+- **Fix script mutual exclusion** -- a global mutex (`Global\ClaudeDesktopFix_v4.6`) prevents concurrent Fix runs from the watchdog, boot-fix task, and manual invocation
+- **HCS JSON corruption detection** -- `Test-RecentHcsErrors` now distinguishes fatal 0xC037010D ("Invalid JSON document") from recoverable HCS errors, and warns the user that a Hyper-V nuclear reset is needed
+- **Watchdog delayed 120s at logon** -- was immediate; prevents the watchdog from racing Claude's own VM initialisation
+- **Boot-fix delayed 180s at logon** -- was 90s; same race condition mitigation
 
 ---
 

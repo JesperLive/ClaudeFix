@@ -23,7 +23,7 @@
     - Extended CPU sampling (3 samples over 3s to catch bursty API-wait patterns)
     - Electron-aware window detection (GetWindowThreadProcessId, not MainWindowHandle)
     - Session 0 safe (falls back to process heuristics when Win32 APIs are unavailable)
-    - Startup grace period (skips first 90s to avoid matching pre-existing events)
+    - Startup grace period (skips first 180s to avoid matching pre-existing events)
     - Consecutive-check requirements on all heuristic triggers
     - Event log matching tightened to Claude-specific messages only
     - Cooldown between fixes (default 5 min)
@@ -45,7 +45,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 4.4.0
+    Version : 4.6.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -60,7 +60,7 @@ param(
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "4.4.0"
+$Version        = "4.6.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
 $ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
@@ -168,6 +168,7 @@ $script:ServiceDownCount     = 0     # Consecutive service-down checks
 $script:EventLogHitCount     = 0     # Consecutive event log hits
 $script:LastVmcomputeCheck   = [datetime]::MinValue
 $script:VmcomputeLeakCount   = 0     # Consecutive vmcompute handle leak checks
+$script:FixHistory           = New-Object System.Collections.ArrayList
 
 # Initialize baselines for existing log files
 if (Test-Path $ClaudeLogDir) {
@@ -182,10 +183,21 @@ function Test-StartupGracePeriod {
     <#
     .SYNOPSIS
         Returns $true if the monitor just started and should skip heuristic checks.
-        Grace period: 90 seconds. This prevents matching pre-existing event log
+        Grace period: 180 seconds. This prevents matching pre-existing event log
         entries or stale logs from before the monitor was running.
     #>
-    return ((Get-Date) - $script:StartTime).TotalSeconds -lt 90
+    return ((Get-Date) - $script:StartTime).TotalSeconds -lt 180
+}
+
+function Test-PersistentFailure {
+    <#
+    .SYNOPSIS
+        Returns $true if the fix has been attempted 3+ times in 30 minutes,
+        indicating an unrecoverable error (e.g., HCS JSON corruption).
+    #>
+    $cutoff = (Get-Date).AddMinutes(-30)
+    $recentFixes = @($script:FixHistory | Where-Object { $_ -gt $cutoff })
+    return $recentFixes.Count -ge 3
 }
 
 function Test-LogsForErrors {
@@ -790,6 +802,31 @@ function Invoke-AutoFix {
         return
     }
 
+    # Persistent failure escalation
+    if (Test-PersistentFailure) {
+        Write-WatchLog "ESCALATION: Fix attempted 3+ times in 30 min -- backing off"
+        Write-WatchLog "  This likely requires a Hyper-V nuclear reset:"
+        Write-WatchLog "  1. Open admin PowerShell"
+        Write-WatchLog "  2. dism /online /disable-feature /featurename:Microsoft-Hyper-V-All"
+        Write-WatchLog "  3. Reboot"
+        Write-WatchLog "  4. dism /online /enable-feature /featurename:Microsoft-Hyper-V-All"
+        Write-WatchLog "  5. Reboot"
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+            $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+            $notifyIcon.Icon = [System.Drawing.SystemIcons]::Error
+            $notifyIcon.Visible = $true
+            $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Error
+            $notifyIcon.BalloonTipTitle = "Claude Health Monitor -- Manual Fix Required"
+            $notifyIcon.BalloonTipText = "Auto-fix failed 3 times. Hyper-V nuclear reset needed.`nSee watch log for instructions."
+            $notifyIcon.ShowBalloonTip(60000)
+            [System.Media.SystemSounds]::Hand.Play()
+        } catch {}
+        # Back off for 30 minutes
+        $script:LastFixTime = (Get-Date).AddMinutes($Cooldown)
+        return
+    }
+
     # ---- SAFETY: Never auto-fix while user is active ----
     if (Test-UserActivity) {
         Write-WatchLog ">>> BLOCKED: $Reason -- user is active (Claude in focus, recent input, or VM busy)"
@@ -931,6 +968,9 @@ function Invoke-AutoFix {
         Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) FAILED: $($_.Exception.Message)"
     }
 
+    # Record fix timestamp for persistent failure detection
+    $null = $script:FixHistory.Add((Get-Date))
+
     # Reset state after fix
     Start-Sleep -Seconds 10
     $script:LogBaselines = @{}
@@ -948,7 +988,7 @@ function Invoke-AutoFix {
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v4.4"
+$mutexName = "Global\ClaudeHealthMonitor_v4.6"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)
@@ -969,7 +1009,7 @@ Write-WatchLog "  Poll interval : ${PollInterval}s"
 Write-WatchLog "  Cooldown      : ${Cooldown} min"
 Write-WatchLog "  Fix script    : $fixScript"
 Write-WatchLog "  Log directory : $ClaudeLogDir"
-Write-WatchLog "  Safety        : user-activity block, 90s grace period, consecutive-check gates"
+Write-WatchLog "  Safety        : user-activity block, 180s grace period, consecutive-check gates"
 Write-WatchLog "  Monitors      : logs, service(x2), events(x2)+HCS, NAT, heartbeat(x3), staleness(x5), vmcompute-health, time sync"
 Write-WatchLog "================================================================"
 
@@ -984,10 +1024,12 @@ try {
                 # ---- Critical checks (trigger auto-fix) ----
 
                 # Check 1: VirtioFS errors in log files (most reliable -- no consecutive gate needed)
-                $logError = Test-LogsForErrors
-                if ($logError) {
-                    Invoke-AutoFix -Reason "Log error: $logError"
-                    continue
+                if (-not (Test-StartupGracePeriod)) {
+                    $logError = Test-LogsForErrors
+                    if ($logError) {
+                        Invoke-AutoFix -Reason "Log error: $logError"
+                        continue
+                    }
                 }
 
                 # Check 2: Service died while Claude is running (2 consecutive checks)
