@@ -4,7 +4,8 @@
 
 .DESCRIPTION
     One-shot script that configures Windows to minimise VirtioFS/Plan9
-    mount failures in Claude Desktop's Cowork VM.
+    mount failures and HCS (Host Compute Service) errors in Claude
+    Desktop's Cowork VM.
 
     Run once. Changes persist across reboots.
 
@@ -19,6 +20,8 @@
     - Sets minimum processor state to 100% on AC
     - Pins Hyper-V VM memory (disables Dynamic Memory ballooning)
     - Boosts VM worker process priority
+    - Configures HCS (vmcompute) service auto-recovery on failure
+    - Sets ServicesPipeTimeout to prevent boot race conditions
     - Verifies and repairs WinNAT rules for VM network
     - Checks Windows Firewall policies for Hyper-V compatibility
     - Detects problematic workspace storage locations
@@ -37,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.2.0
+    Version : 4.5.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -70,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.2.0"
+$Version          = "4.5.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -116,7 +119,7 @@ if ($Undo) {
     # ================================================================
     # UNDO MODE
     # ================================================================
-    $steps = 10
+    $steps = 11
 
     Step 1 $steps "Restoring original power plan..."
     if (Test-Path $BackupFile) {
@@ -207,7 +210,31 @@ if ($Undo) {
         Remove-Item $flagFile -Force -ErrorAction SilentlyContinue
     }
 
-    Step 7 $steps "Removing scheduled tasks and health monitor..."
+    Step 7 $steps "Reverting HCS service configuration..."
+    try {
+        # Reset vmcompute failure actions to Windows default
+        & sc.exe failure vmcompute actions= "" reset= 0 2>&1 | Out-Null
+        Log "vmcompute failure recovery: Reset to defaults" -Colour Green -Indent
+
+        # Remove ServicesPipeTimeout only if we set it (value is exactly 120000)
+        try {
+            $current = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -ErrorAction SilentlyContinue).ServicesPipeTimeout
+            if ($null -ne $current -and $current -eq 120000) {
+                Remove-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -ErrorAction Stop
+                Log "ServicesPipeTimeout: Removed (was 120000ms -- set by this script)" -Colour Green -Indent
+            } elseif ($null -ne $current) {
+                Log "ServicesPipeTimeout: Left at ${current}ms (not set by this script)" -Colour DarkGray -Indent
+            } else {
+                Log "ServicesPipeTimeout: Not set" -Colour DarkGray -Indent
+            }
+        } catch {
+            Log "Could not remove ServicesPipeTimeout -- not critical" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not revert HCS configuration -- not critical" -Colour DarkGray -Indent
+    }
+
+    Step 8 $steps "Removing scheduled tasks and health monitor..."
     # Kill any running health monitor process first
     try {
         Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
@@ -237,7 +264,7 @@ if ($Undo) {
         Log "Removed old watchdog script" -Colour DarkGray -Indent
     }
 
-    Step 8 $steps "Removing shortcuts..."
+    Step 9 $steps "Removing shortcuts..."
     $desktopLnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "Fix Claude Desktop.lnk"
     $startMenuLnk = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Fix Claude Desktop.lnk"
     $removedLnk = $false
@@ -252,7 +279,7 @@ if ($Undo) {
         Log "No shortcuts found" -Colour DarkGray -Indent
     }
 
-    Step 9 $steps "Removing Claude elevation config..."
+    Step 10 $steps "Removing Claude elevation config..."
     try {
         # Remove the LaunchClaudeAdmin scheduled task
         try {
@@ -296,7 +323,7 @@ if ($Undo) {
         Log "Could not fully remove elevation config -- not critical" -Colour DarkGray -Indent
     }
 
-    Step 10 $steps "Reverting admin token policy..."
+    Step 11 $steps "Reverting admin token policy..."
     try {
         $policyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
         $reverted = $false
@@ -337,7 +364,7 @@ if ($Undo) {
     # ================================================================
     # SETUP MODE
     # ================================================================
-    $steps = 21
+    $steps = 23
 
     # ----------------------------------------------------------------
     # 1. Power plan -- High Performance or Ultimate Performance
@@ -572,9 +599,42 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 12. Verify and repair WinNAT rules
+    # 12. Configure HCS service recovery
     # ----------------------------------------------------------------
-    Step 12 $steps "Checking WinNAT rules for VM network..."
+    Step 12 $steps "Configuring HCS service recovery..."
+    try {
+        & sc.exe failure vmcompute actions= restart/30000/restart/60000/restart/120000 reset= 300 2>&1 | Out-Null
+        $verifyResult = & sc.exe qfailure vmcompute 2>&1
+        if ($verifyResult -match "RESTART") {
+            Log "vmcompute failure recovery: restart after 30s/60s/120s (reset after 300s)" -Colour Green -Indent
+        } else {
+            Log "vmcompute failure recovery set (could not verify -- non-critical)" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not configure vmcompute failure recovery -- not critical" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 13. Set service startup timeout (ServicesPipeTimeout)
+    # ----------------------------------------------------------------
+    Step 13 $steps "Setting service startup timeout..."
+    try {
+        $current = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -ErrorAction SilentlyContinue).ServicesPipeTimeout
+        if ($null -eq $current -or $current -lt 120000) {
+            Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -Value 120000 -Type DWord -Force
+            Log "ServicesPipeTimeout set to 120000ms (prevents boot race conditions)" -Colour Green -Indent
+            Log "Takes effect after next reboot" -Colour DarkGray -Indent
+        } else {
+            Log "ServicesPipeTimeout already set to ${current}ms" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not set ServicesPipeTimeout -- not critical" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 14. Verify and repair WinNAT rules
+    # ----------------------------------------------------------------
+    Step 14 $steps "Checking WinNAT rules for VM network..."
     try {
         $natRules = @(Get-NetNat -ErrorAction SilentlyContinue)
         if ($natRules.Count -gt 0) {
@@ -616,9 +676,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 13. Windows Firewall policy verification
+    # 15. Windows Firewall policy verification
     # ----------------------------------------------------------------
-    Step 13 $steps "Checking Windows Firewall policies..."
+    Step 15 $steps "Checking Windows Firewall policies..."
     try {
         # Check if local firewall rules are being applied (Group Policy can block them)
         $fwProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
@@ -659,9 +719,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 14. Storage location detection
+    # 16. Storage location detection
     # ----------------------------------------------------------------
-    Step 14 $steps "Checking workspace storage location..."
+    Step 16 $steps "Checking workspace storage location..."
     $claudeAppData = Join-Path $env:APPDATA "Claude"
     $vmCachePath = Join-Path $claudeAppData "claude-code-vm"
     $storageWarnings = @()
@@ -716,9 +776,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 15. NTP / time synchronisation check
+    # 17. NTP / time synchronisation check
     # ----------------------------------------------------------------
-    Step 15 $steps "Checking time synchronisation..."
+    Step 17 $steps "Checking time synchronisation..."
     try {
         $w32svc = Get-Service -Name "W32Time" -ErrorAction SilentlyContinue
         if ($w32svc) {
@@ -762,9 +822,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 16. Antivirus exclusion guidance
+    # 18. Antivirus exclusion guidance
     # ----------------------------------------------------------------
-    Step 16 $steps "Checking antivirus configuration..."
+    Step 18 $steps "Checking antivirus configuration..."
     $avProducts = @()
     try {
         # Query Windows Security Center (WMI)
@@ -836,8 +896,9 @@ if ($Undo) {
                     try {
                         Add-MpPreference -ExclusionProcess "vmwp.exe" -ErrorAction SilentlyContinue
                         Add-MpPreference -ExclusionProcess "vmms.exe" -ErrorAction SilentlyContinue
+                        Add-MpPreference -ExclusionProcess "vmcompute.exe" -ErrorAction SilentlyContinue
                         Add-MpPreference -ExclusionProcess "cowork-svc.exe" -ErrorAction SilentlyContinue
-                        Log "  + Process exclusions: vmwp.exe, vmms.exe, cowork-svc.exe" -Colour Green -Indent
+                        Log "  + Process exclusions: vmwp.exe, vmms.exe, vmcompute.exe, cowork-svc.exe" -Colour Green -Indent
                     } catch {}
                 } else {
                     Log "Defender exclusions already configured" -Colour Green -Indent
@@ -852,7 +913,7 @@ if ($Undo) {
             Log "  - $env:ProgramFiles\Hyper-V\" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmwp.exe" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmms.exe" -Colour White -Indent
-            Log "  - Process: cowork-svc.exe" -Colour White -Indent
+            Log "  - Process: vmcompute.exe, cowork-svc.exe" -Colour White -Indent
             Log "Adding these exclusions prevents AV filter drivers from" -Colour DarkGray -Indent
             Log "interfering with VirtioFS disk operations" -Colour DarkGray -Indent
         }
@@ -861,9 +922,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 17. Install health monitor (auto-detects and auto-fixes crashes)
+    # 19. Install health monitor (auto-detects and auto-fixes crashes)
     # ----------------------------------------------------------------
-    Step 17 $steps "Installing health monitor..."
+    Step 19 $steps "Installing health monitor..."
 
     # Find Watch-ClaudeHealth.ps1 in the same folder as this script
     $myDir = Split-Path $PSCommandPath -Parent
@@ -950,9 +1011,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 18. Create boot-fix scheduled task
+    # 20. Create boot-fix scheduled task
     # ----------------------------------------------------------------
-    Step 18 $steps "Creating boot-time fix task..."
+    Step 20 $steps "Creating boot-time fix task..."
 
     $fixScript = $null
     if ($myDir) {
@@ -1019,9 +1080,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 19. Create shortcuts (Desktop + Start Menu)
+    # 21. Create shortcuts (Desktop + Start Menu)
     # ----------------------------------------------------------------
-    Step 19 $steps "Creating Fix Claude Desktop shortcuts..."
+    Step 21 $steps "Creating Fix Claude Desktop shortcuts..."
 
     $fixBat = $null
     if ($myDir) {
@@ -1072,9 +1133,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 20. Set Claude Desktop to launch elevated (MSIX-aware)
+    # 22. Set Claude Desktop to launch elevated (MSIX-aware)
     # ----------------------------------------------------------------
-    Step 20 $steps "Configuring Claude Desktop to launch elevated..."
+    Step 22 $steps "Configuring Claude Desktop to launch elevated..."
     try {
         # Scheduled task registration requires admin -- skip gracefully if not elevated
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -1107,6 +1168,9 @@ if ($Undo) {
         # Trade-off: MSIX installs will show a second taskbar icon. This is unavoidable
         # because Windows enforces medium integrity for all shell-activated MSIX apps.
         $launchCmd = @'
+# If Claude is already running, don't launch again
+$existing = Get-Process -Name Claude -ErrorAction SilentlyContinue
+if ($existing) { exit 0 }
 $exe = $null
 # 1. MSIX install (Windows Store / winget MSIX)
 $p = Get-AppxPackage | Where-Object { $_.Name -eq 'Claude' -or $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
@@ -1191,7 +1255,26 @@ if errorlevel 1 (
         $sc.TargetPath = $launcherCmd
         $sc.WorkingDirectory = $launcherDir
         $sc.Description = "Claude Desktop (Elevated via scheduled task)"
-        $sc.IconLocation = "%SystemRoot%\System32\shell32.dll,77"
+        # Try to use Claude's own icon (falls back to generic if path is stale after update)
+        $claudeIcon = $null
+        $appxPkg = Get-AppxPackage -Name "*Claude*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($appxPkg) {
+            $candidateExe = Join-Path $appxPkg.InstallLocation "app\Claude.exe"
+            if (Test-Path $candidateExe) { $claudeIcon = "$candidateExe,0" }
+        }
+        if (-not $claudeIcon) {
+            # Check traditional install paths
+            $exeCandidates = @(
+                (Join-Path $env:LOCALAPPDATA 'Programs\claude-desktop\Claude.exe'),
+                (Join-Path $env:LOCALAPPDATA 'Claude Desktop\Claude.exe'),
+                (Join-Path ${env:ProgramFiles} 'Claude Desktop\Claude.exe')
+            )
+            foreach ($c in $exeCandidates) {
+                if (Test-Path $c) { $claudeIcon = "$c,0"; break }
+            }
+        }
+        if (-not $claudeIcon) { $claudeIcon = "%SystemRoot%\System32\shell32.dll,77" }
+        $sc.IconLocation = $claudeIcon
         $sc.Save()
         Log "Admin shortcut created: $adminLnkPath" -Colour Green -Indent
         Log "No UAC prompt -- task runs with full admin token automatically" -Colour DarkGray -Indent
@@ -1202,9 +1285,9 @@ if errorlevel 1 (
     }
 
     # ----------------------------------------------------------------
-    # 21. Admin token filtering (LocalAccountTokenFilterPolicy)
+    # 23. Admin token filtering (LocalAccountTokenFilterPolicy)
     # ----------------------------------------------------------------
-    Step 21 $steps "Configuring admin token policy..."
+    Step 23 $steps "Configuring admin token policy..."
     try {
         $policyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
         $current = Get-ItemProperty -Path $policyPath -ErrorAction Stop
@@ -1259,6 +1342,8 @@ if errorlevel 1 (
     Write-Host "    CPU minimum (AC) ..... 100%" -ForegroundColor White
     Write-Host "    VM memory ............ Pinned (no ballooning)" -ForegroundColor White
     Write-Host "    VM worker priority ... AboveNormal" -ForegroundColor White
+    Write-Host "    HCS service recovery . Auto-restart on failure" -ForegroundColor White
+    Write-Host "    Service timeout ...... 120s (boot race prevention)" -ForegroundColor White
     Write-Host "    WinNAT rules ......... Verified/repaired" -ForegroundColor White
     Write-Host "    Firewall policies .... Checked" -ForegroundColor White
     Write-Host "    Storage location ..... Checked" -ForegroundColor White

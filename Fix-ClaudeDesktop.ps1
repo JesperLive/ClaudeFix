@@ -3,8 +3,10 @@
     Claude Desktop / Cowork -- Reset & Fix
 
 .DESCRIPTION
-    Kills all Claude processes, stops CoworkVMService, purges stale VM cache,
-    restarts the service, and relaunches Claude Desktop.
+    Kills all Claude processes, stops CoworkVMService, recovers from HCS
+    (Host Compute Service) errors, performs orphan compute system cleanup,
+    purges stale VM cache, restarts the service, and relaunches Claude
+    Desktop with elevated privileges when available.
 
     Does NOT touch: config files, MCP servers, conversations.
     Fully automatic -- no user interaction required.
@@ -19,11 +21,16 @@
 .PARAMETER Quiet
     Suppress the "press any key" prompt at the end.
 
+.PARAMETER KeepCache
+    Skip the VM cache purge (Step 6). Use this to avoid re-downloading
+    the ~2-3 GB VM bundle. If the fix fails with -KeepCache, run again
+    without it to force a clean rebuild.
+
 .PARAMETER WhatIf
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.2.0
+    Version : 4.5.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -31,7 +38,8 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$SkipLaunch,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$KeepCache
 )
 
 # -- Admin elevation (optional) --------------------------------------
@@ -45,6 +53,7 @@ if (-not $script:IsAdmin) {
     if ($SkipLaunch)       { $elevateArgs += " -SkipLaunch" }
     if ($Quiet)            { $elevateArgs += " -Quiet" }
     if ($WhatIfPreference) { $elevateArgs += " -WhatIf" }
+    if ($KeepCache)        { $elevateArgs += " -KeepCache" }
 
     Write-Host ""
     Write-Host "  Requesting admin privileges for full service control..." -ForegroundColor DarkGray
@@ -66,7 +75,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.2.0"
+$Version         = "4.5.0"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -346,6 +355,46 @@ function Restart-CoworkService {
     return $false
 }
 
+# -- HCS error detection -----------------------------------------------
+function Test-RecentHcsErrors {
+    <#
+    .SYNOPSIS
+        Checks for recent HCS (Host Compute Service) errors.
+        Returns $true if HCS-specific errors found in the last 5 minutes.
+    #>
+    # Check 1: HCS Compute event log
+    try {
+        $hcsFilter = @{
+            LogName   = "Microsoft-Windows-Hyper-V-Compute-Admin"
+            Level     = @(1, 2)  # Critical, Error
+            StartTime = (Get-Date).AddMinutes(-5)
+        }
+        $hcsEvents = Get-WinEvent -FilterHashtable $hcsFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($hcsEvents) { return $true }
+    } catch {}
+
+    # Check 2: Claude log files for HCS error patterns
+    $hcsPatterns = @("HCS operation failed", "failed to create compute system", "HcsWaitForOperationResult")
+    $claudeLogDir = Join-Path $env:APPDATA "Claude\logs"
+    if (Test-Path $claudeLogDir) {
+        try {
+            $recentLogs = Get-ChildItem $claudeLogDir -Filter "*.log" -ErrorAction SilentlyContinue |
+                          Where-Object { ((Get-Date) - $_.LastWriteTime).TotalMinutes -lt 5 }
+            foreach ($logFile in $recentLogs) {
+                try {
+                    $content = Get-Content $logFile.FullName -Tail 50 -ErrorAction SilentlyContinue
+                    $text = $content -join "`n"
+                    foreach ($pattern in $hcsPatterns) {
+                        if ($text -match [regex]::Escape($pattern)) { return $true }
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+
+    return $false
+}
+
 # ====================================================================
 # MAIN
 # ====================================================================
@@ -434,7 +483,7 @@ public static class FixActivityCheck {
 # ====================================================================
 # STEP 1 -- Kill all Claude processes
 # ====================================================================
-Log "[1/7] Terminating Claude processes..." -Colour Yellow
+Log "[1/9] Terminating Claude processes..." -Colour Yellow
 
 $claudeProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
 if ($claudeProcs.Count -gt 0) {
@@ -475,7 +524,7 @@ Start-Sleep -Seconds 1
 # ====================================================================
 # STEP 2 -- Stop CoworkVMService
 # ====================================================================
-Log "[2/7] Stopping $ServiceName..." -Colour Yellow
+Log "[2/9] Stopping $ServiceName..." -Colour Yellow
 
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if (-not $svc) {
@@ -507,9 +556,54 @@ if (-not $svc) {
 Start-Sleep -Seconds 1
 
 # ====================================================================
-# STEP 3 -- Verify no orphan processes remain
+# STEP 3 -- HCS service recovery
 # ====================================================================
-Log "[3/7] Checking for orphan processes..." -Colour Yellow
+Log "[3/9] Checking HCS service health..." -Colour Yellow
+
+try {
+    $hcsDetected = Test-RecentHcsErrors
+    if ($hcsDetected) {
+        if ($script:IsAdmin) {
+            Log "HCS errors detected -- restarting vmcompute service" -Colour DarkYellow -Indent
+            try {
+                Stop-Service vmcompute -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 3
+                Start-Service vmcompute -ErrorAction SilentlyContinue
+                # Wait up to 15 seconds for Running status
+                $vmcElapsed = 0
+                $vmcRunning = $false
+                while ($vmcElapsed -lt 15) {
+                    Start-Sleep -Seconds 3
+                    $vmcElapsed += 3
+                    $vmcSvc = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
+                    if ($vmcSvc -and $vmcSvc.Status -eq "Running") { $vmcRunning = $true; break }
+                }
+                if ($vmcRunning) {
+                    Log "vmcompute service restarted successfully" -Colour Green -Indent
+                } else {
+                    Log "vmcompute not running after 15s -- also restarting vmms" -Colour DarkYellow -Indent
+                    Stop-Service vmms -Force -ErrorAction SilentlyContinue
+                    Start-Sleep -Seconds 3
+                    Start-Service vmms -ErrorAction SilentlyContinue
+                    Log "vmms service restarted" -Colour Green -Indent
+                }
+            } catch {
+                Log "[!] vmcompute restart failed: $($_.Exception.Message)" -Colour Red -Indent
+            }
+        } else {
+            Log "HCS errors detected but no admin -- vmcompute restart requires elevation" -Colour DarkYellow -Indent
+        }
+    } else {
+        Log "No HCS issues detected" -Colour DarkGray -Indent
+    }
+} catch {
+    Log "[!] HCS check failed: $($_.Exception.Message) -- continuing" -Colour DarkGray -Indent
+}
+
+# ====================================================================
+# STEP 4 -- Verify no orphan processes remain
+# ====================================================================
+Log "[4/9] Checking for orphan processes..." -Colour Yellow
 
 $remaining = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
     ($_.Name -eq $ProcessName) -or ($_.Name -eq $ServiceExe)
@@ -534,32 +628,117 @@ if ($remaining.Count -gt 0) {
 }
 
 # ====================================================================
-# STEP 4 -- Purge VM cache
+# STEP 5 -- Kill orphan HCS compute systems
 # ====================================================================
-Log "[4/7] Purging VM cache..." -Colour Yellow
-
-$cacheDirs = @(
-    @{ Path = $VmCachePath; Label = "claude-code-vm" },
-    @{ Path = $BundlePath;  Label = "vm_bundles" }
-)
-foreach ($item in $cacheDirs) {
-    if (Test-Path $item.Path) {
-        $size = (Get-ChildItem $item.Path -Recurse -ErrorAction SilentlyContinue |
-                 Measure-Object -Property Length -Sum).Sum
-        $sizeMB = [math]::Round($size / 1MB, 1)
-        if ($PSCmdlet.ShouldProcess($item.Label, "Delete ($sizeMB MB)")) {
-            Remove-Item $item.Path -Recurse -Force -ErrorAction SilentlyContinue
+Log "[5/9] Checking for orphan compute systems..." -Colour Yellow
+try {
+    $orphanKilled = $false
+    # Method 1: hcsdiag (most reliable for HCS compute systems)
+    if ($script:IsAdmin) {
+        $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+        if (Test-Path $hcsdiagPath) {
+            try {
+                $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+                if ($hcsList -match "(?i)claude|cowork") {
+                    Log "Found orphan compute system(s) via hcsdiag" -Colour DarkYellow -Indent
+                    $lines = $hcsList -split "`r?`n"
+                    $currentGuid = $null
+                    $isClaudeVm = $false
+                    foreach ($line in $lines) {
+                        if ($line -match '^\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*$') {
+                            if ($isClaudeVm -and $currentGuid) {
+                                if ($PSCmdlet.ShouldProcess($currentGuid, "hcsdiag kill")) {
+                                    & $hcsdiagPath kill $currentGuid 2>&1 | Out-Null
+                                    Log "Killed orphan compute system: $currentGuid" -Colour Green -Indent
+                                    $orphanKilled = $true
+                                }
+                            }
+                            $currentGuid = $Matches[1]
+                            $isClaudeVm = $false
+                        } elseif ($currentGuid -and $line -match '(?i)claude|cowork') {
+                            $isClaudeVm = $true
+                        }
+                    }
+                    if ($isClaudeVm -and $currentGuid) {
+                        if ($PSCmdlet.ShouldProcess($currentGuid, "hcsdiag kill")) {
+                            & $hcsdiagPath kill $currentGuid 2>&1 | Out-Null
+                            Log "Killed orphan compute system: $currentGuid" -Colour Green -Indent
+                            $orphanKilled = $true
+                        }
+                    }
+                }
+            } catch {
+                Log "hcsdiag query failed: $($_.Exception.Message)" -Colour DarkGray -Indent
+            }
         }
-        Log "$($item.Label) removed ($sizeMB MB freed)" -Colour Green -Indent
-    } else {
-        Log "$($item.Label) not present" -Colour DarkGray -Indent
+    }
+    # Method 2: Hyper-V cmdlets fallback (Stop-VM -TurnOff)
+    try {
+        $claudeVm = Get-VM -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match "claude" }
+        if ($claudeVm) {
+            foreach ($vm in $claudeVm) {
+                if ($vm.State -ne "Off") {
+                    if ($PSCmdlet.ShouldProcess($vm.Name, "Stop-VM -TurnOff")) {
+                        Stop-VM -Name $vm.Name -TurnOff -Force -ErrorAction SilentlyContinue
+                        Log "Force-stopped VM '$($vm.Name)' via Hyper-V" -Colour Green -Indent
+                        $orphanKilled = $true
+                    }
+                }
+            }
+        }
+    } catch {
+        Log "Hyper-V VM check skipped: $($_.Exception.Message)" -Colour DarkGray -Indent
+    }
+    if (-not $orphanKilled) {
+        Log "No orphan compute systems found" -Colour Green -Indent
+    }
+} catch {
+    Log "Orphan VM check failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
+}
+Start-Sleep -Seconds 1
+
+# ====================================================================
+# STEP 6 -- Purge VM cache (skipped with -KeepCache)
+# ====================================================================
+if ($KeepCache) {
+    Log "[6/9] Keeping VM cache (-KeepCache)" -Colour DarkGray
+    foreach ($item in @(
+        @{ Path = $VmCachePath; Label = "claude-code-vm" },
+        @{ Path = $BundlePath;  Label = "vm_bundles" }
+    )) {
+        if (Test-Path $item.Path) {
+            $size = (Get-ChildItem $item.Path -Recurse -ErrorAction SilentlyContinue |
+                     Measure-Object -Property Length -Sum).Sum
+            $sizeMB = [math]::Round($size / 1MB, 1)
+            Log "$($item.Label) preserved ($sizeMB MB)" -Colour DarkGray -Indent
+        }
+    }
+} else {
+    Log "[6/9] Purging VM cache..." -Colour Yellow
+    $cacheDirs = @(
+        @{ Path = $VmCachePath; Label = "claude-code-vm" },
+        @{ Path = $BundlePath;  Label = "vm_bundles" }
+    )
+    foreach ($item in $cacheDirs) {
+        if (Test-Path $item.Path) {
+            $size = (Get-ChildItem $item.Path -Recurse -ErrorAction SilentlyContinue |
+                     Measure-Object -Property Length -Sum).Sum
+            $sizeMB = [math]::Round($size / 1MB, 1)
+            if ($PSCmdlet.ShouldProcess($item.Label, "Delete ($sizeMB MB)")) {
+                Remove-Item $item.Path -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            Log "$($item.Label) removed ($sizeMB MB freed)" -Colour Green -Indent
+        } else {
+            Log "$($item.Label) not present" -Colour DarkGray -Indent
+        }
     }
 }
 
 # ====================================================================
-# STEP 5 -- Restart CoworkVMService (with extended polling)
+# STEP 7 -- Restart CoworkVMService (with extended polling)
 # ====================================================================
-Log "[5/7] Starting $ServiceName..." -Colour Yellow
+Log "[7/9] Starting $ServiceName..." -Colour Yellow
 
 if ($PSCmdlet.ShouldProcess($ServiceName, "Start")) {
     if ($script:IsAdmin) {
@@ -576,22 +755,51 @@ if ($PSCmdlet.ShouldProcess($ServiceName, "Start")) {
 }
 
 # ====================================================================
-# STEP 6 -- Relaunch Claude Desktop
+# STEP 8 -- Relaunch Claude Desktop
 # ====================================================================
 if ($SkipLaunch) {
-    Log "[6/7] Skipping Claude launch (-SkipLaunch)" -Colour DarkGray
-    Log "[7/7] Skipping health check (-SkipLaunch)" -Colour DarkGray
+    Log "[8/9] Skipping Claude launch (-SkipLaunch)" -Colour DarkGray
+    Log "[9/9] Skipping health check (-SkipLaunch)" -Colour DarkGray
 } else {
-    Log "[6/7] Launching Claude Desktop..." -Colour Yellow
+    Log "[8/9] Launching Claude Desktop..." -Colour Yellow
 
     $claudeExe = Find-ClaudeExe
 
     # Detect MSIX install and use shell:AppsFolder protocol if so
     $launched = $false
 
+    # Method 0: Elevated launch via scheduled task (created by Prevent-ClaudeIssues)
+    # This gives Claude a full admin token without UAC prompt.
+    # The task uses direct .exe launch (not shell:AppsFolder) so it inherits
+    # the Highest RunLevel -- shell:AppsFolder would route through the
+    # non-elevated desktop shell and defeat the purpose.
+    $elevTaskPath = "\Claude\LaunchClaudeAdmin"
+    try {
+        $taskExists = Get-ScheduledTask -TaskName "LaunchClaudeAdmin" -TaskPath "\Claude\" -ErrorAction SilentlyContinue
+        if ($taskExists) {
+            if ($PSCmdlet.ShouldProcess($elevTaskPath, "Launch (elevated task)")) {
+                Start-ScheduledTask -TaskName "LaunchClaudeAdmin" -TaskPath "\Claude\" -ErrorAction Stop
+                # Verify the task actually started something (give it 3 seconds)
+                Start-Sleep -Seconds 3
+                $claudeProc = Get-Process -Name "claude" -ErrorAction SilentlyContinue
+                if ($claudeProc) {
+                    Log "Launched elevated via scheduled task: $elevTaskPath" -Colour Green -Indent
+                    $launched = $true
+                } else {
+                    Log "Scheduled task ran but Claude process not detected -- falling back" -Colour DarkYellow -Indent
+                }
+            }
+        } else {
+            Log "LaunchClaudeAdmin task not found -- falling back to standard launch" -Colour DarkGray -Indent
+            Log "(Run Prevent-ClaudeIssues.bat to enable elevated launch)" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Elevated launch failed: $($_.Exception.Message) -- falling back" -Colour DarkYellow -Indent
+    }
+
     # Method A: MSIX / AppX -- query the package and launch properly
     $appxPkg = Get-AppxPackage -Name "*Claude*" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($appxPkg) {
+    if (-not $launched -and $appxPkg) {
         $pfn = $appxPkg.PackageFamilyName
         Log "Detected MSIX install: $pfn" -Colour DarkGray -Indent
         # Get the Application ID from the manifest
@@ -667,7 +875,7 @@ if ($SkipLaunch) {
     }
 
     # ====================================================================
-    # STEP 7 -- Wait for Cowork workspace readiness
+    # STEP 9 -- Wait for Cowork workspace readiness
     # ====================================================================
     # Detection strategy (in order of reliability):
     #   A. Log file: cowork_vm_node.log -- "Startup complete" or "Keepalive"
@@ -676,7 +884,7 @@ if ($SkipLaunch) {
     #   D. File size stability fallback (last resort)
     # The named pipe RPC is NOT usable (requires signed client executable).
     # ====================================================================
-    Log "[7/7] Waiting for Cowork workspace..." -Colour Yellow
+    Log "[9/9] Waiting for Cowork workspace..." -Colour Yellow
 
     $vmReady = $false
     $vmLogDir = Join-Path $ClaudeAppData "logs"

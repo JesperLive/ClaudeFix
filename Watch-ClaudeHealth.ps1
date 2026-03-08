@@ -4,15 +4,17 @@
 
 .DESCRIPTION
     Persistent background monitor that detects VirtioFS/Plan9 mount failures
-    in Claude Desktop and automatically runs the fix script.
+    and HCS/vmcompute errors in Claude Desktop and automatically runs the fix
+    script.
 
     Monitors:
-    - Claude log files for "bad address" and mount failure messages
+    - Claude log files for "bad address", mount failure, and HCS error messages
     - CoworkVMService status (stopped while Claude is running)
-    - Windows Event Log for service and Hyper-V errors/warnings
+    - Windows Event Log for service, Hyper-V, and HCS Compute errors/warnings
     - WinNAT rules (VM network connectivity)
     - Hyper-V Integration Services heartbeat
     - VM log staleness (hung VM detection)
+    - vmcompute handle leak detection (HCS service health)
     - Host clock drift (NTP/time sync)
 
     SAFETY FEATURES (v3.3):
@@ -43,7 +45,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 3.2.0
+    Version : 4.4.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -58,7 +60,7 @@ param(
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "3.3.0"
+$Version        = "4.4.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
 $ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
@@ -69,7 +71,11 @@ $ErrorPatterns = @(
     "Plan9 mount failed",
     "bad address",
     "failed to ensure virtiofs mount",
-    "RPC error -1"
+    "RPC error -1",
+    "HCS operation failed",
+    "failed to create compute system",
+    "HcsWaitForOperationResult",
+    "VM is already running"
 )
 
 # -- Win32 APIs for user activity detection ------------------------------
@@ -160,6 +166,8 @@ $script:VmLogStaleCount      = 0     # Consecutive stale checks
 $script:VmLogEverActive      = $false  # Has VM log ever been active this session?
 $script:ServiceDownCount     = 0     # Consecutive service-down checks
 $script:EventLogHitCount     = 0     # Consecutive event log hits
+$script:LastVmcomputeCheck   = [datetime]::MinValue
+$script:VmcomputeLeakCount   = 0     # Consecutive vmcompute handle leak checks
 
 # Initialize baselines for existing log files
 if (Test-Path $ClaudeLogDir) {
@@ -334,6 +342,24 @@ function Test-EventLogErrors {
                 # TIGHTENED: must specifically mention claude or cowork
                 if ($msg -match "claude" -or $msg -match "cowork") {
                     $foundIssue = "Hyper-V VMMS: $msg"
+                }
+            }
+        } catch {}
+    }
+
+    # Check 4: HCS Compute log -- dedicated channel for Host Compute Service
+    if (-not $foundIssue) {
+        try {
+            $hcsFilter = @{
+                LogName   = "Microsoft-Windows-Hyper-V-Compute-Admin"
+                Level     = @(1, 2)  # Critical, Error
+                StartTime = $since
+            }
+            $hcsEvents = Get-WinEvent -FilterHashtable $hcsFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+            if ($hcsEvents) {
+                $msg = ($hcsEvents[0].Message -split "`n")[0]
+                if ($msg -match "claude" -or $msg -match "cowork" -or $msg -match "failed to create" -or $msg -match "HcsWaitForOperationResult") {
+                    $foundIssue = "HCS Compute: $msg"
                 }
             }
         } catch {}
@@ -546,6 +572,44 @@ function Test-TimeSyncHealth {
                     return "Clock drift ${drift}s -- may cause VM connectivity issues"
                 }
             }
+        }
+    } catch {}
+    return $null
+}
+
+function Test-VmcomputeHealth {
+    <#
+    .SYNOPSIS
+        Checks the vmcompute process for handle leaks that indicate HCS instability.
+        Returns $null if healthy, or a trigger string if a serious leak is detected.
+        Requires 2 consecutive checks above threshold before triggering.
+        Only checks every 60 seconds.
+    #>
+    # Skip during startup grace period
+    if (Test-StartupGracePeriod) { return $null }
+
+    # Only check every 60 seconds
+    $now = Get-Date
+    if (($now - $script:LastVmcomputeCheck).TotalSeconds -lt 60) { return $null }
+    $script:LastVmcomputeCheck = $now
+
+    try {
+        $vmcompute = Get-Process -Name "vmcompute" -ErrorAction SilentlyContinue
+        if (-not $vmcompute) { return $null }
+
+        $handleCount = $vmcompute.HandleCount
+        if ($handleCount -gt 10000) {
+            $script:VmcomputeLeakCount++
+            if ($script:VmcomputeLeakCount -ge 2) {
+                $script:VmcomputeLeakCount = 0
+                return "vmcompute handle leak critical ($handleCount handles) -- service needs restart"
+            }
+            Write-WatchLog "vmcompute handle leak detected ($handleCount handles) -- check $($script:VmcomputeLeakCount)/2"
+        } elseif ($handleCount -gt 5000) {
+            Write-WatchLog "vmcompute handle leak detected ($handleCount handles) -- service may need restart"
+            $script:VmcomputeLeakCount = 0
+        } else {
+            $script:VmcomputeLeakCount = 0
         }
     } catch {}
     return $null
@@ -880,10 +944,11 @@ function Invoke-AutoFix {
     $script:ServiceDownCount   = 0
     $script:EventLogHitCount   = 0
     $script:HeartbeatFailCount = 0
+    $script:VmcomputeLeakCount = 0
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v3.3"
+$mutexName = "Global\ClaudeHealthMonitor_v4.4"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)
@@ -905,7 +970,7 @@ Write-WatchLog "  Cooldown      : ${Cooldown} min"
 Write-WatchLog "  Fix script    : $fixScript"
 Write-WatchLog "  Log directory : $ClaudeLogDir"
 Write-WatchLog "  Safety        : user-activity block, 90s grace period, consecutive-check gates"
-Write-WatchLog "  Monitors      : logs, service(x2), events(x2), NAT, heartbeat(x3), staleness(x5), time sync"
+Write-WatchLog "  Monitors      : logs, service(x2), events(x2)+HCS, NAT, heartbeat(x3), staleness(x5), vmcompute-health, time sync"
 Write-WatchLog "================================================================"
 
 try {
@@ -955,6 +1020,13 @@ try {
                 $staleIssue = Test-VmLogStaleness
                 if ($staleIssue) {
                     Invoke-AutoFix -Reason $staleIssue
+                    continue
+                }
+
+                # Check 7: vmcompute handle leak (2 consecutive checks, 60s interval)
+                $vmcomputeIssue = Test-VmcomputeHealth
+                if ($vmcomputeIssue) {
+                    Invoke-AutoFix -Reason $vmcomputeIssue
                     continue
                 }
 

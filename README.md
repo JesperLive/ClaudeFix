@@ -1,8 +1,8 @@
 # Claude Desktop / Cowork VM Fix for Windows
 
-**Fix the "VirtioFS mount failed: bad address" crash in Claude Desktop on Windows -- without rebooting.**
+**Fix "VirtioFS mount failed" and "HCS operation failed" crashes in Claude Desktop on Windows -- without rebooting.**
 
-If you're seeing any of these errors in Claude Desktop's Cowork mode, this toolkit will fix them:
+If you're seeing any of these errors in Claude Desktop's Cowork mode, this toolkit will fix and prevent them:
 
 ```
 RPC error -1: failed to ensure virtiofs mount: Plan9 mount failed: bad address
@@ -12,6 +12,12 @@ Workspace failed to start
 ```
 ```
 Setting up workspace... (stuck forever)
+```
+```
+HCS operation failed: failed to create compute system
+```
+```
+VM is already running
 ```
 
 Two scripts: one **prevents** the crash, the other **fixes** it when it happens anyway.
@@ -80,6 +86,21 @@ The VirtioFS connection degrades when:
 - Antivirus filter drivers interfere with VirtioFS disk operations
 - Host clock drift causes TLS and API failures inside the VM
 
+### HCS Failures
+
+A separate class of failure occurs before the VM even boots. The Host Compute Service (HCS, `vmcompute.exe`) manages Hyper-V compute systems. When it fails, Claude shows:
+
+```
+Failed to start Claude's workspace
+```
+
+The underlying HCS error (`failed to create compute system: HcsWaitForOperationResult failed`) can be caused by:
+
+- Handle leaks in `vmcompute.exe` after many VM start/stop cycles
+- The `vmcompute` service crashing or entering a stuck state
+- Boot race conditions where services start before the kernel is ready
+- Antivirus filter drivers interfering with compute system creation
+
 ### Tracked Issues
 
 - [#26554](https://github.com/anthropics/claude-code/issues/26554) -- VirtioFS mount fails with "bad address"
@@ -87,6 +108,8 @@ The VirtioFS connection degrades when:
 - [#28890](https://github.com/anthropics/claude-code/issues/28890) -- Mount goes stale after idle
 - [#29587](https://github.com/anthropics/claude-code/issues/29587) -- Cowork fails after brief use
 - [#29848](https://github.com/anthropics/claude-code/issues/29848) -- Recurring VM crashes
+- [#31520](https://github.com/anthropics/claude-code/issues/31520) -- Community recovery script for VirtioFS failures (ClaudeFix covers all steps and more)
+- [#31703](https://github.com/anthropics/claude-code/issues/31703) -- HCS/VM service failures on v1.1.5368 (still open as of March 2026)
 
 ---
 
@@ -98,17 +121,25 @@ One-click fix when Claude Desktop / Cowork is broken. No reboot needed.
 
 | Step | Action |
 |------|--------|
-| 1 | Captures Claude.exe path, then force-kills all `claude.exe` processes |
-| 2 | Stops `CoworkVMService` (graceful with admin, force-kill without) |
-| 3 | Verifies no orphan processes remain |
-| 4 | Deletes stale VM cache (`claude-code-vm` and `vm_bundles`) to force a clean rebuild |
-| 5 | Restarts `CoworkVMService` (admin) or defers to Claude auto-restart (non-admin) |
-| 6 | Auto-detects and relaunches Claude Desktop (MSIX-aware -- no duplicate taskbar icons) |
-| 7 | Monitors `cowork_vm_node.log` for boot completion, confirms workspace is ready |
+| 1 | Captures Claude.exe path, then force-kills all claude.exe processes |
+| 2 | Stops CoworkVMService (graceful with admin, force-kill without) |
+| 3 | Checks for HCS errors and restarts vmcompute service if needed (admin only) |
+| 4 | Verifies no orphan processes remain |
+| 5 | Kills orphan HCS compute systems via hcsdiag and Hyper-V cmdlets |
+| 6 | Deletes stale VM cache (claude-code-vm and vm_bundles) to force a clean rebuild |
+| 7 | Restarts CoworkVMService (admin) or defers to Claude auto-restart (non-admin) |
+| 8 | Relaunches Claude Desktop with elevated privileges via scheduled task (Method 0), falling back to MSIX shell protocol or direct exe launch |
+| 9 | Monitors cowork_vm_node.log for boot completion, confirms workspace is ready |
 
-**Step 6** detects both MSIX (Microsoft Store) and traditional installs. MSIX apps are launched via `shell:AppsFolder` protocol to avoid creating loose instances with duplicate taskbar icons. Eight different detection methods ensure the executable is found regardless of install location.
+**Step 8** first attempts to relaunch Claude with elevated privileges via the `LaunchClaudeAdmin` scheduled task created by Prevent (Method 0). This gives Claude a full admin token without a UAC prompt. If the task doesn't exist or fails, it falls through to three standard methods: Method A launches MSIX installs via `shell:AppsFolder` protocol (no duplicate taskbar icons), Method B launches traditional `.exe` installs directly, and Method C uses Start Menu shortcuts as a last resort. All methods respect `-WhatIf` and each has a `$launched` guard to prevent double-launch.
 
-**Step 7** monitors the VM boot log for definitive completion markers (`"Startup complete"`, `"[Keepalive]"`), showing real-time progress through the boot stages. Falls back to Hyper-V heartbeat checks and directory monitoring if logs are unavailable. After completion, the PowerShell window is brought to the foreground and the taskbar icon flashes until you dismiss it.
+**Step 5** terminates orphan HCS compute systems that survive service shutdown. When CoworkVMService stops, the underlying Hyper-V VM may remain registered in HCS, causing "VM is already running" errors on restart. The script first uses `hcsdiag list` to find any claude/cowork compute systems and `hcsdiag kill` to terminate them (admin only). As a fallback, it uses `Stop-VM -TurnOff -Force` via Hyper-V cmdlets. Both methods are tried because hcsdiag operates at the HCS layer (catching lightweight containers) while Stop-VM operates at the Hyper-V management layer (catching full VMs). This step is non-fatal -- failures don't block the rest of the fix.
+
+**Step 3** checks recent Windows Event Log entries and Claude logs for HCS error patterns (`HCS operation failed`, `failed to create compute system`, `HcsWaitForOperationResult`). If detected and running as admin, it stops and restarts the `vmcompute` service. If `vmcompute` fails to restart within 15 seconds, it also restarts the `vmms` (Virtual Machine Management) service as a fallback. This step is wrapped in a try/catch so failures don't block the rest of the fix process. Without admin, HCS errors are logged but require manual elevation.
+
+**Step 9** monitors the VM boot log for definitive completion markers (`"Startup complete"`, `"[Keepalive]"`), showing real-time progress through the boot stages. Falls back to Hyper-V heartbeat checks and directory monitoring if logs are unavailable. After completion, the PowerShell window is brought to the foreground and the taskbar icon flashes until you dismiss it.
+
+**Step 6 note:** Purging the VM cache (`vm_bundles`) forces Claude to re-download approximately 2-3 GB of VM resources on the next launch. This is necessary for a clean recovery but means the first Cowork session after a fix will take longer to start. If you're running the fix script frequently, be aware of this download cost.
 
 ### What It Does NOT Touch
 
@@ -122,6 +153,7 @@ One-click fix when Claude Desktop / Cowork is broken. No reboot needed.
 |-----------|-------------|
 | `-SkipLaunch` | Reset the VM but don't relaunch Claude |
 | `-Quiet` | Suppress the "press any key" prompt (for scheduled tasks) |
+| `-KeepCache` | Skip the VM cache purge (avoids ~2-3 GB re-download). Use when running Fix frequently. If the fix fails with `-KeepCache`, run again without it. |
 | `-WhatIf` | Dry run -- show what would happen without changing anything |
 
 ### Diagnostics
@@ -149,16 +181,18 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 9 | Processor minimum state | 100% (AC) | Prevents CPU throttling that can starve the VM |
 | 10 | Hyper-V VM memory | Pinned (no ballooning) | Prevents memory reclaim from invalidating VirtioFS shared regions |
 | 11 | VM worker priority | AboveNormal | Prevents host from deprioritizing vmwp.exe under load |
-| 12 | WinNAT rules | Verified / repaired | Ensures VM has outbound network connectivity |
-| 13 | Firewall policies | Checked | Detects Group Policy blocking Hyper-V network rules |
-| 14 | Storage location | Checked | Warns if workspace is on cloud-sync, USB, or network drive |
-| 15 | Time synchronisation | Verified | Ensures NTP is running and clock drift is within tolerance |
-| 16 | Antivirus exclusions | Configured / advised | Prevents AV filter drivers from blocking VirtioFS disk ops |
-| 17 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
-| 18 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
-| 19 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
-| 20 | Claude elevation | Scheduled task (full admin, no UAC prompt) | Ensures Claude Desktop (and its child processes like MCP servers) launch with full admin privileges |
-| 21 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering -- complementary to Step 20 for tools that use COM or WMI elevation |
+| 12 | HCS service recovery | Auto-restart 30s/60s/120s | Configures `vmcompute` to auto-restart on failure with escalating delays |
+| 13 | Service startup timeout | 120000ms | Prevents boot race conditions where services start before dependencies are ready |
+| 14 | WinNAT rules | Verified / repaired | Ensures VM has outbound network connectivity |
+| 15 | Firewall policies | Checked | Detects Group Policy blocking Hyper-V network rules |
+| 16 | Storage location | Checked | Warns if workspace is on cloud-sync, USB, or network drive |
+| 17 | Time synchronisation | Verified | Ensures NTP is running and clock drift is within tolerance |
+| 18 | Antivirus exclusions | Configured / advised | Prevents AV filter drivers from blocking VirtioFS disk ops |
+| 19 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
+| 20 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
+| 21 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
+| 22 | Claude elevation | Scheduled task + Desktop shortcut | Ensures Claude Desktop launches with full admin privileges. Desktop shortcut uses Claude's own icon and includes a process guard to prevent double-launch |
+| 23 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering -- complementary to Step 22 for tools that use COM or WMI elevation |
 
 Battery settings are not changed -- laptop users keep normal battery behaviour.
 
@@ -168,23 +202,29 @@ Battery settings are not changed -- laptop users keep normal battery behaviour.
 
 **VM worker process priority** (step 11) -- `vmwp.exe` is the Hyper-V Virtual Machine Worker Process that hosts each VM on the host side. At Normal priority, it can be starved under heavy CPU or I/O load, causing the VirtioFS connection to stall or time out. Setting it to AboveNormal gives it scheduling preference. This is not persistent across reboots, so the health monitor re-applies it on every poll cycle.
 
+### HCS Service Recovery
+
+**HCS service recovery** (step 12) -- The `vmcompute` service (Host Compute Service) manages all Hyper-V compute system operations. If it crashes, every VM creation call fails with `HCS operation failed`. The script configures Windows Service Control Manager to auto-restart `vmcompute` with escalating delays: 30 seconds after the first failure, 60 seconds after the second, 120 seconds after the third. The failure counter resets after 300 seconds of healthy operation. This is a permanent OS-level setting that survives reboots.
+
+**Service startup timeout** (step 13) -- The default `ServicesPipeTimeout` of 30 seconds can be too short on heavily loaded systems or during Windows Update reboots. If services like `vmcompute` don't start within this window, dependent services fail silently. Setting it to 120 seconds (120000ms) gives boot-time services more room. This is idempotent -- if the timeout is already >=120000ms (set by another tool), it's left untouched. Requires a reboot to take effect.
+
 ### Network and NAT
 
-**WinNAT rules** (step 12) -- The Cowork VM needs a WinNAT rule to route traffic from its internal Hyper-V switch to the host's network. If this rule disappears (VPN reconnect, network adapter change, Windows Update), the VM silently loses all outbound connectivity. API calls fail, package downloads stall, and the workspace becomes unresponsive. The prevention script checks for existing NAT rules and auto-creates one if missing. The health monitor continuously monitors NAT health and repairs it automatically.
+**WinNAT rules** (step 14) -- The Cowork VM needs a WinNAT rule to route traffic from its internal Hyper-V switch to the host's network. If this rule disappears (VPN reconnect, network adapter change, Windows Update), the VM silently loses all outbound connectivity. API calls fail, package downloads stall, and the workspace becomes unresponsive. The prevention script checks for existing NAT rules and auto-creates one if missing. The health monitor continuously monitors NAT health and repairs it automatically.
 
-**Firewall policies** (step 13) -- Group Policy can set "Apply Local Firewall Rules" to disabled, which blocks the DHCP and DNS rules that Hyper-V's Host Network Service (HNS) creates for VMs. The script detects this and warns you to contact your IT admin. It also checks that Hyper-V-specific firewall rules are enabled.
+**Firewall policies** (step 15) -- Group Policy can set "Apply Local Firewall Rules" to disabled, which blocks the DHCP and DNS rules that Hyper-V's Host Network Service (HNS) creates for VMs. The script detects this and warns you to contact your IT admin. It also checks that Hyper-V-specific firewall rules are enabled.
 
 ### Storage, Time Sync, and Antivirus
 
-**Storage location** (step 14) -- VirtioFS mounts fail when Claude's data directory is on a cloud-sync folder (OneDrive, Google Drive, Dropbox), an external USB drive, or a network share. The script detects these conditions and warns you to move Claude's data to a local SSD.
+**Storage location** (step 16) -- VirtioFS mounts fail when Claude's data directory is on a cloud-sync folder (OneDrive, Google Drive, Dropbox), an external USB drive, or a network share. The script detects these conditions and warns you to move Claude's data to a local SSD.
 
-**Time synchronisation** (step 15) -- If the host clock drifts more than 5 seconds from NTP, Hyper-V's time synchronisation integration service can't correct the guest clock. This causes TLS certificate validation failures and API timeouts inside the VM. The script checks the W32Time service, measures actual drift, and forces a resync if needed. The health monitor continues to check every 5 minutes.
+**Time synchronisation** (step 17) -- If the host clock drifts more than 5 seconds from NTP, Hyper-V's time synchronisation integration service can't correct the guest clock. This causes TLS certificate validation failures and API timeouts inside the VM. The script checks the W32Time service, measures actual drift, and forces a resync if needed. The health monitor continues to check every 5 minutes.
 
-**Antivirus exclusions** (step 16) -- Antivirus filter drivers sit in the I/O path between VirtioFS and the host filesystem. They can delay or block disk operations that VirtioFS depends on, causing timeouts and mount failures. For Windows Defender, the script automatically adds exclusions for Claude's data directory, Hyper-V binaries, and the CoworkVMService process. For third-party AV products, it lists the recommended exclusion paths for you to add manually.
+**Antivirus exclusions** (step 18) -- Antivirus filter drivers sit in the I/O path between VirtioFS and the host filesystem. They can delay or block disk operations that VirtioFS depends on, causing timeouts and mount failures. For Windows Defender, the script automatically adds exclusions for Claude's data directory, Hyper-V binaries, and the CoworkVMService process. For third-party AV products, it lists the recommended exclusion paths for you to add manually.
 
 ### The Health Monitor
 
-A persistent background process that starts at logon and polls every 30 seconds. It monitors seven sources for VirtioFS failures:
+A persistent background process that starts at logon and polls every 30 seconds. It monitors eight sources for VirtioFS failures:
 
 1. **Claude log files** -- scans all `*.log` files in `%APPDATA%\Claude\logs\` for error patterns like "Plan9 mount failed" and "bad address"
 2. **Service status** -- detects when `CoworkVMService` stops while `claude.exe` is still running (2 consecutive checks)
@@ -193,8 +233,9 @@ A persistent background process that starts at logon and polls every 30 seconds.
 5. **Hyper-V heartbeat** -- monitors the VM's Integration Services heartbeat to detect hung VMs (3 consecutive checks)
 6. **VM log staleness** -- catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if VM was previously active)
 7. **Clock drift** -- checks NTP drift every 5 minutes and auto-resyncs if >5 seconds (warning only)
+8. **vmcompute health** -- monitors `vmcompute.exe` handle count every 60 seconds. Warning at 5000 handles, critical trigger at 10000 handles (2 consecutive checks required). Catches handle leaks that precede HCS failures
 
-### Safety Features (v3.3)
+### Safety Features (v4.3)
 
 The entire toolkit is designed to **never interrupt active work** — whether you're in Chat, Cowork, or Code:
 
@@ -226,9 +267,9 @@ Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`. Can also be star
 
 ### Claude Elevation and Admin Token Policy
 
-**Claude elevation** (step 20) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`. **Note:** MSIX installs will show a second Claude icon on the taskbar when launched elevated. This is unavoidable -- Windows enforces medium integrity for all shell-activated MSIX apps, so the only way to get a full admin token is to launch the `.exe` directly, which bypasses the MSIX app model's icon grouping.
+**Claude elevation** (step 22) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`. **Note:** MSIX installs will show a second Claude icon on the taskbar when launched elevated. This is unavoidable -- Windows enforces medium integrity for all shell-activated MSIX apps, so the only way to get a full admin token is to launch the `.exe` directly, which bypasses the MSIX app model's icon grouping. The scheduled task includes a process guard: if Claude is already running when the task is triggered (e.g., clicking the Desktop shortcut while Claude is open), it exits cleanly without launching a second instance. The Desktop shortcut uses Claude's actual icon (resolved at Prevent runtime via `Get-AppxPackage`); if the icon path becomes stale after a Claude update, it falls back to a generic Windows icon until Prevent is re-run.
 
-**Admin token policy** (step 21) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 20 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
+**Admin token policy** (step 23) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 22 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
 
 ### Fast Startup, Connected Standby, NIC Power Saving
 
@@ -258,7 +299,7 @@ Creates a "Fix Claude Desktop" shortcut on the Desktop and in the Start Menu. Yo
 .\Prevent-ClaudeIssues.ps1 -Undo
 ```
 
-Restores your original power plan, re-enables hibernate, resets sleep to 30 minutes, removes all scheduled tasks (Watchdog, BootFix, LaunchClaudeAdmin), deletes the shortcuts and launcher scripts, removes the RUNASADMIN registry flags, and reverts admin token policy changes.
+Restores your original power plan, re-enables hibernate, resets sleep to 30 minutes, reverts HCS service recovery configuration, removes all scheduled tasks (Watchdog, BootFix, LaunchClaudeAdmin), deletes the shortcuts and launcher scripts, removes the RUNASADMIN registry flags, and reverts admin token policy changes.
 
 ---
 
@@ -276,6 +317,12 @@ Restores your original power plan, re-enables hibernate, resets sleep to 30 minu
 
 **The fix script says "Workspace ready" but Cowork still shows an error**
 Try running the fix script a second time. Some stale states need two cycles to fully clear. If it persists after 2-3 runs, reboot and let the boot-fix task handle it.
+
+**"Failed to start Claude's workspace" with HCS error**
+This is an HCS (Host Compute Service) failure, not a VirtioFS mount failure. Run `Fix-ClaudeDesktop.bat` as admin -- Step 3 will detect the HCS error and restart the `vmcompute` service. If it keeps happening, run `Prevent-ClaudeIssues.bat` to configure automatic HCS service recovery. The health monitor (installed by Prevent) also watches for `vmcompute` handle leaks that precede these failures.
+
+**"VM is already running" after running the fix script**
+The old VM wasn't fully released before the service restarted. Run the fix script again -- Step 5 now explicitly kills orphan compute systems via hcsdiag. If it persists, open an admin PowerShell and run `hcsdiag list` to see all compute systems, then `hcsdiag kill <id>` for any claude/cowork entries.
 
 **"Service not found -- is Cowork installed?"**
 The `CoworkVMService` Windows service is only installed when you've used Cowork mode at least once. Open Claude Desktop, start a Cowork session, let it install the VM components, then run the scripts.
@@ -312,6 +359,8 @@ Watch-ClaudeHealth.ps1      -- Health monitor (auto-detects and auto-fixes crash
 README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
+
+Current versions: Fix 4.5.0, Watch 4.4.0, Prevent 4.5.0
 
 ---
 
