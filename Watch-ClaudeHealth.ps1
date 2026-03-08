@@ -45,7 +45,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 4.6.0
+    Version : 4.7.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -60,7 +60,7 @@ param(
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "4.6.0"
+$Version        = "4.7.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
 $ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
@@ -988,7 +988,7 @@ function Invoke-AutoFix {
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v4.6"
+$mutexName = "Global\ClaudeHealthMonitor_v4.7"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)

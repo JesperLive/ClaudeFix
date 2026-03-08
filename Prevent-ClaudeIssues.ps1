@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.6.0
+    Version : 4.7.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -73,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.6.0"
+$Version          = "4.7.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -364,7 +364,7 @@ if ($Undo) {
     # ================================================================
     # SETUP MODE
     # ================================================================
-    $steps = 23
+    $steps = 24
 
     # ----------------------------------------------------------------
     # 1. Power plan -- High Performance or Ultimate Performance
@@ -922,9 +922,53 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 19. Install health monitor (auto-detects and auto-fixes crashes)
+    # 19. WSL2 / Hyper-V conflict detection
     # ----------------------------------------------------------------
-    Step 19 $steps "Installing health monitor..."
+    Step 19 $steps "Checking for WSL2 / Hyper-V conflicts..."
+
+    $wsl2Warnings = @()
+
+    # Check WSL feature
+    $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+    if ($wslFeature -and $wslFeature.State -eq 'Enabled') {
+        $wsl2Warnings += "WSL feature is enabled"
+
+        # Check for running distros
+        if (Test-Path "$env:SystemRoot\System32\wsl.exe") {
+            try {
+                $distroOutput = & wsl -l -v 2>$null
+                if ($distroOutput) {
+                    $running = $distroOutput | Where-Object { $_ -match 'Running' -and $_ -match '\s2\s' }
+                    if ($running) {
+                        $wsl2Warnings += "WSL2 distros are actively running -- may conflict with Claude's VM"
+                        $wsl2Warnings += "If Cowork has issues, try: wsl --shutdown"
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    # Check Docker Desktop
+    if (Test-Path "C:\Program Files\Docker\Docker\Docker.exe") {
+        $wsl2Warnings += "Docker Desktop detected (may use WSL2 backend)"
+    }
+
+    # Display warnings
+    if ($wsl2Warnings.Count -gt 0) {
+        Write-Host ""
+        Log "WSL2 / Hyper-V Conflict Check:" -Colour Yellow
+        foreach ($w in $wsl2Warnings) {
+            Log "  [!] $w" -Colour Yellow -Indent
+        }
+        Write-Host ""
+    } else {
+        Log "WSL2 conflict check: No conflicts detected" -Colour Green -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 20. Install health monitor (auto-detects and auto-fixes crashes)
+    # ----------------------------------------------------------------
+    Step 20 $steps "Installing health monitor..."
 
     # Find Watch-ClaudeHealth.ps1 in the same folder as this script
     $myDir = Split-Path $PSCommandPath -Parent
@@ -1012,9 +1056,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 20. Create boot-fix scheduled task
+    # 21. Create boot-fix scheduled task
     # ----------------------------------------------------------------
-    Step 20 $steps "Creating boot-time fix task..."
+    Step 21 $steps "Creating boot-time fix task..."
 
     $fixScript = $null
     if ($myDir) {
@@ -1081,9 +1125,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 21. Create shortcuts (Desktop + Start Menu)
+    # 22. Create shortcuts (Desktop + Start Menu)
     # ----------------------------------------------------------------
-    Step 21 $steps "Creating Fix Claude Desktop shortcuts..."
+    Step 22 $steps "Creating Fix Claude Desktop shortcuts..."
 
     $fixBat = $null
     if ($myDir) {
@@ -1134,9 +1178,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 22. Set Claude Desktop to launch elevated (MSIX-aware)
+    # 23. Set Claude Desktop to launch elevated (MSIX-aware)
     # ----------------------------------------------------------------
-    Step 22 $steps "Configuring Claude Desktop to launch elevated..."
+    Step 23 $steps "Configuring Claude Desktop to launch elevated..."
     try {
         # Scheduled task registration requires admin -- skip gracefully if not elevated
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -1286,9 +1330,9 @@ if errorlevel 1 (
     }
 
     # ----------------------------------------------------------------
-    # 23. Admin token filtering (LocalAccountTokenFilterPolicy)
+    # 24. Admin token filtering (LocalAccountTokenFilterPolicy)
     # ----------------------------------------------------------------
-    Step 23 $steps "Configuring admin token policy..."
+    Step 24 $steps "Configuring admin token policy..."
     try {
         $policyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
         $current = Get-ItemProperty -Path $policyPath -ErrorAction Stop
@@ -1350,6 +1394,7 @@ if errorlevel 1 (
     Write-Host "    Storage location ..... Checked" -ForegroundColor White
     Write-Host "    Time sync ............ Verified" -ForegroundColor White
     Write-Host "    Antivirus ............ Exclusions configured" -ForegroundColor White
+    Write-Host "    WSL2 conflicts ....... Checked" -ForegroundColor White
     Write-Host "    Health monitor ....... Every 30s (auto-fix)" -ForegroundColor White
     Write-Host "    Boot-fix task ........ At every logon" -ForegroundColor White
     Write-Host "    Shortcuts ............ Desktop + Start Menu" -ForegroundColor White

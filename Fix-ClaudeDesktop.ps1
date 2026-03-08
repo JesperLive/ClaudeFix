@@ -19,7 +19,15 @@
     Reset the VM service but don't relaunch Claude Desktop afterwards.
 
 .PARAMETER Quiet
-    Suppress the "press any key" prompt at the end.
+    Suppress the "press any key" prompt at the end and skip the
+    interactive menu. Defaults to Smart mode.
+
+.PARAMETER Mode
+    Skip the interactive menu and run in the specified mode:
+      Quick      -- Restart services + basic repair (Steps 1-5, skip cache purge)
+      Deep       -- Full nuclear reset (all steps including cache purge)
+      Smart      -- Try quick first, escalate to deep if needed (default)
+      Diagnostic -- Health check only, no changes
 
 .PARAMETER KeepCache
     Skip the VM cache purge (Step 6). Use this to avoid re-downloading
@@ -30,7 +38,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.6.0
+    Version : 4.7.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -38,8 +46,11 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$SkipLaunch,
+    [Alias("Silent")]
     [switch]$Quiet,
-    [switch]$KeepCache
+    [switch]$KeepCache,
+    [ValidateSet('Quick','Deep','Smart','Diagnostic')]
+    [string]$Mode
 )
 
 # -- Admin elevation (optional) --------------------------------------
@@ -54,6 +65,7 @@ if (-not $script:IsAdmin) {
     if ($Quiet)            { $elevateArgs += " -Quiet" }
     if ($WhatIfPreference) { $elevateArgs += " -WhatIf" }
     if ($KeepCache)        { $elevateArgs += " -KeepCache" }
+    if ($Mode)             { $elevateArgs += " -Mode $Mode" }
 
     Write-Host ""
     Write-Host "  Requesting admin privileges for full service control..." -ForegroundColor DarkGray
@@ -75,7 +87,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.6.0"
+$Version         = "4.7.0"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -418,7 +430,7 @@ Write-Host "  +-------------------------------------------+" -ForegroundColor Cy
 Write-Host ""
 
 # -- Prevent concurrent Fix runs ----------------------------------------
-$fixMutexName = "Global\ClaudeDesktopFix_v4.6"
+$fixMutexName = "Global\ClaudeDesktopFix_v4.7"
 $fixMutex = $null
 try {
     $fixMutex = [System.Threading.Mutex]::new($false, $fixMutexName)
@@ -438,6 +450,198 @@ if ($WhatIfPreference) {
     Log "DRY RUN -- no changes will be made" -Colour Yellow
 }
 Write-Host ""
+
+# ====================================================================
+# INTERACTIVE MENU -- shown when run manually without -Mode or -Quiet
+# ====================================================================
+$script:SelectedMode = $Mode   # may be empty
+if (-not $Quiet -and -not $Mode -and [Environment]::UserInteractive) {
+    # Try PromptForChoice first (works in full console hosts)
+    $menuSuccess = $false
+    try {
+        $modeTitle   = "  Select repair mode"
+        $modeMessage = "  What kind of fix do you want to run?"
+        $modeChoices = [System.Management.Automation.Host.ChoiceDescription[]]@(
+            (New-Object System.Management.Automation.Host.ChoiceDescription "&Quick Fix",   "Restart services + basic repair (Steps 1-5, skip cache purge)"),
+            (New-Object System.Management.Automation.Host.ChoiceDescription "&Deep Fix",    "Full nuclear reset (all steps including cache purge)"),
+            (New-Object System.Management.Automation.Host.ChoiceDescription "&Smart Fix",   "Try quick first, escalate to deep if needed (recommended)"),
+            (New-Object System.Management.Automation.Host.ChoiceDescription "D&iagnostic",  "Health check only, no changes"),
+            (New-Object System.Management.Automation.Host.ChoiceDescription "&Cancel",      "Exit without doing anything")
+        )
+        $modeDefault = 2  # Smart Fix
+        $modeResult  = $host.UI.PromptForChoice($modeTitle, $modeMessage, $modeChoices, $modeDefault)
+        $menuSuccess = $true
+
+        switch ($modeResult) {
+            0 { $script:SelectedMode = "Quick" }
+            1 { $script:SelectedMode = "Deep" }
+            2 { $script:SelectedMode = "Smart" }
+            3 { $script:SelectedMode = "Diagnostic" }
+            4 {
+                Log "Cancelled by user" -Colour DarkGray
+                Save-Log
+                exit 0
+            }
+        }
+
+        # Second menu: options
+        Write-Host ""
+        $optTitle   = "  Options"
+        $optMessage = "  Toggle any options, then Continue:"
+        $optDone = $false
+        while (-not $optDone) {
+            $kcLabel   = if ($KeepCache) { "&Keep cache [ON]" } else { "&Keep cache [off]" }
+            $slLabel   = if ($SkipLaunch) { "&Skip relaunch [ON]" } else { "&Skip relaunch [off]" }
+            $wiLabel   = if ($WhatIfPreference) { "&WhatIf mode [ON]" } else { "&WhatIf mode [off]" }
+            $optChoices = [System.Management.Automation.Host.ChoiceDescription[]]@(
+                (New-Object System.Management.Automation.Host.ChoiceDescription $kcLabel,  "Toggle cache preservation"),
+                (New-Object System.Management.Automation.Host.ChoiceDescription $slLabel,  "Toggle Claude relaunch"),
+                (New-Object System.Management.Automation.Host.ChoiceDescription $wiLabel,  "Toggle dry-run mode"),
+                (New-Object System.Management.Automation.Host.ChoiceDescription "&Continue", "Accept current options")
+            )
+            $optResult = $host.UI.PromptForChoice($optTitle, $optMessage, $optChoices, 3)
+            switch ($optResult) {
+                0 { $KeepCache = -not $KeepCache }
+                1 { $SkipLaunch = -not $SkipLaunch }
+                2 { $WhatIfPreference = -not $WhatIfPreference }
+                3 { $optDone = $true }
+            }
+        }
+    } catch {
+        # Fallback: simple Read-Host menu for hosts that don't support PromptForChoice
+        if (-not $menuSuccess) {
+            Write-Host ""
+            Write-Host "  Select repair mode:" -ForegroundColor Cyan
+            Write-Host "  1) Quick Fix     -- Restart services + basic repair"
+            Write-Host "  2) Deep Fix      -- Full nuclear reset (cache purge)"
+            Write-Host "  3) Smart Fix     -- Quick first, escalate if needed (recommended)"
+            Write-Host "  4) Diagnostic    -- Health check only, no changes"
+            Write-Host "  C) Cancel"
+            Write-Host ""
+            $choice = Read-Host "  Selection [3]"
+            if (-not $choice) { $choice = "3" }
+            switch ($choice.Trim()) {
+                "1" { $script:SelectedMode = "Quick" }
+                "2" { $script:SelectedMode = "Deep" }
+                "3" { $script:SelectedMode = "Smart" }
+                "4" { $script:SelectedMode = "Diagnostic" }
+                { $_ -eq "C" -or $_ -eq "c" } {
+                    Log "Cancelled by user" -Colour DarkGray
+                    Save-Log
+                    exit 0
+                }
+                default { $script:SelectedMode = "Smart" }
+            }
+        }
+    }
+
+    # Summary and final confirm
+    Write-Host ""
+    Write-Host "  +-------------------------------------------+" -ForegroundColor Cyan
+    Write-Host "  |  SELECTED OPTIONS                         |" -ForegroundColor Cyan
+    Write-Host "  +-------------------------------------------+" -ForegroundColor Cyan
+    Write-Host "    Mode:          $($script:SelectedMode)" -ForegroundColor White
+    Write-Host "    Keep cache:    $(if ($KeepCache) { 'Yes' } else { 'No' })" -ForegroundColor White
+    Write-Host "    Skip relaunch: $(if ($SkipLaunch) { 'Yes' } else { 'No' })" -ForegroundColor White
+    Write-Host "    WhatIf:        $(if ($WhatIfPreference) { 'Yes' } else { 'No' })" -ForegroundColor White
+    Write-Host ""
+    $confirm = Read-Host "  Proceed? (Y/n)"
+    if ($confirm -and $confirm.Trim() -match "^[Nn]") {
+        Log "Cancelled by user" -Colour DarkGray
+        Save-Log
+        exit 0
+    }
+    Write-Host ""
+}
+
+# Default mode when none selected
+if (-not $script:SelectedMode) { $script:SelectedMode = "Smart" }
+
+# ====================================================================
+# DIAGNOSTIC MODE -- report health and exit
+# ====================================================================
+if ($script:SelectedMode -eq "Diagnostic") {
+    Log "Running diagnostic check (no changes)..." -Colour Cyan
+    Write-Host ""
+
+    # Service status
+    $diagSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($diagSvc) {
+        $diagCol = if ($diagSvc.Status -eq "Running") { "Green" } else { "Yellow" }
+        Log "  $ServiceName : $($diagSvc.Status)" -Colour $diagCol
+    } else {
+        Log "  $ServiceName : Not installed" -Colour Red
+    }
+
+    # vmcompute status
+    $diagVmc = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
+    if ($diagVmc) {
+        $diagCol = if ($diagVmc.Status -eq "Running") { "Green" } else { "Yellow" }
+        Log "  vmcompute     : $($diagVmc.Status)" -Colour $diagCol
+    }
+
+    # HCS errors
+    $diagHcs = Test-RecentHcsErrors
+    if ($diagHcs -eq "json_corruption") {
+        Log "  HCS health    : JSON corruption detected (0xC037010D)" -Colour Red
+    } elseif ($diagHcs -eq "hcs_error") {
+        Log "  HCS health    : Errors detected" -Colour Yellow
+    } else {
+        Log "  HCS health    : Clean" -Colour Green
+    }
+
+    # Claude processes
+    $diagProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    Log "  Claude procs  : $($diagProcs.Count) running" -Colour Cyan
+
+    # VM cache
+    foreach ($cp in @(
+        @{ Path = $VmCachePath; Label = "claude-code-vm" },
+        @{ Path = $BundlePath;  Label = "vm_bundles" }
+    )) {
+        if (Test-Path $cp.Path) {
+            $sz = (Get-ChildItem $cp.Path -Recurse -ErrorAction SilentlyContinue |
+                   Measure-Object -Property Length -Sum).Sum
+            Log "  $($cp.Label) : $([math]::Round($sz/1MB,1)) MB" -Colour DarkGray
+        } else {
+            Log "  $($cp.Label) : Not present" -Colour DarkGray
+        }
+    }
+
+    # Recent event log errors
+    try {
+        $diagEvFilter = @{
+            LogName      = "Application"
+            ProviderName = "CoworkVMService"
+            Level        = 2
+            StartTime    = (Get-Date).AddHours(-1)
+        }
+        $diagEvents = @(Get-WinEvent -FilterHashtable $diagEvFilter -MaxEvents 5 -ErrorAction SilentlyContinue)
+        if ($diagEvents) {
+            Write-Host ""
+            Log "  Recent service errors (last hour):" -Colour DarkYellow
+            foreach ($de in $diagEvents) {
+                $deTime = "{0:HH:mm}" -f $de.TimeCreated
+                $deMsg  = ($de.Message -split "`n")[0]
+                Log "    [$deTime] $deMsg" -Colour DarkGray
+            }
+        }
+    } catch {}
+
+    Write-Host ""
+    Log "Diagnostic complete -- no changes were made" -Colour Green
+    Save-Log
+
+    if (-not $Quiet) {
+        Write-Host ""
+        Write-Host "  Press any key to close..." -ForegroundColor DarkGray
+        try { [Win32Window]::Flash() } catch {}
+        [void][System.Console]::ReadKey($true)
+        try { [Win32Window]::StopFlash() } catch {}
+    }
+    if ($fixMutex) { try { $fixMutex.ReleaseMutex(); $fixMutex.Dispose() } catch {} }
+    exit 0
+}
 
 # ====================================================================
 # SAFETY GATE -- Block when called by automation while user is active
@@ -620,11 +824,35 @@ try {
                 if ($vmcRunning) {
                     Log "vmcompute service restarted successfully" -Colour Green -Indent
                 } else {
-                    Log "vmcompute not running after 15s -- also restarting vmms" -Colour DarkYellow -Indent
-                    Stop-Service vmms -Force -ErrorAction SilentlyContinue
-                    Start-Sleep -Seconds 3
-                    Start-Service vmms -ErrorAction SilentlyContinue
-                    Log "vmms service restarted" -Colour Green -Indent
+                    Log "vmcompute not running after 15s -- escalating" -Colour DarkYellow -Indent
+                    # Escalation 1: restart vmms (Virtual Machine Management)
+                    $vmmsOk = $false
+                    $vmmsSvc = Get-Service -Name "vmms" -ErrorAction SilentlyContinue
+                    if ($vmmsSvc) {
+                        Log "Restarting vmms (Virtual Machine Management)..." -Colour DarkYellow -Indent
+                        Stop-Service vmms -Force -ErrorAction SilentlyContinue
+                        Start-Sleep -Seconds 3
+                        Start-Service vmms -ErrorAction SilentlyContinue
+                        Log "vmms service restarted" -Colour Green -Indent
+                        # Re-check vmcompute (vmms restart often brings it back)
+                        Start-Sleep -Seconds 3
+                        $vmcSvc2 = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
+                        if ($vmcSvc2 -and $vmcSvc2.Status -eq "Running") { $vmmsOk = $true }
+                    } else {
+                        Log "vmms service not found -- skipping" -Colour DarkGray -Indent
+                    }
+                    # Escalation 2: restart HvHost -- ONLY in Deep mode (very disruptive)
+                    if (-not $vmmsOk -and $script:SelectedMode -eq "Deep") {
+                        $hvHostSvc = Get-Service -Name "HvHost" -ErrorAction SilentlyContinue
+                        if ($hvHostSvc) {
+                            Log "WARNING: Restarting HvHost affects ALL Hyper-V VMs" -Colour Red -Indent
+                            Log "Restarting HvHost (Host Compute Service Host)..." -Colour DarkYellow -Indent
+                            Restart-Service HvHost -Force -ErrorAction SilentlyContinue
+                            Log "HvHost service restarted" -Colour Green -Indent
+                        } else {
+                            Log "HvHost service not found -- skipping" -Colour DarkGray -Indent
+                        }
+                    }
                 }
             } catch {
                 Log "[!] vmcompute restart failed: $($_.Exception.Message)" -Colour Red -Indent
@@ -729,6 +957,53 @@ try {
     } catch {
         Log "Hyper-V VM check skipped: $($_.Exception.Message)" -Colour DarkGray -Indent
     }
+    # Method 3: Kill hung vmwp.exe (VM Worker Process)
+    try {
+        $vmwpProcs = @(Get-CimInstance Win32_Process -Filter "Name='vmwp.exe'" -ErrorAction SilentlyContinue)
+        if ($vmwpProcs.Count -gt 0) {
+            foreach ($vmwp in $vmwpProcs) {
+                $vmwpPid = $vmwp.ProcessId
+                $vmwpCmd = $vmwp.CommandLine
+                if (-not $vmwpCmd) {
+                    Log "vmwp.exe (PID $vmwpPid) has no command line -- skipping" -Colour DarkGray -Indent
+                    continue
+                }
+                # Extract GUID from command line
+                if ($vmwpCmd -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+                    $vmwpGuid = $Matches[1]
+                    # Only kill if related to Claude's VM (match claude/cowork in hcsdiag or if this is the only VM)
+                    if ($PSCmdlet.ShouldProcess("vmwp.exe PID $vmwpPid (GUID $vmwpGuid)", "Kill")) {
+                        $vmwpKilled = $false
+                        # Try hcsdiag kill first (cleaner)
+                        if ($script:IsAdmin -and (Test-Path "$env:SystemRoot\System32\hcsdiag.exe")) {
+                            try {
+                                & "$env:SystemRoot\System32\hcsdiag.exe" kill $vmwpGuid 2>&1 | Out-Null
+                                $vmwpKilled = $true
+                            } catch {}
+                        }
+                        # Fallback: force-kill the process
+                        if (-not $vmwpKilled) {
+                            try {
+                                Stop-Process -Id $vmwpPid -Force -ErrorAction Stop
+                                $vmwpKilled = $true
+                            } catch {
+                                Log "[!] vmwp.exe (PID $vmwpPid) is unkillable -- host restart may be needed" -Colour Red -Indent
+                            }
+                        }
+                        if ($vmwpKilled) {
+                            Log "WARNING: Force-killed vmwp.exe (PID $vmwpPid, GUID $vmwpGuid) -- VHDX corruption risk" -Colour DarkYellow -Indent
+                            $orphanKilled = $true
+                        }
+                    }
+                }
+            }
+        } else {
+            Log "No hung VM worker processes found" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "vmwp.exe check failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
+    }
+
     if (-not $orphanKilled) {
         Log "No orphan compute systems found" -Colour Green -Indent
     }
@@ -738,10 +1013,28 @@ try {
 Start-Sleep -Seconds 1
 
 # ====================================================================
-# STEP 6 -- Purge VM cache (skipped with -KeepCache)
+# STEP 6 -- Purge VM cache (skipped with -KeepCache or Quick mode)
 # ====================================================================
-if ($KeepCache) {
-    Log "[6/9] Keeping VM cache (-KeepCache)" -Colour DarkGray
+# Quick mode and Smart mode (before escalation) skip cache purge.
+# Deep mode and Smart-escalated do full purge with VHDX backup/restore.
+$skipCachePurge = $KeepCache -or ($script:SelectedMode -eq "Quick")
+
+# -- VHDX integrity check helper --
+function Test-VhdxHeader {
+    param([string]$Path)
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        $buf = New-Object byte[] 4
+        $fs.Seek(65536, 'Begin') | Out-Null
+        $read = $fs.Read($buf, 0, 4)
+        $fs.Close()
+        return ($read -eq 4 -and $buf[0] -eq 0x68 -and $buf[1] -eq 0x65 -and $buf[2] -eq 0x61 -and $buf[3] -eq 0x64)
+    } catch { return $false }
+}
+
+if ($skipCachePurge) {
+    $skipReason = if ($KeepCache) { "-KeepCache" } else { "$($script:SelectedMode) mode" }
+    Log "[6/9] Keeping VM cache ($skipReason)" -Colour DarkGray
     foreach ($item in @(
         @{ Path = $VmCachePath; Label = "claude-code-vm" },
         @{ Path = $BundlePath;  Label = "vm_bundles" }
@@ -754,12 +1047,64 @@ if ($KeepCache) {
         }
     }
 } else {
-    Log "[6/9] Purging VM cache..." -Colour Yellow
-    $cacheDirs = @(
+    Log "[6/9] Smart cache purge..." -Colour Yellow
+
+    # Phase 1: Backup sessiondata.vhdx and smol-bin.vhdx
+    $backupDir = Join-Path $LogDir "vhdx-backup"
+    if (-not (Test-Path $backupDir)) { New-Item $backupDir -ItemType Directory -Force | Out-Null }
+
+    $drive = (Get-Item $backupDir).PSDrive
+    $needed = 720MB  # 580 + 36 + margin
+    $free = (Get-PSDrive $drive.Name).Free
+    $spaceOk = $free -ge $needed
+
+    if (-not $spaceOk) {
+        Log "Insufficient disk space for VHDX backup ($([math]::Round($free/1MB,0)) MB free, need $([math]::Round($needed/1MB,0)) MB) -- doing full nuke" -Colour DarkYellow -Indent
+    }
+
+    $vhdxFiles = @('sessiondata.vhdx', 'smol-bin.vhdx')
+    $vhdxBackedUp = @{}
+    $cacheDirs = @($VmCachePath, $BundlePath)
+
+    if ($spaceOk) {
+        foreach ($vhdx in $vhdxFiles) {
+            # Find the file in BundlePath or VmCachePath
+            $src = $null
+            foreach ($cd in $cacheDirs) {
+                if (-not $cd -or -not (Test-Path $cd)) { continue }
+                $candidate = Get-ChildItem $cd -Recurse -Filter $vhdx -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($candidate) { $src = $candidate.FullName; break }
+            }
+            if ($src -and (Test-Path $src)) {
+                $tmp   = Join-Path $backupDir "$vhdx.tmp"
+                $final = Join-Path $backupDir $vhdx
+                try {
+                    if ($PSCmdlet.ShouldProcess($vhdx, "Backup")) {
+                        Copy-Item $src $tmp -Force -ErrorAction Stop
+                        # Validate VHDX header
+                        if (Test-VhdxHeader $tmp) {
+                            if (Test-Path $final) { Remove-Item $final -Force -ErrorAction SilentlyContinue }
+                            Rename-Item $tmp $vhdx -ErrorAction Stop
+                            $vhdxBackedUp[$vhdx] = $src  # remember original location
+                            Log "Backed up $vhdx ($([math]::Round((Get-Item $final).Length/1MB,1)) MB)" -Colour Green -Indent
+                        } else {
+                            Log "WARNING: $vhdx backup has invalid VHDX header -- skipping" -Colour DarkYellow -Indent
+                            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                } catch {
+                    Log "[!] Failed to backup $vhdx : $($_.Exception.Message)" -Colour Red -Indent
+                    if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        }
+    }
+
+    # Phase 2: Nuke -- delete bulk VM files, keep session data if backed up
+    foreach ($item in @(
         @{ Path = $VmCachePath; Label = "claude-code-vm" },
         @{ Path = $BundlePath;  Label = "vm_bundles" }
-    )
-    foreach ($item in $cacheDirs) {
+    )) {
         if (Test-Path $item.Path) {
             $size = (Get-ChildItem $item.Path -Recurse -ErrorAction SilentlyContinue |
                      Measure-Object -Property Length -Sum).Sum
@@ -772,7 +1117,67 @@ if ($KeepCache) {
             Log "$($item.Label) not present" -Colour DarkGray -Indent
         }
     }
+
+    # Phase 3: Restore backed-up VHDXs (after service restart in Step 7)
+    # Deferred -- see $vhdxBackedUp usage after Step 7 below.
+
+    # Phase 4: MSIX smol-bin fallback (if backup doesn't exist or is corrupt)
+    if (-not $vhdxBackedUp.ContainsKey('smol-bin.vhdx')) {
+        try {
+            $pkg = Get-AppxPackage | Where-Object { $_.Name -eq 'Claude' -or $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
+            if ($pkg) {
+                $msixSmolBin = Join-Path $pkg.InstallLocation 'resources\app\claudevm.bundle\smol-bin.vhdx'
+                if (Test-Path $msixSmolBin) {
+                    $final = Join-Path $backupDir 'smol-bin.vhdx'
+                    Copy-Item $msixSmolBin $final -Force -ErrorAction Stop
+                    $vhdxBackedUp['smol-bin.vhdx'] = $null  # no original location -- will use bundle path
+                    Log "Recovered smol-bin.vhdx from MSIX package" -Colour Green -Indent
+                }
+            }
+        } catch {
+            Log "MSIX smol-bin recovery skipped: $($_.Exception.Message)" -Colour DarkGray -Indent
+        }
+    }
 }
+
+# -- Temp file cleanup (Change 5) --
+try {
+    $tempPatterns = @("$env:TEMP\anthropic-*", "$env:TEMP\claude-*")
+    $tempCleaned = 0
+    $tempBytes = 0
+    foreach ($pattern in $tempPatterns) {
+        Get-ChildItem -Path $pattern -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $tempBytes += $_.Length
+            if ($PSCmdlet.ShouldProcess($_.FullName, "Remove temp file")) {
+                Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            $tempCleaned++
+        }
+    }
+    if ($tempCleaned -gt 0) {
+        $freed = if ($tempBytes -gt 1MB) { "{0:N1} MB" -f ($tempBytes/1MB) } else { "{0:N0} KB" -f ($tempBytes/1KB) }
+        Log "Cleaned $tempCleaned temp items ($freed freed)" -Colour DarkGray -Indent
+    }
+} catch {}
+
+# -- AnthropicClaude traditional-install path cleanup (Change 6) --
+try {
+    $tradPaths = @(
+        (Join-Path $env:LOCALAPPDATA 'AnthropicClaude\sessions'),
+        (Join-Path $env:LOCALAPPDATA 'AnthropicClaude\vm-state')
+    )
+    foreach ($tp in $tradPaths) {
+        if (Test-Path $tp) {
+            $count = (Get-ChildItem $tp -Recurse -ErrorAction SilentlyContinue).Count
+            if ($count -gt 0) {
+                if ($PSCmdlet.ShouldProcess($tp, "Clean traditional install path")) {
+                    Remove-Item "$tp\*" -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Log "Cleaned traditional install path: $tp ($count items)" -Colour DarkGray -Indent
+            }
+        }
+    }
+} catch {}
 
 # ====================================================================
 # STEP 7 -- Restart CoworkVMService (with extended polling)
@@ -790,6 +1195,66 @@ if ($PSCmdlet.ShouldProcess($ServiceName, "Start")) {
     } else {
         Log "Skipping manual service start (no admin)" -Colour DarkGray -Indent
         Log "Claude will restart the service automatically when it launches" -Colour DarkGray -Indent
+    }
+}
+
+# -- Phase 3: Restore backed-up VHDXs after service restart --
+if (-not $skipCachePurge -and $vhdxBackedUp -and $vhdxBackedUp.Count -gt 0) {
+    foreach ($vhdx in $vhdxBackedUp.Keys) {
+        $backup = Join-Path $backupDir $vhdx
+        # Determine restore target: original location or first existing cache dir
+        $target = $vhdxBackedUp[$vhdx]
+        if (-not $target) {
+            # smol-bin from MSIX -- pick the bundle path if it was recreated
+            foreach ($cd in @($BundlePath, $VmCachePath)) {
+                if (Test-Path $cd) { $target = Join-Path $cd $vhdx; break }
+            }
+        }
+        if ($target -and (Test-Path $backup) -and -not (Test-Path $target)) {
+            try {
+                # Ensure parent directory exists
+                $parentDir = Split-Path $target -Parent
+                if (-not (Test-Path $parentDir)) { New-Item $parentDir -ItemType Directory -Force | Out-Null }
+                Copy-Item $backup $target -Force -ErrorAction Stop
+                Log "Restored $vhdx from backup" -Colour Green -Indent
+            } catch {
+                Log "[!] Failed to restore $vhdx : $($_.Exception.Message) -- service will recreate" -Colour DarkYellow -Indent
+            }
+        }
+    }
+}
+
+# -- Smart mode escalation: if service didn't start, escalate to Deep --
+if ($script:SelectedMode -eq "Smart") {
+    $smartSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $smartSvc -or $smartSvc.Status -ne "Running") {
+        Log "Smart mode: service not running after quick fix -- escalating to Deep" -Colour Yellow
+        # Run the cache purge that was skipped
+        Log "[6/9] Escalated cache purge..." -Colour Yellow
+        foreach ($item in @(
+            @{ Path = $VmCachePath; Label = "claude-code-vm" },
+            @{ Path = $BundlePath;  Label = "vm_bundles" }
+        )) {
+            if (Test-Path $item.Path) {
+                $size = (Get-ChildItem $item.Path -Recurse -ErrorAction SilentlyContinue |
+                         Measure-Object -Property Length -Sum).Sum
+                $sizeMB = [math]::Round($size / 1MB, 1)
+                if ($PSCmdlet.ShouldProcess($item.Label, "Delete ($sizeMB MB)")) {
+                    Remove-Item $item.Path -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                Log "$($item.Label) removed ($sizeMB MB freed)" -Colour Green -Indent
+            }
+        }
+        # Retry service start
+        Log "Retrying service start after deep purge..." -Colour Yellow -Indent
+        if ($script:IsAdmin) {
+            $svcOk2 = Restart-CoworkService
+            if ($svcOk2) {
+                Log "Service running after escalation" -Colour Green -Indent
+            } else {
+                Log "[!] Service still failed after deep purge" -Colour Red -Indent
+            }
+        }
     }
 }
 

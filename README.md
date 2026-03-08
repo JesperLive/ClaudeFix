@@ -117,29 +117,47 @@ The underlying HCS error (`failed to create compute system: HcsWaitForOperationR
 
 One-click fix when Claude Desktop / Cowork is broken. No reboot needed.
 
+### Interactive Menu
+
+When run manually (without `-Quiet` or `-Mode`), the script shows an interactive menu:
+
+1. **Quick Fix** -- Restart services + basic repair (Steps 1-5, skip cache purge)
+2. **Deep Fix** -- Full nuclear reset (all steps including cache purge)
+3. **Smart Fix** -- Try quick first, escalate to deep if needed (default)
+4. **Diagnostic** -- Health check only, no changes
+
+After selecting a mode, a second menu lets you toggle options (Keep cache, Skip relaunch, WhatIf). A summary is shown before the final Y/N confirmation.
+
+The menu is skipped when:
+- `-Mode` is passed as a parameter (uses that mode directly)
+- `-Quiet` is set (defaults to Smart mode, for automated callers)
+- The host is non-interactive (defaults to Smart mode)
+
 ### What It Does
 
 | Step | Action |
 |------|--------|
 | 1 | Captures Claude.exe path, then force-kills all claude.exe processes |
 | 2 | Stops CoworkVMService (graceful with admin, force-kill without) |
-| 3 | Checks for HCS errors and restarts vmcompute service if needed (admin only) |
+| 3 | Checks for HCS errors and restarts vmcompute service if needed; escalates to vmms and HvHost (Deep mode only) |
 | 4 | Verifies no orphan processes remain |
-| 5 | Kills orphan HCS compute systems via hcsdiag and Hyper-V cmdlets |
-| 6 | Deletes stale VM cache (claude-code-vm and vm_bundles) to force a clean rebuild |
-| 7 | Restarts CoworkVMService (admin) or defers to Claude auto-restart (non-admin) |
+| 5 | Kills orphan HCS compute systems via hcsdiag, Hyper-V cmdlets, and hung vmwp.exe processes |
+| 6 | Smart cache purge: backs up session VHDXs, nukes VM cache, restores session data; cleans temp files and legacy paths |
+| 7 | Restarts CoworkVMService (admin) or defers to Claude auto-restart (non-admin); restores VHDX backups |
 | 8 | Relaunches Claude Desktop with elevated privileges via scheduled task (Method 0), falling back to MSIX shell protocol or direct exe launch |
 | 9 | Monitors cowork_vm_node.log for boot completion, confirms workspace is ready |
 
 **Step 8** first attempts to relaunch Claude with elevated privileges via the `LaunchClaudeAdmin` scheduled task created by Prevent (Method 0). This gives Claude a full admin token without a UAC prompt. If the task doesn't exist or fails, it falls through to three standard methods: Method A launches MSIX installs via `shell:AppsFolder` protocol (no duplicate taskbar icons), Method B launches traditional `.exe` installs directly, and Method C uses Start Menu shortcuts as a last resort. All methods respect `-WhatIf` and each has a `$launched` guard to prevent double-launch.
 
-**Step 5** terminates orphan HCS compute systems that survive service shutdown. When CoworkVMService stops, the underlying Hyper-V VM may remain registered in HCS, causing "VM is already running" errors on restart. The script first uses `hcsdiag list` to find any claude/cowork compute systems and `hcsdiag kill` to terminate them (admin only). As a fallback, it uses `Stop-VM -TurnOff -Force` via Hyper-V cmdlets. Both methods are tried because hcsdiag operates at the HCS layer (catching lightweight containers) while Stop-VM operates at the Hyper-V management layer (catching full VMs). This step is non-fatal -- failures don't block the rest of the fix.
+**Step 5** terminates orphan HCS compute systems that survive service shutdown. When CoworkVMService stops, the underlying Hyper-V VM may remain registered in HCS, causing "VM is already running" errors on restart. The script first uses `hcsdiag list` to find any claude/cowork compute systems and `hcsdiag kill` to terminate them (admin only). As a fallback, it uses `Stop-VM -TurnOff -Force` via Hyper-V cmdlets, then checks for hung `vmwp.exe` processes (VM worker) and kills them via hcsdiag or force-kill. Both methods are tried because hcsdiag operates at the HCS layer (catching lightweight containers) while Stop-VM operates at the Hyper-V management layer (catching full VMs). This step is non-fatal -- failures don't block the rest of the fix.
 
-**Step 3** checks recent Windows Event Log entries and Claude logs for HCS error patterns (`HCS operation failed`, `failed to create compute system`, `HcsWaitForOperationResult`). If detected and running as admin, it stops and restarts the `vmcompute` service. If `vmcompute` fails to restart within 15 seconds, it also restarts the `vmms` (Virtual Machine Management) service as a fallback. This step is wrapped in a try/catch so failures don't block the rest of the fix process. Without admin, HCS errors are logged but require manual elevation.
+**Step 3** checks recent Windows Event Log entries and Claude logs for HCS error patterns (`HCS operation failed`, `failed to create compute system`, `HcsWaitForOperationResult`). If detected and running as admin, it stops and restarts the `vmcompute` service. If `vmcompute` fails to restart within 15 seconds, it escalates: first restarting `vmms` (Virtual Machine Management), then in Deep mode only, restarting `HvHost` (which affects all Hyper-V VMs). This step is wrapped in a try/catch so failures don't block the rest of the fix process. Without admin, HCS errors are logged but require manual elevation.
 
 **Step 9** monitors the VM boot log for definitive completion markers (`"Startup complete"`, `"[Keepalive]"`), showing real-time progress through the boot stages. Falls back to Hyper-V heartbeat checks and directory monitoring if logs are unavailable. After completion, the PowerShell window is brought to the foreground and the taskbar icon flashes until you dismiss it.
 
-**Step 6 note:** Purging the VM cache (`vm_bundles`) forces Claude to re-download approximately 2-3 GB of VM resources on the next launch. This is necessary for a clean recovery but means the first Cowork session after a fix will take longer to start. If you're running the fix script frequently, be aware of this download cost.
+**Step 6 -- Smart Cache Purge:** Instead of blindly deleting everything, the script now backs up `sessiondata.vhdx` and `smol-bin.vhdx` before purging (with VHDX header integrity validation), then restores them after the service restart. If `smol-bin.vhdx` can't be backed up, it attempts recovery from the MSIX package. The step also cleans Claude temp files (`%TEMP%\anthropic-*`, `%TEMP%\claude-*`) and legacy `AnthropicClaude\sessions` and `vm-state` directories. Quick mode skips this step entirely.
+
+**Smart mode escalation:** If the service doesn't start after the quick fix (Steps 1-5), Smart mode automatically escalates to a deep cache purge and retries the service start.
 
 ### What It Does NOT Touch
 
@@ -151,8 +169,9 @@ One-click fix when Claude Desktop / Cowork is broken. No reboot needed.
 
 | Parameter | Description |
 |-----------|-------------|
+| `-Mode` | `Quick`, `Deep`, `Smart`, or `Diagnostic`. Skips the interactive menu. |
 | `-SkipLaunch` | Reset the VM but don't relaunch Claude |
-| `-Quiet` | Suppress the "press any key" prompt (for scheduled tasks) |
+| `-Quiet` / `-Silent` | Suppress the interactive menu and "press any key" prompt (for scheduled tasks). Defaults to Smart mode. |
 | `-KeepCache` | Skip the VM cache purge (avoids ~2-3 GB re-download). Use when running Fix frequently. If the fix fails with `-KeepCache`, run again without it. |
 | `-WhatIf` | Dry run -- show what would happen without changing anything |
 
@@ -188,11 +207,12 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 16 | Storage location | Checked | Warns if workspace is on cloud-sync, USB, or network drive |
 | 17 | Time synchronisation | Verified | Ensures NTP is running and clock drift is within tolerance |
 | 18 | Antivirus exclusions | Configured / advised | Prevents AV filter drivers from blocking VirtioFS disk ops |
-| 19 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
-| 20 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
-| 21 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
-| 22 | Claude elevation | Scheduled task + Desktop shortcut | Ensures Claude Desktop launches with full admin privileges. Desktop shortcut uses Claude's own icon and includes a process guard to prevent double-launch |
-| 23 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering -- complementary to Step 22 for tools that use COM or WMI elevation |
+| 19 | WSL2 conflict detection | Checked | Warns about WSL2 distros and Docker Desktop that may conflict with Claude's VM |
+| 20 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
+| 21 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
+| 22 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
+| 23 | Claude elevation | Scheduled task + Desktop shortcut | Ensures Claude Desktop launches with full admin privileges. Desktop shortcut uses Claude's own icon and includes a process guard to prevent double-launch |
+| 24 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering -- complementary to Step 23 for tools that use COM or WMI elevation |
 
 Battery settings are not changed -- laptop users keep normal battery behaviour.
 
@@ -267,9 +287,9 @@ Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`. Can also be star
 
 ### Claude Elevation and Admin Token Policy
 
-**Claude elevation** (step 22) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`. **Note:** MSIX installs will show a second Claude icon on the taskbar when launched elevated. This is unavoidable -- Windows enforces medium integrity for all shell-activated MSIX apps, so the only way to get a full admin token is to launch the `.exe` directly, which bypasses the MSIX app model's icon grouping. The scheduled task includes a process guard: if Claude is already running when the task is triggered (e.g., clicking the Desktop shortcut while Claude is open), it exits cleanly without launching a second instance. The Desktop shortcut uses Claude's actual icon (resolved at Prevent runtime via `Get-AppxPackage`); if the icon path becomes stale after a Claude update, it falls back to a generic Windows icon until Prevent is re-run.
+**Claude elevation** (step 23) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`. **Note:** MSIX installs will show a second Claude icon on the taskbar when launched elevated. This is unavoidable -- Windows enforces medium integrity for all shell-activated MSIX apps, so the only way to get a full admin token is to launch the `.exe` directly, which bypasses the MSIX app model's icon grouping. The scheduled task includes a process guard: if Claude is already running when the task is triggered (e.g., clicking the Desktop shortcut while Claude is open), it exits cleanly without launching a second instance. The Desktop shortcut uses Claude's actual icon (resolved at Prevent runtime via `Get-AppxPackage`); if the icon path becomes stale after a Claude update, it falls back to a generic Windows icon until Prevent is re-run.
 
-**Admin token policy** (step 23) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 22 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
+**Admin token policy** (step 24) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 23 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
 
 ### Fast Startup, Connected Standby, NIC Power Saving
 
@@ -360,11 +380,25 @@ README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
 
-Current versions: Fix 4.6.0, Watch 4.6.0, Prevent 4.6.0
+Current versions: Fix 4.7.0, Watch 4.7.0, Prevent 4.7.0
 
 ---
 
 ## Changelog
+
+### v4.7.0 — Interactive Menu + 7 New Features (2026-03-08)
+
+- **Interactive menu** -- Fix script now shows a mode selection menu when run manually (Quick, Deep, Smart, Diagnostic). Bypassed with `-Mode`, `-Quiet`, or non-interactive hosts. Falls back to simple numbered menu if `PromptForChoice` is unavailable
+- **`-Mode` parameter** -- `Quick`, `Deep`, `Smart`, or `Diagnostic`. Skips the menu and runs in the specified mode
+- **`-Silent` alias** -- `-Silent` is now an alias for `-Quiet` for backward compatibility
+- **Diagnostic mode** -- Health-check-only mode that reports service status, HCS health, process counts, and VM cache state without making any changes
+- **HvHost service restart fallback** -- Step 3 now escalates through vmcompute → vmms → HvHost when services fail to restart. HvHost restart is only attempted in Deep mode due to its impact on all Hyper-V VMs
+- **vmwp.exe kill** -- Step 5 now detects and kills hung VM worker processes (`vmwp.exe`) via hcsdiag or force-kill, with VHDX corruption warnings
+- **Smart cache purge with VHDX backup/restore** -- Step 6 backs up `sessiondata.vhdx` and `smol-bin.vhdx` (with VHDX header integrity validation) before purging, then restores them after service restart. Falls back to MSIX package recovery for `smol-bin.vhdx`
+- **Temp file cleanup** -- Removes `%TEMP%\anthropic-*` and `%TEMP%\claude-*` files during cache purge
+- **AnthropicClaude path cleanup** -- Cleans `AnthropicClaude\sessions` and `vm-state` directories from traditional installs
+- **Smart mode escalation** -- If the service doesn't start after Quick-mode steps, Smart mode automatically escalates to a deep cache purge and retries
+- **WSL2 conflict detection** (Prevent) -- New Step 19 checks for WSL feature, running WSL2 distros, and Docker Desktop. Warns about potential conflicts with Claude's Hyper-V VM
 
 ### v4.6.0 — Race Condition & Escalation Fixes (2026-03-08)
 
