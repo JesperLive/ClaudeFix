@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Claude Desktop / Cowork -- Reset & Fix
 
@@ -129,7 +129,7 @@ function Save-Log {
     catch { Write-Host "  [!] Could not write log file" -ForegroundColor DarkGray }
 }
 
-# Transcript backup (v4.8.0) — catches output even if Save-Log fails
+# Transcript backup (v4.8.0) -- catches output even if Save-Log fails
 $script:TranscriptFile = Join-Path $LogDir "fix_$($script:SessionTimestamp)_transcript.log"
 try { Start-Transcript -Path $script:TranscriptFile -Append -ErrorAction SilentlyContinue } catch {}
 
@@ -380,9 +380,9 @@ function Test-RecentHcsErrors {
         Returns: $null (clean), "json_corruption" (0xC037010D), "construct_failure"
         (0x800707DE), or "hcs_error" (other HCS issues).
     #>
-    # Check 1: HCS Compute event log — check ALL levels including Information
+    # Check 1: HCS Compute event log -- check ALL levels including Information
     try {
-        # Check for 0xC037010D (shutdown failures) — these are Information-level
+        # Check for 0xC037010D (shutdown failures) -- these are Information-level
         $hcsInfoFilter = @{
             LogName   = "Microsoft-Windows-Hyper-V-Compute-Operational"
             StartTime = (Get-Date).AddMinutes(-5)
@@ -459,7 +459,7 @@ function Close-StaleHcsVms {
     #>
     param(
         [string]$Action = "close",   # "close" or "kill"
-        [switch]$KeepOne             # Keep one instance (the active one) — only close extras
+        [switch]$KeepOne             # Keep one instance (the active one) -- only close extras
     )
     $closed = 0
     $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
@@ -878,16 +878,16 @@ if ($script:IsAdmin) {
         if (Test-Path $hcsdiagPath) {
             $hcsList = & $hcsdiagPath list 2>&1 | Out-String
             if ($hcsList -match "cowork-vm") {
-                Log "Found stale cowork-vm in HCS — cleaning up" -Colour DarkYellow -Indent
+                Log "Found stale cowork-vm in HCS -- cleaning up" -Colour DarkYellow -Indent
                 $cleaned = Close-StaleHcsVms -Action "close"
                 if ($cleaned -gt 0) {
                     Log "Closed $cleaned stale HCS compute system(s)" -Colour Green -Indent
                 }
             } else {
-                Log "HCS state clean — no stale cowork-vm found" -Colour Green -Indent
+                Log "HCS state clean -- no stale cowork-vm found" -Colour Green -Indent
             }
         } else {
-            Log "hcsdiag.exe not found — skipping HCS cleanup" -Colour DarkGray -Indent
+            Log "hcsdiag.exe not found -- skipping HCS cleanup" -Colour DarkGray -Indent
         }
     } catch {
         Log "HCS cleanup failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
@@ -996,7 +996,7 @@ try {
         }
     }
     if ($hcsDetected -eq "construct_failure") {
-        Log "HCS construct failure (0x800707DE) — stale state from failed shutdowns" -Colour DarkYellow -Indent
+        Log "HCS construct failure (0x800707DE) -- stale state from failed shutdowns" -Colour DarkYellow -Indent
     }
     if ($hcsDetected) {
         if ($script:IsAdmin) {
@@ -1442,7 +1442,7 @@ if ($script:SelectedMode -eq "Smart") {
     $smartSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $smartSvc -or $smartSvc.Status -ne "Running") {
         Log "Smart mode: service not running after quick fix -- escalating to Deep" -Colour Yellow
-        # Run the cache purge that was skipped — with VHDX backup
+        # Run the cache purge that was skipped -- with VHDX backup
         Log "[7/10] Escalated cache purge..." -Colour Yellow
         # Phase 0: HCS cleanup
         if ($script:IsAdmin) {
@@ -1799,7 +1799,7 @@ if ($SkipLaunch) {
 # If workspace didn't come up after the full fix, retry service restart
 if (-not $vmReady -and -not $SkipLaunch) {
     Log "" -Colour White
-    Log "Workspace not ready — attempting retry cycle ($MaxRetries max)..." -Colour Yellow
+    Log "Workspace not ready -- attempting retry cycle ($MaxRetries max)..." -Colour Yellow
     for ($retryNum = 1; $retryNum -le $MaxRetries; $retryNum++) {
         Log "Retry $retryNum/$MaxRetries -- quick service restart..." -Colour Yellow -Indent
         if ($script:IsAdmin) {
@@ -1829,12 +1829,12 @@ if (-not $vmReady -and -not $SkipLaunch) {
             if ($vmReady) { break }
             Log "Retry $retryNum failed" -Colour DarkYellow -Indent
         } else {
-            Log "Retry requires admin — skipping" -Colour DarkGray -Indent
+            Log "Retry requires admin -- skipping" -Colour DarkGray -Indent
             break
         }
     }
     if (-not $vmReady) {
-        Log "All $MaxRetries retries exhausted — manual intervention may be needed" -Colour Red
+        Log "All $MaxRetries retries exhausted -- manual intervention may be needed" -Colour Red
     }
 }
 

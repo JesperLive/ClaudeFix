@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Claude Desktop / Cowork -- Preventive Configuration
 
@@ -633,10 +633,10 @@ if ($Undo) {
                 Log "CoworkVMService failure recovery set (could not verify)" -Colour DarkGray -Indent
             }
         } else {
-            Log "CoworkVMService not installed — skipping" -Colour DarkGray -Indent
+            Log "CoworkVMService not installed -- skipping" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not configure CoworkVMService recovery — not critical" -Colour DarkGray -Indent
+        Log "Could not configure CoworkVMService recovery -- not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------

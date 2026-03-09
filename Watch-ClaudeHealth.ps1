@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Claude Desktop / Cowork -- Health Monitor
 
@@ -676,7 +676,7 @@ function Test-HcsStateHealth {
         $fiveMinAgo = (Get-Date).AddMinutes(-5)
         $recentSpike = @($allShutdownEvents | Where-Object { $_.TimeCreated -gt $fiveMinAgo })
         if ($recentSpike.Count -gt 5) {
-            Write-WatchLog "HCS SPIKE: $($recentSpike.Count) shutdown failures in 5 min — restarting vmcompute"
+            Write-WatchLog "HCS SPIKE: $($recentSpike.Count) shutdown failures in 5 min -- restarting vmcompute"
             try {
                 Restart-Service -Name "vmcompute" -Force -ErrorAction Stop
                 Start-Sleep -Seconds 3
@@ -687,7 +687,7 @@ function Test-HcsStateHealth {
         }
     } catch {}
 
-    # Check 3: Session file count (secondary metric — warn at 500, critical at 1000)
+    # Check 3: Session file count (secondary metric -- warn at 500, critical at 1000)
     try {
         $sessionDir = Join-Path $env:APPDATA "Claude\local-agent-mode-sessions"
         if (Test-Path $sessionDir) {
@@ -817,7 +817,7 @@ function Test-UserActivity {
                     foreach ($cp in $claudeProcs) {
                         if ($cp.Id -eq $fgPid) { return $true }
                     }
-                    # Electron renderer → main process: check parent PID
+                    # Electron renderer -> main process: check parent PID
                     try {
                         $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$fgPid" -ErrorAction SilentlyContinue).ParentProcessId
                         foreach ($cp in $claudeProcs) {
@@ -977,7 +977,7 @@ function Invoke-AutoFix {
         }
 
         # Cancel if any Claude process is burning CPU
-        # Extended sampling: 3 checks × 1s to catch bursty Code patterns
+        # Extended sampling: 3 checks x 1s to catch bursty Code patterns
         # (Code has near-zero CPU during API waits but spikes during processing)
         if (-not $cancelFix) {
             for ($sample = 1; $sample -le 3; $sample++) {
@@ -1155,7 +1155,7 @@ try {
                 $hcsStateIssue = Test-HcsStateHealth
                 if ($hcsStateIssue) {
                     Write-WatchLog "HCS STATE: $hcsStateIssue"
-                    # Don't auto-fix — this is informational + pre-emptive cleanup
+                    # Don't auto-fix -- this is informational + pre-emptive cleanup
                     # Try hcsdiag close for stale VMs proactively
                     try {
                         $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
