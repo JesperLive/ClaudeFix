@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.8.0
+    Version : 4.8.3
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -73,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.8.0"
+$Version          = "4.8.4"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -1153,10 +1153,10 @@ if ($Undo) {
                 Unregister-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
-            # Wrap in a delayed command: wait 180s after logon before running fix.
-            # This prevents racing with Claude Desktop's own auto-start at logon.
-            # The Fix script also has its own activity guard (-Quiet mode) as a second layer.
-            $delayedCmd = "Start-Sleep -Seconds 180; & '$fixScript' -SkipLaunch -Quiet"
+            # Wrap in a delayed command: wait 30s after logon before running BootPrep.
+            # Short delay gives vmcompute time to start, but runs before user opens Claude.
+            # BootPrep is non-destructive: only restarts vmcompute, does not kill Claude.
+            $delayedCmd = "Start-Sleep -Seconds 30; & '$fixScript' -BootPrep -Quiet"
             $bootAction = New-ScheduledTaskAction -Execute "PowerShell.exe" `
                               -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$delayedCmd`""
 
@@ -1181,12 +1181,12 @@ if ($Undo) {
                 -Trigger $bootTrigger `
                 -Settings $bootSettings `
                 -Principal $bootPrincipal `
-                -Description "Runs Fix-ClaudeDesktop at logon to ensure clean VM state after boot." `
+                -Description "Non-destructive vmcompute restart at logon to prevent construct failures." `
                 -Force | Out-Null
 
-            Log "Boot-fix task created (runs 180s after logon)" -Colour Green -Indent
+            Log "Boot-fix task created (runs 30s after logon, non-destructive)" -Colour Green -Indent
             Log "Task: Task Scheduler > $TaskPath$BootTaskName" -Colour DarkGray -Indent
-            Log "Runs: $fixScript -SkipLaunch -Quiet (after 180s delay)" -Colour DarkGray -Indent
+            Log "Runs: $fixScript -BootPrep -Quiet (after 30s delay)" -Colour DarkGray -Indent
         } catch {
             Log "[!] Could not create boot task: $($_.Exception.Message)" -Colour Red -Indent
         }

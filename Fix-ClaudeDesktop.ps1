@@ -38,7 +38,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.8.0
+    Version : 4.8.4
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -46,6 +46,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$SkipLaunch,
+    [switch]$BootPrep,
     [Alias("Silent")]
     [switch]$Quiet,
     [switch]$KeepCache,
@@ -65,6 +66,7 @@ if (-not $script:IsAdmin) {
     if ($Quiet)            { $elevateArgs += " -Quiet" }
     if ($WhatIfPreference) { $elevateArgs += " -WhatIf" }
     if ($KeepCache)        { $elevateArgs += " -KeepCache" }
+    if ($BootPrep)         { $elevateArgs += " -BootPrep" }
     if ($Mode)             { $elevateArgs += " -Mode $Mode" }
 
     Write-Host ""
@@ -87,7 +89,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.8.0"
+$Version         = "4.8.4"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -377,8 +379,8 @@ function Test-RecentHcsErrors {
     <#
     .SYNOPSIS
         Checks for recent HCS errors. Now checks Information-level events too (v4.8.0).
-        Returns: $null (clean), "json_corruption" (0xC037010D), "construct_failure"
-        (0x800707DE), or "hcs_error" (other HCS issues).
+        Returns: $null (clean), "shutdown_stale" (0xC037010D -- property query bug),
+        "construct_failure" (0x800707DE), or "hcs_error" (other HCS issues).
     #>
     # Check 1: HCS Compute event log -- check ALL levels including Information
     try {
@@ -405,9 +407,10 @@ function Test-RecentHcsErrors {
             return "construct_failure"
         }
 
-        # Shutdown failures indicate stale state building up
-        if ($shutdownFailures -gt 3) {
-            return "json_corruption"
+        # Shutdown failures from Claude Desktop property query bug (literal '$')
+        # These happen on EVERY VM shutdown -- only flag if excessive spike
+        if ($shutdownFailures -gt 8) {
+            return "shutdown_stale"
         }
 
         # Also check Critical/Error level (original check)
@@ -421,7 +424,7 @@ function Test-RecentHcsErrors {
             foreach ($evt in $hcsCritEvents) {
                 $xml = $evt.ToXml()
                 if ($xml -match "0xC037010D" -or $xml -match "Invalid JSON document") {
-                    return "json_corruption"
+                    return "shutdown_stale"
                 }
             }
             return "hcs_error"
@@ -661,8 +664,8 @@ if ($script:SelectedMode -eq "Diagnostic") {
 
     # HCS errors
     $diagHcs = Test-RecentHcsErrors
-    if ($diagHcs -eq "json_corruption") {
-        Log "  HCS health    : JSON corruption detected (0xC037010D)" -Colour Red
+    if ($diagHcs -eq "shutdown_stale") {
+        Log "  HCS health    : Shutdown stale (0xC037010D property query bug)" -Colour Yellow
     } elseif ($diagHcs -eq "construct_failure") {
         Log "  HCS health    : Construct failure detected (0x800707DE)" -Colour Red
     } elseif ($diagHcs -eq "hcs_error") {
@@ -805,6 +808,102 @@ if ($script:SelectedMode -eq "Diagnostic") {
 }
 
 # ====================================================================
+# BOOT PREP MODE -- Non-destructive vmcompute preparation (v4.8.4)
+# ====================================================================
+# When -BootPrep is set (called by boot task 30s after logon), do a
+# lightweight vmcompute restart to clear stale state from previous session.
+# This runs BEFORE the user opens Claude, preventing construct failures.
+# Does NOT kill Claude, stop services, or touch any files.
+if ($BootPrep) {
+    Log "=== ClaudeFix Boot Prep v$Version ===" -Colour Cyan
+    Log "[BootPrep] Non-destructive boot preparation (30s post-logon)" -Colour DarkGray
+    if (-not $script:IsAdmin) {
+        Log "[BootPrep] Not running as admin -- cannot restart vmcompute" -Colour Yellow
+        Save-Log
+        exit 1
+    }
+    # Wait for vmcompute to be running (may still be starting after boot)
+    $vmcWait = 0
+    $vmcReady = $false
+    while ($vmcWait -lt 30) {
+        $vmcSvc = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
+        if ($vmcSvc -and $vmcSvc.Status -eq "Running") { $vmcReady = $true; break }
+        if ($vmcWait -eq 0) {
+            Log "[BootPrep] Waiting for vmcompute service to start..." -Colour DarkGray
+        }
+        Start-Sleep -Seconds 3
+        $vmcWait += 3
+    }
+    if (-not $vmcReady) {
+        Log "[BootPrep] vmcompute not running after 30s -- cannot prepare" -Colour Yellow
+        Save-Log
+        exit 1
+    }
+    Log "[BootPrep] vmcompute is running" -Colour DarkGray
+    # Check if there is an active workspace (do not disrupt healthy sessions)
+    $activeWorkspace = $false
+    try {
+        $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+        if (Test-Path $hcsdiagPath) {
+            $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+            if ($hcsList -match "cowork-vm") {
+                # Distinguish stale VMs (from before reboot) from active ones
+                # If Claude is running and cowork-vm exists, it is likely active
+                $claudeRunning = @(Get-Process -Name "claude" -ErrorAction SilentlyContinue).Count -gt 0
+                if ($claudeRunning) {
+                    $activeWorkspace = $true
+                    Log "[BootPrep] Active workspace detected (Claude running + cowork-vm in HCS)" -Colour DarkGray
+                } else {
+                    # Stale VM from previous session -- clean it up
+                    Log "[BootPrep] Stale cowork-vm found in HCS -- cleaning" -Colour DarkYellow
+                    try {
+                        $cleaned = Close-StaleHcsVms -Action "close"
+                        if ($cleaned -gt 0) {
+                            Log "[BootPrep] Closed $cleaned stale HCS system(s)" -Colour Green -Indent
+                        }
+                    } catch {
+                        Log "[BootPrep] HCS cleanup failed: $($_.Exception.Message)" -Colour DarkGray
+                    }
+                }
+            }
+        }
+    } catch {
+        Log "[BootPrep] HCS check failed: $($_.Exception.Message)" -Colour DarkGray
+    }
+    if ($activeWorkspace) {
+        Log "[BootPrep] Skipping vmcompute restart (active workspace)" -Colour Green
+        Log "[BootPrep] Boot prep complete -- no action needed" -Colour Green
+        Save-Log
+        exit 0
+    }
+    # Proactive vmcompute restart to clear stale boot state
+    Log "[BootPrep] Restarting vmcompute to clear stale boot state..." -Colour DarkYellow
+    try {
+        Stop-Service vmcompute -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 3
+        Start-Service vmcompute -ErrorAction SilentlyContinue
+        $vmcElapsed = 0
+        $vmcRunning = $false
+        while ($vmcElapsed -lt 15) {
+            Start-Sleep -Seconds 3
+            $vmcElapsed += 3
+            $vmcSvc2 = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
+            if ($vmcSvc2 -and $vmcSvc2.Status -eq "Running") { $vmcRunning = $true; break }
+        }
+        if ($vmcRunning) {
+            Log "[BootPrep] vmcompute restarted successfully -- ready for Claude" -Colour Green
+        } else {
+            Log "[BootPrep] vmcompute not running after restart" -Colour Yellow
+        }
+    } catch {
+        Log "[BootPrep] vmcompute restart failed: $($_.Exception.Message)" -Colour Red
+    }
+    Log "[BootPrep] Boot prep complete" -Colour Green
+    Save-Log
+    exit 0
+}
+
+# ====================================================================
 # SAFETY GATE -- Block when called by automation while user is active
 # ====================================================================
 # When -Quiet is set (called by health monitor or boot task), check if
@@ -868,6 +967,8 @@ public static class FixActivityCheck {
     }
 }
 
+$vmReady = $false
+
 # ====================================================================
 # STEP 0 -- Pre-emptive HCS state cleanup (v4.8.0)
 # ====================================================================
@@ -896,6 +997,28 @@ if ($script:IsAdmin) {
     Log "Skipped (requires admin)" -Colour DarkGray -Indent
 }
 Start-Sleep -Seconds 1
+
+# Clean up old session files to prevent accumulation (>7 days)
+# These accumulate over days and Watch flags them as "critical" at 1000+
+$sessionDir = Join-Path $ClaudeAppData "local-agent-mode-sessions"
+if (Test-Path $sessionDir) {
+    try {
+        $cutoff = (Get-Date).AddDays(-7)
+        $oldFiles = @(Get-ChildItem $sessionDir -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff })
+        if ($oldFiles.Count -gt 0) {
+            $sizeMB = [math]::Round(($oldFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+            $oldFiles | Remove-Item -Force -ErrorAction SilentlyContinue
+            Log "Cleaned $($oldFiles.Count) session files older than 7 days ($sizeMB MB)" -Colour Green -Indent
+            # Remove empty directories
+            Get-ChildItem $sessionDir -Directory -ErrorAction SilentlyContinue |
+                Where-Object { @(Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue).Count -eq 0 } |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Log "Session cleanup failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
+    }
+}
 
 # ====================================================================
 # STEP 1 -- Kill all Claude processes
@@ -979,21 +1102,9 @@ Log "[3/10] Checking HCS service health..." -Colour Yellow
 
 try {
     $hcsDetected = Test-RecentHcsErrors
-    if ($hcsDetected -eq "json_corruption") {
-        Log "CRITICAL: HCS JSON corruption detected (0xC037010D)" -Colour Red -Indent
-        Log "This error is NOT recoverable by restarting vmcompute." -Colour Red -Indent
-        Log "Required fix: Hyper-V nuclear reset" -Colour Yellow -Indent
-        Log "  1. Open admin PowerShell" -Colour White -Indent
-        Log "  2. dism /online /disable-feature /featurename:Microsoft-Hyper-V-All" -Colour White -Indent
-        Log "  3. Reboot" -Colour White -Indent
-        Log "  4. dism /online /enable-feature /featurename:Microsoft-Hyper-V-All" -Colour White -Indent
-        Log "  5. Reboot" -Colour White -Indent
-        if (-not $Quiet) {
-            Log "" -Colour White
-            Log "The script will still attempt a vmcompute restart, but it is" -Colour DarkGray -Indent
-            Log "unlikely to resolve JSON corruption. If Cowork fails to start" -Colour DarkGray -Indent
-            Log "after this fix, perform the nuclear reset above." -Colour DarkGray -Indent
-        }
+    if ($hcsDetected -eq "shutdown_stale") {
+        Log "HCS shutdown failures (0xC037010D) -- stale state from property query bug" -Colour DarkYellow -Indent
+        Log "vmcompute restart will clear this (same recovery as construct failure)" -Colour DarkGray -Indent
     }
     if ($hcsDetected -eq "construct_failure") {
         Log "HCS construct failure (0x800707DE) -- stale state from failed shutdowns" -Colour DarkYellow -Indent
@@ -1055,6 +1166,33 @@ try {
         }
     } else {
         Log "No HCS issues detected" -Colour DarkGray -Indent
+    }
+
+    # Boot-fix mode: always restart vmcompute to clear stale state from sleep/reboot
+    # After sleep/wake, hcsdiag may show clean but vmcompute can hold stale VM registrations
+    # that cause "VM is already running" errors when Claude tries to start the workspace.
+    if ($SkipLaunch -and -not $hcsDetected -and $script:IsAdmin) {
+        Log "Boot-fix mode -- proactive vmcompute restart (clears stale post-sleep state)" -Colour DarkYellow -Indent
+        try {
+            Stop-Service vmcompute -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            Start-Service vmcompute -ErrorAction SilentlyContinue
+            $vmcElapsed = 0
+            $vmcRunning = $false
+            while ($vmcElapsed -lt 15) {
+                Start-Sleep -Seconds 3
+                $vmcElapsed += 3
+                $vmcSvc = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
+                if ($vmcSvc -and $vmcSvc.Status -eq "Running") { $vmcRunning = $true; break }
+            }
+            if ($vmcRunning) {
+                Log "vmcompute restarted (proactive boot cleanup)" -Colour Green -Indent
+            } else {
+                Log "vmcompute did not come back after proactive restart" -Colour DarkYellow -Indent
+            }
+        } catch {
+            Log "Proactive vmcompute restart failed: $($_.Exception.Message)" -Colour DarkYellow -Indent
+        }
     }
 } catch {
     Log "[!] HCS check failed: $($_.Exception.Message) -- continuing" -Colour DarkGray -Indent
@@ -1714,6 +1852,12 @@ if ($SkipLaunch) {
     $hvChecked = $false
     $hvAvailable = $false
 
+    # Skip Hyper-V cmdlet checks if vmcompute was just restarted (may hang on unstable service)
+    $skipHvChecks = [bool]$hcsDetected
+    if ($skipHvChecks) {
+        Log "Skipping Hyper-V VM checks (vmcompute was just restarted)" -Colour DarkGray -Indent
+    }
+
     while ($vmElapsed -lt $vmTimeout) {
         Start-Sleep -Seconds 5
         $vmElapsed += 5
@@ -1737,12 +1881,12 @@ if ($SkipLaunch) {
         # B. Check Hyper-V (once, to see if cmdlets work)
         if (-not $hvChecked) {
             $hvChecked = $true
-            $hvState = Test-HyperVReady
+            $hvState = if ($skipHvChecks) { $null } else { Test-HyperVReady }
             if ($null -ne $hvState) {
                 $hvAvailable = $true
                 Log "Hyper-V VM detected: $hvState" -Colour DarkGray -Indent
             }
-        } elseif ($hvAvailable -and $vmElapsed -ge 20) {
+        } elseif ($hvAvailable -and -not $skipHvChecks -and $vmElapsed -ge 20) {
             $hvState = Test-HyperVReady
             if ($hvState -eq "running+heartbeat") {
                 # Heartbeat OK -- give logs a few more seconds then accept

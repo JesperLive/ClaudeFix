@@ -1,6 +1,6 @@
 # Claude Desktop / Cowork VM Fix for Windows
 
-**Fix "VirtioFS mount failed" and "HCS operation failed" crashes in Claude Desktop on Windows -- without rebooting.**
+**Fix "VirtioFS mount failed", "HCS operation failed", and "Failed to start Claude's workspace" errors in Claude Desktop Cowork mode on Windows — without rebooting.**
 
 If you're seeing any of these errors in Claude Desktop's Cowork mode, this toolkit will fix and prevent them:
 
@@ -18,6 +18,18 @@ HCS operation failed: failed to create compute system
 ```
 ```
 VM is already running
+```
+```
+HCS operation failed: The operation failed because of a virtual disk system limitation (0x800707DE)
+```
+```
+Failed to start Claude's workspace
+```
+```
+VM service not running. The service failed to start.
+```
+```
+VM boot failed: VM is already running
 ```
 
 Two scripts: one **prevents** the crash, the other **fixes** it when it happens anyway.
@@ -110,6 +122,8 @@ The underlying HCS error (`failed to create compute system: HcsWaitForOperationR
 - [#29848](https://github.com/anthropics/claude-code/issues/29848) -- Recurring VM crashes
 - [#31520](https://github.com/anthropics/claude-code/issues/31520) -- Community recovery script for VirtioFS failures (ClaudeFix covers all steps and more)
 - [#31703](https://github.com/anthropics/claude-code/issues/31703) -- HCS/VM service failures on v1.1.5368 (still open as of March 2026)
+- [#29045](https://github.com/anthropics/claude-code/issues/29045) — Claude Desktop spawns Hyper-V VM on every launch, even for chat-only use
+- [#27801](https://github.com/anthropics/claude-code/issues/27801) — "Failed to start Claude's workspace" — VM service not running, persists after reboot
 
 ---
 
@@ -170,6 +184,7 @@ The menu is skipped when:
 | Parameter | Description |
 |-----------|-------------|
 | `-Mode` | `Quick`, `Deep`, `Smart`, or `Diagnostic`. Skips the interactive menu. |
+| `-BootPrep` | Non-destructive boot preparation mode. Unconditionally restarts `vmcompute` if no active Cowork workspace exists. Used by the logon boot-fix task. Does not kill Claude, stop services, or purge cache. |
 | `-SkipLaunch` | Reset the VM but don't relaunch Claude |
 | `-Quiet` / `-Silent` | Suppress the interactive menu and "press any key" prompt (for scheduled tasks). Defaults to Smart mode. |
 | `-KeepCache` | Skip the VM cache purge (avoids ~2-3 GB re-download). Use when running Fix frequently. If the fix fails with `-KeepCache`, run again without it. |
@@ -278,7 +293,7 @@ The entire toolkit is designed to **never interrupt active work** — whether yo
 - **Extended VM log window** -- activity check uses 120s window (was 30s). Code's "thinking" phases can leave the VM log quiet for minutes; the old 30s window caused false negatives
 - **User input window** -- 3 minutes (was 2). More buffer for reading/reviewing before auto-fix considers you idle
 - **Fix script activity guard** -- `Fix-ClaudeDesktop.ps1` itself now checks for active use when called with `-Quiet` (by the monitor or boot task). Three checks: CPU sampling, VM log, user input. Blocks and exits if anything is active. Manual runs (no `-Quiet`) always proceed
-- **Boot-fix 180s delay** -- the logon task waits 180 seconds before running, preventing a race condition where it would kill Claude Desktop as it was auto-starting at logon
+- **BootPrep mode** (v4.8.4) -- the logon task now uses non-destructive `-BootPrep` mode with a 30-second delay instead of the previous 180-second full fix. It unconditionally restarts `vmcompute` for a clean HCS state without killing Claude, stopping services, or purging cache. If Claude is already running with an active workspace, it exits silently
 - **Startup grace period** -- all heuristic checks (including log scanning, event log, heartbeat, staleness) are skipped for the first 180 seconds after the monitor starts, preventing false triggers from pre-existing events
 - **Consecutive-check gates** -- every heuristic trigger requires multiple consecutive failures before firing (service: 2, event log: 2, heartbeat: 3, staleness: 5). Only the log-file pattern check (actual VirtioFS error strings) triggers immediately
 - **Tightened event log matching** -- Hyper-V VMMS events must mention "claude" or "cowork" (no generic "failed"/"unexpected" matching). Worker events: Critical/Error only
@@ -314,7 +329,22 @@ These three settings are the most commonly overlooked causes of VirtioFS failure
 
 ### The Boot-Fix Task
 
-A scheduled task runs at every user logon as the current user (elevated). It waits **180 seconds** (to let Claude Desktop auto-start first), then executes `Fix-ClaudeDesktop.ps1 -SkipLaunch -Quiet` to ensure the VM service starts cleanly. The Fix script's own activity guard provides a second layer of protection — if Claude is already running and active after the 180s delay, the fix is blocked and exits silently.
+A scheduled task runs at every user logon as the current user (elevated). It waits **30 seconds** (to let Windows services initialise), then executes `Fix-ClaudeDesktop.ps1 -BootPrep -Quiet` for a non-destructive vmcompute preparation.
+
+**BootPrep mode** (added in v4.8.4) is a lightweight, non-destructive boot preparation mode that:
+
+1. Waits up to 30 seconds for `vmcompute` to be running
+2. Checks for an active Cowork workspace via `hcsdiag` — if Claude is already running with an active VM, it exits cleanly
+3. Cleans any stale VMs left from a previous session (only if Claude is not running)
+4. **Unconditionally restarts `vmcompute`** to ensure a fresh HCS state before Claude launches
+
+Unlike the previous approach (v4.8.0–v4.8.3 used `-SkipLaunch -Quiet` with a 180-second delay), BootPrep:
+- Runs in 30 seconds instead of 180, so the system is ready faster
+- Never kills Claude processes or stops CoworkVMService
+- Never purges cache or touches VM bundle files
+- Is safe to run even if Claude is already open (it detects and exits)
+
+This prevents the `0x800707DE` "failed to create compute system" HCS error that occurs when `vmcompute` has stale state after a reboot.
 
 The prevention script auto-detects `Fix-ClaudeDesktop.ps1` in the same folder. If it can't find it, this step is skipped with a warning.
 
@@ -378,6 +408,30 @@ The fix script auto-cleans logs older than 30 days. You can safely delete everyt
 
 ---
 
+## Known Limitations
+
+### Claude Desktop closes and reopens on first launch after reboot
+
+After a reboot, Claude Desktop may briefly close and reopen itself on the first launch. This is a **cosmetic behaviour caused by a race condition inside Claude Desktop** (not a ClaudeFix issue):
+
+1. Claude Desktop restores multiple windows on startup
+2. Each window independently tries to start the Cowork VM simultaneously
+3. The first call succeeds; the second gets `"VM is already running"`
+4. Claude's internal error handler triggers an auto-reinstall, causing the visible close-reopen
+5. The VM starts successfully on the second attempt (~8–10 seconds total)
+
+**This does not affect functionality.** No data is lost, no settings are changed, and the workspace starts correctly. ClaudeFix's BootPrep mode prevents the more serious `0x800707DE` construct failure — the close-reopen is a separate Claude Desktop bug that cannot be fixed externally.
+
+Relevant log pattern in `%APPDATA%\Claude\logs\cowork_vm_node.log`:
+```
+[VM:start] Beginning startup, VM instance ID: ...
+[VM:start] Beginning startup, VM instance ID: ...  (duplicate)
+[error] VM boot failed: VM is already running
+Auto-reinstalling workspace after startup failure
+```
+
+---
+
 ## File List
 
 ```
@@ -391,11 +445,19 @@ README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
 
-Current versions: Fix 4.8.0, Watch 4.8.0, Prevent 4.8.0
+Current versions: Fix 4.8.4, Watch 4.8.4, Prevent 4.8.4
 
 ---
 
 ## Changelog
+
+### v4.8.4 — Non-Destructive Boot Prep (2026-03-09)
+
+- **BootPrep mode** (Fix) — new `-BootPrep` parameter for lightweight, non-destructive boot preparation. Unconditionally restarts `vmcompute` when no active workspace exists, preventing `0x800707DE` construct failures without killing Claude or stopping services
+- **30-second boot task** (Prevent) — boot-fix scheduled task now uses `-BootPrep -Quiet` with a 30-second delay (was 180s with `-SkipLaunch -Quiet`), making the system ready for Claude 150 seconds faster
+- **Stale VM cleanup at boot** (Fix) — BootPrep cleans orphan HCS compute systems from previous sessions before restarting `vmcompute`
+- **Active workspace detection** (Fix) — BootPrep safely exits if Claude is already running with an active Cowork workspace, preventing interference with in-progress sessions
+- **Version bump** — all three scripts updated to v4.8.4; Watch-ClaudeHealth mutex updated to `v4.8.4`
 
 ### v4.8.0 -- HCS Hardening & Robustness (2026-03-09)
 
@@ -445,9 +507,10 @@ This toolkit was built by combining community knowledge from multiple independen
 - **Jonas Kamsker** ([blog.kamsker.at](https://blog.kamsker.at/blog/cowork-windows-broken/)) -- Comprehensive diagnostics, DNS/NAT fix scripts, and VM state recovery techniques
 - **Elliot Segler** ([elliotsegler.com](https://www.elliotsegler.com/fixing-claude-coworks-network-conflict-on-windows.html)) -- Network conflict resolution and HNS-based recovery for subnet collisions
 - **@garabedjunior-dotcom** ([GitHub #29848](https://github.com/anthropics/claude-code/issues/29848)) -- Community troubleshooting scripts and MCP crash diagnosis
+- **@Onimir89** ([GitHub: Restart_claude](https://github.com/Onimir89/Restart_claude)) — Independent VM restart script demonstrating the service-reset recovery pattern
 - Everyone who reported and documented VirtioFS failures in the [claude-code issue tracker](https://github.com/anthropics/claude-code/issues)
 
-Special thanks to the community contributors on GitHub issues #26554, #27576, #28890, #29587, and #29848 whose collective debugging narrowed down the root causes.
+Special thanks to the community contributors on GitHub issues #25206, #26554, #27576, #27801, #28890, #29045, #29587, #29848, and #31520 whose collective debugging narrowed down the root causes.
 
 ---
 
