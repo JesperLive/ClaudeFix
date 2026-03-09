@@ -445,11 +445,18 @@ README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
 
-Current versions: Fix 4.8.4, Watch 4.8.4, Prevent 4.8.4
+Current versions: Fix 4.8.5, Watch 4.8.5, Prevent 4.8.5
 
 ---
 
 ## Changelog
+
+### v4.8.5 — Power Plan Fix (2026-03-09)
+
+- **Fixed power plan activation** (Prevent) — `powercfg /duplicatescheme` returns a new GUID, but the code was trying to activate the template GUID which doesn't exist as an actual plan. Now parses the new GUID from the command output and activates that
+- **Power plan deduplication** (Prevent) — Step 1 now detects existing "Ultimate Performance" plans before creating a new one. If duplicates exist from previous runs, all but one are deleted
+- **Power plan cleanup on Undo** (Prevent) — `-Undo` now deletes all ClaudeFix-created Ultimate Performance plans in addition to restoring the original plan
+- **Activation verification** (Prevent) — Step 1 now logs the actual active plan name and GUID after activation to confirm success
 
 ### v4.8.4 — Non-Destructive Boot Prep (2026-03-09)
 

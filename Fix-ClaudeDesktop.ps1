@@ -38,7 +38,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.8.4
+    Version : 4.8.5
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -89,7 +89,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.8.4"
+$Version         = "4.8.5"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"

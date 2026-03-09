@@ -73,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.8.4"
+$Version          = "4.8.5"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -130,6 +130,18 @@ if ($Undo) {
             Remove-Item $BackupFile -Force -ErrorAction SilentlyContinue
         } else {
             Log "Backup file corrupt -- please set your power plan manually" -Colour Yellow -Indent
+        }
+        # Clean up any ClaudeFix-created Ultimate Performance plans
+        $planLines = powercfg /list | Where-Object { $_ -match 'Ultimate Performance' }
+        $deleteCount = 0
+        foreach ($line in $planLines) {
+            if ($line -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+                powercfg /delete $Matches[1] 2>$null
+                $deleteCount++
+            }
+        }
+        if ($deleteCount -gt 0) {
+            Log "Deleted $deleteCount Ultimate Performance plan(s)" -Colour DarkGray -Indent
         }
     } else {
         Log "No backup found -- power plan was not changed by this script" -Colour DarkGray -Indent
@@ -371,7 +383,7 @@ if ($Undo) {
     $steps = 26
 
     # ----------------------------------------------------------------
-    # 1. Power plan -- High Performance or Ultimate Performance
+    # 1. Power plan -- Ultimate Performance (with deduplication)
     # ----------------------------------------------------------------
     Step 1 $steps "Configuring power plan..."
 
@@ -382,25 +394,49 @@ if ($Undo) {
         Log "Backed up current plan: $currentPlan" -Colour DarkGray -Indent
     }
 
-    # Check for Ultimate Performance (may not exist)
     $ultimateGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
     $highPerfGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
 
-    $planList = powercfg /list
-    if ($planList -match $ultimateGuid) {
-        powercfg /setactive $ultimateGuid
+    # Find all existing "Ultimate Performance" plans
+    $planLines = powercfg /list | Where-Object { $_ -match 'Ultimate Performance' }
+    $ultimatePlans = @()
+    foreach ($line in $planLines) {
+        if ($line -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+            $ultimatePlans += $Matches[1]
+        }
+    }
+
+    if ($ultimatePlans.Count -gt 0) {
+        # Keep the first one, delete the rest
+        $keepGuid = $ultimatePlans[0]
+        if ($ultimatePlans.Count -gt 1) {
+            $deleteCount = 0
+            for ($i = 1; $i -lt $ultimatePlans.Count; $i++) {
+                powercfg /delete $ultimatePlans[$i] 2>$null
+                $deleteCount++
+            }
+            Log "Cleaned up $deleteCount duplicate Ultimate Performance plan(s)" -Colour DarkGray -Indent
+        }
+        powercfg /setactive $keepGuid
         Log "Set to: Ultimate Performance" -Colour Green -Indent
     } else {
-        # Try to add Ultimate Performance
+        # No Ultimate Performance plan exists -- create one
         $dupResult = powercfg /duplicatescheme $ultimateGuid 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            powercfg /setactive $ultimateGuid
-            Log "Set to: Ultimate Performance (added)" -Colour Green -Indent
+        if ($LASTEXITCODE -eq 0 -and $dupResult -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+            $newGuid = $Matches[1]
+            powercfg /setactive $newGuid
+            Log "Set to: Ultimate Performance (created)" -Colour Green -Indent
         } else {
+            # Ultimate Performance not available on this system -- fall back to High Performance
             powercfg /setactive $highPerfGuid
             Log "Set to: High Performance (Ultimate not available)" -Colour Green -Indent
         }
     }
+
+    # Verify activation
+    $verifyPlan = Get-ActivePlanGuid
+    $verifyName = (powercfg /getactivescheme) -replace '.*\(', '' -replace '\).*', ''
+    Log "Active plan verified: $verifyName ($verifyPlan)" -Colour DarkGray -Indent
 
     # ----------------------------------------------------------------
     # 2. Disable sleep on AC
