@@ -157,7 +157,7 @@ The menu is skipped when:
 
 **Step 6 -- Smart Cache Purge:** Instead of blindly deleting everything, the script now backs up `sessiondata.vhdx` and `smol-bin.vhdx` before purging (with VHDX header integrity validation), then restores them after the service restart. If `smol-bin.vhdx` can't be backed up, it attempts recovery from the MSIX package. The step also cleans Claude temp files (`%TEMP%\anthropic-*`, `%TEMP%\claude-*`) and legacy `AnthropicClaude\sessions` and `vm-state` directories. Quick mode skips this step entirely.
 
-**Smart mode escalation:** If the service doesn't start after the quick fix (Steps 1-5), Smart mode automatically escalates to a deep cache purge and retries the service start.
+**Smart mode escalation:** If the service doesn't start after the quick fix (Steps 1-5), Smart mode automatically escalates to a full deep purge with VHDX preservation: Phase 0 cleans stale HCS state, Phase 1 backs up session VHDXs, Phase 2 nukes the VM cache, the service is restarted, and Phase 3 restores the backed-up VHDXs. This ensures session data survives even when escalation is needed.
 
 ### What It Does NOT Touch
 
@@ -200,19 +200,21 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 9 | Processor minimum state | 100% (AC) | Prevents CPU throttling that can starve the VM |
 | 10 | Hyper-V VM memory | Pinned (no ballooning) | Prevents memory reclaim from invalidating VirtioFS shared regions |
 | 11 | VM worker priority | AboveNormal | Prevents host from deprioritizing vmwp.exe under load |
-| 12 | HCS service recovery | Auto-restart 30s/60s/120s | Configures `vmcompute` to auto-restart on failure with escalating delays |
-| 13 | Service startup timeout | 120000ms | Prevents boot race conditions where services start before dependencies are ready |
-| 14 | WinNAT rules | Verified / repaired | Ensures VM has outbound network connectivity |
-| 15 | Firewall policies | Checked | Detects Group Policy blocking Hyper-V network rules |
-| 16 | Storage location | Checked | Warns if workspace is on cloud-sync, USB, or network drive |
-| 17 | Time synchronisation | Verified | Ensures NTP is running and clock drift is within tolerance |
-| 18 | Antivirus exclusions | Configured / advised | Prevents AV filter drivers from blocking VirtioFS disk ops |
-| 19 | WSL2 conflict detection | Checked | Warns about WSL2 distros and Docker Desktop that may conflict with Claude's VM |
-| 20 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
-| 21 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
-| 22 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
-| 23 | Claude elevation | Scheduled task + Desktop shortcut | Ensures Claude Desktop launches with full admin privileges. Desktop shortcut uses Claude's own icon and includes a process guard to prevent double-launch |
-| 24 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering -- complementary to Step 23 for tools that use COM or WMI elevation |
+| 12 | HCS service recovery | Auto-restart 30s/60s/120s | Configures vmcompute to auto-restart on failure with escalating delays |
+| 13 | CoworkVMService recovery | Auto-restart 10s/30s/60s | Configures CoworkVMService to auto-restart on failure (independent of vmcompute) |
+| 14 | HCS state cleanup | Pre-emptive close | Closes stale cowork-vm entries in HCS before they accumulate and cause 0xC037010D errors |
+| 15 | Service startup timeout | 120000ms | Prevents boot race conditions where services start before dependencies are ready |
+| 16 | WinNAT rules | Verified / repaired | Ensures VM has outbound network connectivity |
+| 17 | Firewall policies | Checked | Detects Group Policy blocking Hyper-V network rules |
+| 18 | Storage location | Checked | Warns if workspace is on cloud-sync, USB, or network drive |
+| 19 | Time synchronisation | Verified | Ensures NTP is running and clock drift is within tolerance |
+| 20 | Antivirus exclusions | Configured / advised | Prevents AV filter drivers from blocking VirtioFS disk ops |
+| 21 | WSL2 conflict detection | Checked | Warns about WSL2 distros and Docker Desktop that may conflict with Claude's VM |
+| 22 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
+| 23 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
+| 24 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
+| 25 | Claude elevation | Scheduled task + Desktop shortcut | Ensures Claude Desktop launches with full admin privileges |
+| 26 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering |
 
 Battery settings are not changed -- laptop users keep normal battery behaviour.
 
@@ -226,25 +228,33 @@ Battery settings are not changed -- laptop users keep normal battery behaviour.
 
 **HCS service recovery** (step 12) -- The `vmcompute` service (Host Compute Service) manages all Hyper-V compute system operations. If it crashes, every VM creation call fails with `HCS operation failed`. The script configures Windows Service Control Manager to auto-restart `vmcompute` with escalating delays: 30 seconds after the first failure, 60 seconds after the second, 120 seconds after the third. The failure counter resets after 300 seconds of healthy operation. This is a permanent OS-level setting that survives reboots.
 
-**Service startup timeout** (step 13) -- The default `ServicesPipeTimeout` of 30 seconds can be too short on heavily loaded systems or during Windows Update reboots. If services like `vmcompute` don't start within this window, dependent services fail silently. Setting it to 120 seconds (120000ms) gives boot-time services more room. This is idempotent -- if the timeout is already >=120000ms (set by another tool), it's left untouched. Requires a reboot to take effect.
+### CoworkVMService Recovery
+
+**CoworkVMService recovery** (step 13) -- Independent of the `vmcompute` recovery in Step 12, the `CoworkVMService` itself can crash. The script configures Windows Service Control Manager to auto-restart it with escalating delays: 10 seconds, 30 seconds, 60 seconds. This ensures the Cowork VM restarts automatically without user intervention, even if `vmcompute` is healthy.
+
+### HCS State Cleanup
+
+**HCS state cleanup** (step 14) -- Over time, stale `cowork-vm` entries can accumulate in the Host Compute Service after unclean shutdowns. These orphan entries cause `0xC037010D` errors ("The virtual machine or container exited unexpectedly") when the service tries to create a new compute system. The prevention script proactively enumerates HCS entries via `hcsdiag list` and closes any stale cowork-vm instances. This is also performed by the health monitor on every cycle (Check 8) and by the fix script during cache purge.
+
+**Service startup timeout** (step 15) -- The default `ServicesPipeTimeout` of 30 seconds can be too short on heavily loaded systems or during Windows Update reboots. If services like `vmcompute` don't start within this window, dependent services fail silently. Setting it to 120 seconds (120000ms) gives boot-time services more room. This is idempotent -- if the timeout is already >=120000ms (set by another tool), it's left untouched. Requires a reboot to take effect.
 
 ### Network and NAT
 
-**WinNAT rules** (step 14) -- The Cowork VM needs a WinNAT rule to route traffic from its internal Hyper-V switch to the host's network. If this rule disappears (VPN reconnect, network adapter change, Windows Update), the VM silently loses all outbound connectivity. API calls fail, package downloads stall, and the workspace becomes unresponsive. The prevention script checks for existing NAT rules and auto-creates one if missing. The health monitor continuously monitors NAT health and repairs it automatically.
+**WinNAT rules** (step 16) -- The Cowork VM needs a WinNAT rule to route traffic from its internal Hyper-V switch to the host's network. If this rule disappears (VPN reconnect, network adapter change, Windows Update), the VM silently loses all outbound connectivity. API calls fail, package downloads stall, and the workspace becomes unresponsive. The prevention script checks for existing NAT rules and auto-creates one if missing. The health monitor continuously monitors NAT health and repairs it automatically.
 
-**Firewall policies** (step 15) -- Group Policy can set "Apply Local Firewall Rules" to disabled, which blocks the DHCP and DNS rules that Hyper-V's Host Network Service (HNS) creates for VMs. The script detects this and warns you to contact your IT admin. It also checks that Hyper-V-specific firewall rules are enabled.
+**Firewall policies** (step 17) -- Group Policy can set "Apply Local Firewall Rules" to disabled, which blocks the DHCP and DNS rules that Hyper-V's Host Network Service (HNS) creates for VMs. The script detects this and warns you to contact your IT admin. It also checks that Hyper-V-specific firewall rules are enabled.
 
 ### Storage, Time Sync, and Antivirus
 
-**Storage location** (step 16) -- VirtioFS mounts fail when Claude's data directory is on a cloud-sync folder (OneDrive, Google Drive, Dropbox), an external USB drive, or a network share. The script detects these conditions and warns you to move Claude's data to a local SSD.
+**Storage location** (step 18) -- VirtioFS mounts fail when Claude's data directory is on a cloud-sync folder (OneDrive, Google Drive, Dropbox), an external USB drive, or a network share. The script detects these conditions and warns you to move Claude's data to a local SSD.
 
-**Time synchronisation** (step 17) -- If the host clock drifts more than 5 seconds from NTP, Hyper-V's time synchronisation integration service can't correct the guest clock. This causes TLS certificate validation failures and API timeouts inside the VM. The script checks the W32Time service, measures actual drift, and forces a resync if needed. The health monitor continues to check every 5 minutes.
+**Time synchronisation** (step 19) -- If the host clock drifts more than 5 seconds from NTP, Hyper-V's time synchronisation integration service can't correct the guest clock. This causes TLS certificate validation failures and API timeouts inside the VM. The script checks the W32Time service, measures actual drift, and forces a resync if needed. The health monitor continues to check every 5 minutes.
 
-**Antivirus exclusions** (step 18) -- Antivirus filter drivers sit in the I/O path between VirtioFS and the host filesystem. They can delay or block disk operations that VirtioFS depends on, causing timeouts and mount failures. For Windows Defender, the script automatically adds exclusions for Claude's data directory, Hyper-V binaries, and the CoworkVMService process. For third-party AV products, it lists the recommended exclusion paths for you to add manually.
+**Antivirus exclusions** (step 20) -- Antivirus filter drivers sit in the I/O path between VirtioFS and the host filesystem. They can delay or block disk operations that VirtioFS depends on, causing timeouts and mount failures. For Windows Defender, the script automatically adds exclusions for Claude's data directory, Hyper-V binaries, and the CoworkVMService process. For third-party AV products, it lists the recommended exclusion paths for you to add manually.
 
 ### The Health Monitor
 
-A persistent background process that starts at logon and polls every 30 seconds. It monitors eight sources for VirtioFS failures:
+A persistent background process that starts at logon and polls every 30 seconds. It monitors nine sources for VirtioFS failures:
 
 1. **Claude log files** -- scans all `*.log` files in `%APPDATA%\Claude\logs\` for error patterns like "Plan9 mount failed" and "bad address"
 2. **Service status** -- detects when `CoworkVMService` stops while `claude.exe` is still running (2 consecutive checks)
@@ -254,6 +264,7 @@ A persistent background process that starts at logon and polls every 30 seconds.
 6. **VM log staleness** -- catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if VM was previously active)
 7. **Clock drift** -- checks NTP drift every 5 minutes and auto-resyncs if >5 seconds (warning only)
 8. **vmcompute health** -- monitors `vmcompute.exe` handle count every 60 seconds. Warning at 5000 handles, critical trigger at 10000 handles (2 consecutive checks required). Catches handle leaks that precede HCS failures
+9. **HCS state health** -- monitors for stale cowork-vm entries in HCS via hcsdiag and tracks 0xC037010D shutdown failure frequency in the Hyper-V Compute event log. Proactively closes stale VMs (keeping the active one) and auto-restarts vmcompute if >5 shutdown failures occur within 5 minutes
 
 ### Safety Features (v4.3)
 
@@ -287,9 +298,9 @@ Visible in Task Scheduler under `\Claude\ClaudeCoworkWatchdog`. Can also be star
 
 ### Claude Elevation and Admin Token Policy
 
-**Claude elevation** (step 23) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`. **Note:** MSIX installs will show a second Claude icon on the taskbar when launched elevated. This is unavoidable -- Windows enforces medium integrity for all shell-activated MSIX apps, so the only way to get a full admin token is to launch the `.exe` directly, which bypasses the MSIX app model's icon grouping. The scheduled task includes a process guard: if Claude is already running when the task is triggered (e.g., clicking the Desktop shortcut while Claude is open), it exits cleanly without launching a second instance. The Desktop shortcut uses Claude's actual icon (resolved at Prevent runtime via `Get-AppxPackage`); if the icon path becomes stale after a Claude update, it falls back to a generic Windows icon until Prevent is re-run.
+**Claude elevation** (step 25) -- Claude Desktop is installed as an MSIX (Microsoft Store) package. By default, it launches with a standard (non-elevated) user token, even if you're an administrator. This means its child processes (including MCP servers like Desktop Commander) also run without admin privileges and cannot perform system-level operations. MSIX apps block all direct `.exe` access from `WindowsApps` (ACLs, `Start-Process -Verb RunAs`, `dir` enumeration all fail), so the only reliable approach is a **scheduled task**. The script creates a `\Claude\LaunchClaudeAdmin` task with `RunLevel=Highest` + `LogonType=Interactive`, which gives the process a full unfiltered admin token with no UAC prompt, while keeping the GUI visible in the user's desktop session. The task's action finds Claude at runtime via three methods: (1) `Get-AppxPackage` for MSIX installs, (2) common install paths for traditional `.exe` installs, (3) running-process detection as a final fallback. This survives version updates and works with any install type. A "Claude (Admin)" desktop shortcut triggers this task via `schtasks /run`. **Note:** MSIX installs will show a second Claude icon on the taskbar when launched elevated. This is unavoidable -- Windows enforces medium integrity for all shell-activated MSIX apps, so the only way to get a full admin token is to launch the `.exe` directly, which bypasses the MSIX app model's icon grouping. The scheduled task includes a process guard: if Claude is already running when the task is triggered (e.g., clicking the Desktop shortcut while Claude is open), it exits cleanly without launching a second instance. The Desktop shortcut uses Claude's actual icon (resolved at Prevent runtime via `Get-AppxPackage`); if the icon path becomes stale after a Claude update, it falls back to a generic Windows icon until Prevent is re-run.
 
-**Admin token policy** (step 24) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 23 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
+**Admin token policy** (step 26) -- Windows filters admin tokens for local accounts during remote/network logins via `LocalAccountTokenFilterPolicy`. Setting it to `1` (along with `FilterAdministratorToken=0`) allows tools that use COM elevation, WMI, or remote PowerShell to receive full admin tokens. This is complementary to Step 25 -- the scheduled task handles the main elevation for Claude Desktop itself, while the token policy helps any tools that use COM-based or network-based elevation. UAC stays enabled and Store apps continue to work. Requires a reboot.
 
 ### Fast Startup, Connected Standby, NIC Power Saving
 
@@ -380,11 +391,26 @@ README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
 
-Current versions: Fix 4.7.0, Watch 4.7.0, Prevent 4.7.0
+Current versions: Fix 4.8.0, Watch 4.8.0, Prevent 4.8.0
 
 ---
 
 ## Changelog
+
+### v4.8.0 -- HCS Hardening & Robustness (2026-03-09)
+
+- **CoworkVMService auto-recovery** (Prevent Step 13) -- configures `CoworkVMService` to auto-restart on failure with escalating delays (10s/30s/60s), independent of vmcompute recovery
+- **Pre-emptive HCS state cleanup** (Prevent Step 14) -- closes stale cowork-vm entries in HCS during prevention setup and on every health monitor cycle
+- **HCS state health monitor** (Watch Check 8) -- new check that detects stale cowork-vm entries, tracks 0xC037010D shutdown failure frequency, auto-restarts vmcompute on spikes (>5 in 5 min), and monitors session file accumulation
+- **Close-StaleHcsVms helper** (Fix) -- unified function for consistent GUID parsing and HCS cleanup across all code paths (Step 0, Phase 0, Smart escalation, retry loop)
+- **Test-HyperVReady heartbeat support** (Fix) -- VM readiness check now queries Hyper-V Integration Services heartbeat, enabling the wait loop to detect full VM boot (not just HCS registration)
+- **Smart escalation VHDX preservation** (Fix) -- escalation from Quick to Deep now includes Phase 0 (HCS cleanup), Phase 1 (VHDX backup), Phase 2 (nuke), and Phase 3 (VHDX restore), preserving session data through the escalation
+- **FileStream leak protection** (Fix + Watch) -- all FileStream usage in Test-VmLogReady and Test-LogsForErrors wrapped in try/finally to prevent handle leaks on exceptions
+- **Event log deduplication** (Watch) -- Test-HcsStateHealth now fetches shutdown events once and filters in-memory for spike detection, eliminating redundant Get-WinEvent calls
+- **Consistent log timestamps** (Fix) -- shared `$script:SessionTimestamp` ensures log file and transcript file use identical timestamps
+- **Explicit auto-fix mode** (Watch) -- Invoke-AutoFix now passes `-Mode Smart -Quiet` explicitly instead of relying on defaults
+- **Prevent step count fix** -- corrected `$steps = 27` to `$steps = 26` (was off-by-one)
+- **Watch Check 8 safety** -- stale VM cleanup now skips the last (most likely active) cowork-vm entry, preventing accidental termination of the running VM
 
 ### v4.7.0 — Interactive Menu + 7 New Features (2026-03-08)
 

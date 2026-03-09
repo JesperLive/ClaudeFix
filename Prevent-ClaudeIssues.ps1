@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.7.0
+    Version : 4.8.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -73,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.7.0"
+$Version          = "4.8.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -215,6 +215,10 @@ if ($Undo) {
         # Reset vmcompute failure actions to Windows default
         & sc.exe failure vmcompute actions= "" reset= 0 2>&1 | Out-Null
         Log "vmcompute failure recovery: Reset to defaults" -Colour Green -Indent
+
+        # Reset CoworkVMService failure actions (v4.8.0)
+        & sc.exe failure CoworkVMService actions= "" reset= 0 2>&1 | Out-Null
+        Log "CoworkVMService failure recovery: Reset to defaults" -Colour Green -Indent
 
         # Remove ServicesPipeTimeout only if we set it (value is exactly 120000)
         try {
@@ -364,7 +368,7 @@ if ($Undo) {
     # ================================================================
     # SETUP MODE
     # ================================================================
-    $steps = 24
+    $steps = 26
 
     # ----------------------------------------------------------------
     # 1. Power plan -- High Performance or Ultimate Performance
@@ -615,9 +619,58 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 13. Set service startup timeout (ServicesPipeTimeout)
+    # 13. Configure CoworkVMService recovery (v4.8.0)
     # ----------------------------------------------------------------
-    Step 13 $steps "Setting service startup timeout..."
+    Step 13 $steps "Configuring CoworkVMService recovery..."
+    try {
+        $svc = Get-Service -Name "CoworkVMService" -ErrorAction SilentlyContinue
+        if ($svc) {
+            & sc.exe failure CoworkVMService reset= 300 actions= restart/30000/restart/60000/restart/120000 2>&1 | Out-Null
+            $verifyResult = & sc.exe qfailure CoworkVMService 2>&1
+            if ($verifyResult -match "RESTART") {
+                Log "CoworkVMService failure recovery: restart after 30s/60s/120s (reset 300s)" -Colour Green -Indent
+            } else {
+                Log "CoworkVMService failure recovery set (could not verify)" -Colour DarkGray -Indent
+            }
+        } else {
+            Log "CoworkVMService not installed — skipping" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not configure CoworkVMService recovery — not critical" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 14. Pre-emptive HCS state cleanup (v4.8.0)
+    # ----------------------------------------------------------------
+    Step 14 $steps "Pre-emptive HCS state cleanup..."
+    if (Test-Path "$env:SystemRoot\System32\hcsdiag.exe") {
+        try {
+            $hcsList = & "$env:SystemRoot\System32\hcsdiag.exe" list 2>&1 | Out-String
+            if ($hcsList -match "cowork-vm") {
+                $lines = $hcsList -split "`n"
+                $currentGuid = $null
+                foreach ($line in $lines) {
+                    if ($line -match "^([0-9a-f-]{36})") { $currentGuid = $Matches[1] }
+                    if ($line -match "cowork-vm" -and $currentGuid) {
+                        & "$env:SystemRoot\System32\hcsdiag.exe" close $currentGuid 2>&1 | Out-Null
+                        Log "Closed stale HCS compute system: $currentGuid" -Colour Green -Indent
+                        $currentGuid = $null
+                    }
+                }
+            } else {
+                Log "HCS state clean" -Colour Green -Indent
+            }
+        } catch {
+            Log "HCS cleanup check failed: $($_.Exception.Message)" -Colour DarkGray -Indent
+        }
+    } else {
+        Log "hcsdiag.exe not available" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 15. Set service startup timeout (ServicesPipeTimeout)
+    # ----------------------------------------------------------------
+    Step 15 $steps "Setting service startup timeout..."
     try {
         $current = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -ErrorAction SilentlyContinue).ServicesPipeTimeout
         if ($null -eq $current -or $current -lt 120000) {
@@ -632,9 +685,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 14. Verify and repair WinNAT rules
+    # 16. Verify and repair WinNAT rules
     # ----------------------------------------------------------------
-    Step 14 $steps "Checking WinNAT rules for VM network..."
+    Step 16 $steps "Checking WinNAT rules for VM network..."
     try {
         $natRules = @(Get-NetNat -ErrorAction SilentlyContinue)
         if ($natRules.Count -gt 0) {
@@ -676,9 +729,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 15. Windows Firewall policy verification
+    # 17. Windows Firewall policy verification
     # ----------------------------------------------------------------
-    Step 15 $steps "Checking Windows Firewall policies..."
+    Step 17 $steps "Checking Windows Firewall policies..."
     try {
         # Check if local firewall rules are being applied (Group Policy can block them)
         $fwProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
@@ -719,9 +772,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 16. Storage location detection
+    # 18. Storage location detection
     # ----------------------------------------------------------------
-    Step 16 $steps "Checking workspace storage location..."
+    Step 18 $steps "Checking workspace storage location..."
     $claudeAppData = Join-Path $env:APPDATA "Claude"
     $vmCachePath = Join-Path $claudeAppData "claude-code-vm"
     $storageWarnings = @()
@@ -776,9 +829,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 17. NTP / time synchronisation check
+    # 19. NTP / time synchronisation check
     # ----------------------------------------------------------------
-    Step 17 $steps "Checking time synchronisation..."
+    Step 19 $steps "Checking time synchronisation..."
     try {
         $w32svc = Get-Service -Name "W32Time" -ErrorAction SilentlyContinue
         if ($w32svc) {
@@ -822,9 +875,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 18. Antivirus exclusion guidance
+    # 20. Antivirus exclusion guidance
     # ----------------------------------------------------------------
-    Step 18 $steps "Checking antivirus configuration..."
+    Step 20 $steps "Checking antivirus configuration..."
     $avProducts = @()
     try {
         # Query Windows Security Center (WMI)
@@ -900,6 +953,24 @@ if ($Undo) {
                         Add-MpPreference -ExclusionProcess "cowork-svc.exe" -ErrorAction SilentlyContinue
                         Log "  + Process exclusions: vmwp.exe, vmms.exe, vmcompute.exe, cowork-svc.exe" -Colour Green -Indent
                     } catch {}
+                    # Verify process exclusions were applied (v4.8.0)
+                    try {
+                        $procExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
+                        $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "cowork-svc.exe")
+                        $missingProcs = @()
+                        foreach ($rp in $requiredProcs) {
+                            if (-not ($procExclusions -contains $rp)) { $missingProcs += $rp }
+                        }
+                        if ($missingProcs.Count -gt 0) {
+                            Log "  ! Missing process exclusions: $($missingProcs -join ', ')" -Colour Yellow -Indent
+                            foreach ($mp in $missingProcs) {
+                                Add-MpPreference -ExclusionProcess $mp -ErrorAction SilentlyContinue
+                            }
+                            Log "  Retried adding missing exclusions" -Colour DarkGray -Indent
+                        } else {
+                            Log "  All process exclusions verified" -Colour Green -Indent
+                        }
+                    } catch {}
                 } else {
                     Log "Defender exclusions already configured" -Colour Green -Indent
                 }
@@ -922,9 +993,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 19. WSL2 / Hyper-V conflict detection
+    # 21. WSL2 / Hyper-V conflict detection
     # ----------------------------------------------------------------
-    Step 19 $steps "Checking for WSL2 / Hyper-V conflicts..."
+    Step 21 $steps "Checking for WSL2 / Hyper-V conflicts..."
 
     $wsl2Warnings = @()
 
@@ -966,9 +1037,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 20. Install health monitor (auto-detects and auto-fixes crashes)
+    # 22. Install health monitor (auto-detects and auto-fixes crashes)
     # ----------------------------------------------------------------
-    Step 20 $steps "Installing health monitor..."
+    Step 22 $steps "Installing health monitor..."
 
     # Find Watch-ClaudeHealth.ps1 in the same folder as this script
     $myDir = Split-Path $PSCommandPath -Parent
@@ -1056,9 +1127,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 21. Create boot-fix scheduled task
+    # 23. Create boot-fix scheduled task
     # ----------------------------------------------------------------
-    Step 21 $steps "Creating boot-time fix task..."
+    Step 23 $steps "Creating boot-time fix task..."
 
     $fixScript = $null
     if ($myDir) {
@@ -1125,9 +1196,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 22. Create shortcuts (Desktop + Start Menu)
+    # 24. Create shortcuts (Desktop + Start Menu)
     # ----------------------------------------------------------------
-    Step 22 $steps "Creating Fix Claude Desktop shortcuts..."
+    Step 24 $steps "Creating Fix Claude Desktop shortcuts..."
 
     $fixBat = $null
     if ($myDir) {
@@ -1178,9 +1249,9 @@ if ($Undo) {
     }
 
     # ----------------------------------------------------------------
-    # 23. Set Claude Desktop to launch elevated (MSIX-aware)
+    # 25. Set Claude Desktop to launch elevated (MSIX-aware)
     # ----------------------------------------------------------------
-    Step 23 $steps "Configuring Claude Desktop to launch elevated..."
+    Step 25 $steps "Configuring Claude Desktop to launch elevated..."
     try {
         # Scheduled task registration requires admin -- skip gracefully if not elevated
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -1330,9 +1401,9 @@ if errorlevel 1 (
     }
 
     # ----------------------------------------------------------------
-    # 24. Admin token filtering (LocalAccountTokenFilterPolicy)
+    # 26. Admin token filtering (LocalAccountTokenFilterPolicy)
     # ----------------------------------------------------------------
-    Step 24 $steps "Configuring admin token policy..."
+    Step 26 $steps "Configuring admin token policy..."
     try {
         $policyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
         $current = Get-ItemProperty -Path $policyPath -ErrorAction Stop
@@ -1388,6 +1459,8 @@ if errorlevel 1 (
     Write-Host "    VM memory ............ Pinned (no ballooning)" -ForegroundColor White
     Write-Host "    VM worker priority ... AboveNormal" -ForegroundColor White
     Write-Host "    HCS service recovery . Auto-restart on failure" -ForegroundColor White
+    Write-Host "    VM service recovery .. Auto-restart on failure" -ForegroundColor White
+    Write-Host "    HCS state cleanup .... Pre-emptive stale VM removal" -ForegroundColor White
     Write-Host "    Service timeout ...... 120s (boot race prevention)" -ForegroundColor White
     Write-Host "    WinNAT rules ......... Verified/repaired" -ForegroundColor White
     Write-Host "    Firewall policies .... Checked" -ForegroundColor White

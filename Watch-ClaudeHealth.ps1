@@ -45,7 +45,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 4.7.0
+    Version : 4.8.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -60,7 +60,7 @@ param(
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "4.7.0"
+$Version        = "4.8.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
 $ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
@@ -232,16 +232,21 @@ function Test-LogsForErrors {
 
         # Read only new content
         try {
-            $stream = [System.IO.FileStream]::new(
-                $path,
-                [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read,
-                [System.IO.FileShare]::ReadWrite)
-            $stream.Position = $baseline
-            $reader = [System.IO.StreamReader]::new($stream)
-            $newContent = $reader.ReadToEnd()
-            $reader.Close()
-            $stream.Close()
+            $stream = $null
+            $reader = $null
+            try {
+                $stream = [System.IO.FileStream]::new(
+                    $path,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::ReadWrite)
+                $stream.Position = $baseline
+                $reader = [System.IO.StreamReader]::new($stream)
+                $newContent = $reader.ReadToEnd()
+            } finally {
+                if ($reader) { try { $reader.Close() } catch {} }
+                if ($stream) { try { $stream.Close() } catch {} }
+            }
 
             foreach ($pattern in $ErrorPatterns) {
                 if ($newContent -match [regex]::Escape($pattern)) {
@@ -627,6 +632,80 @@ function Test-VmcomputeHealth {
     return $null
 }
 
+function Test-HcsStateHealth {
+    <#
+    .SYNOPSIS
+        Monitors HCS state for stale cowork-vm and 0xC037010D shutdown failure frequency.
+        Returns $null if healthy, or a trigger string if intervention needed.
+        Also tracks session file count as secondary metric.
+    #>
+    # Skip during startup grace period
+    if (Test-StartupGracePeriod) { return $null }
+
+    $issues = @()
+
+    # Check 1: Stale cowork-vm in hcsdiag (should not exist while service is healthy)
+    try {
+        $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+        if (Test-Path $hcsdiagPath) {
+            $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+            # Count cowork-vm entries
+            $vmCount = ([regex]::Matches($hcsList, "cowork-vm")).Count
+            if ($vmCount -gt 1) {
+                $issues += "Multiple cowork-vm instances in HCS ($vmCount found)"
+            }
+        }
+    } catch {}
+
+    # Check 2: 0xC037010D shutdown failure frequency
+    try {
+        $shutdownFilter = @{
+            LogName   = "Microsoft-Windows-Hyper-V-Compute-Operational"
+            StartTime = (Get-Date).AddHours(-1)
+        }
+        $allShutdownEvents = @(Get-WinEvent -FilterHashtable $shutdownFilter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match "0xC037010D" })
+        $shutdownCount = $allShutdownEvents.Count
+        if ($shutdownCount -gt 0) {
+            Write-WatchLog "HCS: $shutdownCount shutdown failures (0xC037010D) in last hour"
+        }
+        if ($shutdownCount -gt 10) {
+            $issues += "HCS shutdown failure spike: $shutdownCount events in last hour"
+        }
+        # Spike detection: >5 in last 5 minutes triggers vmcompute restart
+        $fiveMinAgo = (Get-Date).AddMinutes(-5)
+        $recentSpike = @($allShutdownEvents | Where-Object { $_.TimeCreated -gt $fiveMinAgo })
+        if ($recentSpike.Count -gt 5) {
+            Write-WatchLog "HCS SPIKE: $($recentSpike.Count) shutdown failures in 5 min — restarting vmcompute"
+            try {
+                Restart-Service -Name "vmcompute" -Force -ErrorAction Stop
+                Start-Sleep -Seconds 3
+                Write-WatchLog "vmcompute restarted (pre-emptive, cleared stale HCS state)"
+            } catch {
+                Write-WatchLog "vmcompute restart failed: $($_.Exception.Message)"
+            }
+        }
+    } catch {}
+
+    # Check 3: Session file count (secondary metric — warn at 500, critical at 1000)
+    try {
+        $sessionDir = Join-Path $env:APPDATA "Claude\local-agent-mode-sessions"
+        if (Test-Path $sessionDir) {
+            $fileCount = (Get-ChildItem $sessionDir -Recurse -File -ErrorAction SilentlyContinue).Count
+            if ($fileCount -gt 1000) {
+                $issues += "Session file accumulation critical: $fileCount files"
+            } elseif ($fileCount -gt 500) {
+                Write-WatchLog "Session file count elevated: $fileCount files"
+            }
+        }
+    } catch {}
+
+    if ($issues.Count -gt 0) {
+        return ($issues -join "; ")
+    }
+    return $null
+}
+
 # -- VM maintenance functions ---------------------------------------------
 
 function Set-VmWorkerPriority {
@@ -962,7 +1041,7 @@ function Invoke-AutoFix {
     $script:LastFixTime = $now
 
     try {
-        & $fixScript -Quiet
+        & $fixScript -Mode Smart -Quiet
         Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) COMPLETE"
     } catch {
         Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) FAILED: $($_.Exception.Message)"
@@ -988,7 +1067,7 @@ function Invoke-AutoFix {
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v4.7"
+$mutexName = "Global\ClaudeHealthMonitor_v4.8"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)
@@ -1010,7 +1089,7 @@ Write-WatchLog "  Cooldown      : ${Cooldown} min"
 Write-WatchLog "  Fix script    : $fixScript"
 Write-WatchLog "  Log directory : $ClaudeLogDir"
 Write-WatchLog "  Safety        : user-activity block, 180s grace period, consecutive-check gates"
-Write-WatchLog "  Monitors      : logs, service(x2), events(x2)+HCS, NAT, heartbeat(x3), staleness(x5), vmcompute-health, time sync"
+Write-WatchLog "  Monitors      : logs, service(x2), events(x2)+HCS, NAT, heartbeat(x3), staleness(x5), vmcompute-health, hcs-state, time sync"
 Write-WatchLog "================================================================"
 
 try {
@@ -1070,6 +1149,43 @@ try {
                 if ($vmcomputeIssue) {
                     Invoke-AutoFix -Reason $vmcomputeIssue
                     continue
+                }
+
+                # Check 8: HCS state health (stale VMs, shutdown failure frequency)
+                $hcsStateIssue = Test-HcsStateHealth
+                if ($hcsStateIssue) {
+                    Write-WatchLog "HCS STATE: $hcsStateIssue"
+                    # Don't auto-fix — this is informational + pre-emptive cleanup
+                    # Try hcsdiag close for stale VMs proactively
+                    try {
+                        $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+                        if (Test-Path $hcsdiagPath) {
+                            $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+                            $vmEntries = ([regex]::Matches($hcsList, "cowork-vm")).Count
+                            if ($vmEntries -gt 1) {
+                                # Parse all cowork-vm GUIDs
+                                $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+                                $vmGuids = @()
+                                $currentGuid = $null
+                                foreach ($line in ($hcsList -split "`r?`n")) {
+                                    if ($line -match "^\s*$guidPattern\s*$") {
+                                        $currentGuid = $Matches[1]
+                                    } elseif ($currentGuid -and $line -match "cowork-vm") {
+                                        $vmGuids += $currentGuid
+                                        $currentGuid = $null
+                                    }
+                                }
+                                # Close all EXCEPT the last one (most likely the active VM)
+                                if ($vmGuids.Count -gt 1) {
+                                    $staleGuids = $vmGuids[0..($vmGuids.Count - 2)]
+                                    foreach ($guid in $staleGuids) {
+                                        & $hcsdiagPath close $guid 2>&1 | Out-Null
+                                        Write-WatchLog "HCS: proactively closed stale cowork-vm ($guid)"
+                                    }
+                                }
+                            }
+                        }
+                    } catch {}
                 }
 
                 # ---- Maintenance (non-fix actions) ----

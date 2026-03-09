@@ -38,7 +38,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.7.0
+    Version : 4.8.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -87,7 +87,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.7.0"
+$Version         = "4.8.0"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -104,7 +104,8 @@ $script:CapturedClaudeExe = $null  # set in Step 1 from running process
 
 # -- Logging ---------------------------------------------------------
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
-$LogFile = Join-Path $LogDir ("fix_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+$script:SessionTimestamp = "{0:yyyyMMdd_HHmmss}" -f (Get-Date)
+$LogFile = Join-Path $LogDir "fix_$($script:SessionTimestamp).log"
 
 # Clean up logs older than 30 days
 try {
@@ -127,6 +128,10 @@ function Save-Log {
     try { $script:LogLines | Out-File -FilePath $LogFile -Encoding utf8 -Force }
     catch { Write-Host "  [!] Could not write log file" -ForegroundColor DarkGray }
 }
+
+# Transcript backup (v4.8.0) — catches output even if Save-Log fails
+$script:TranscriptFile = Join-Path $LogDir "fix_$($script:SessionTimestamp)_transcript.log"
+try { Start-Transcript -Path $script:TranscriptFile -Append -ErrorAction SilentlyContinue } catch {}
 
 # -- Win32: bring window to foreground and flash taskbar icon --------
 Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
@@ -371,20 +376,49 @@ function Restart-CoworkService {
 function Test-RecentHcsErrors {
     <#
     .SYNOPSIS
-        Checks for recent HCS (Host Compute Service) errors.
-        Returns $null if clean, "json_corruption" if 0xC037010D detected,
-        or "hcs_error" for other HCS errors.
+        Checks for recent HCS errors. Now checks Information-level events too (v4.8.0).
+        Returns: $null (clean), "json_corruption" (0xC037010D), "construct_failure"
+        (0x800707DE), or "hcs_error" (other HCS issues).
     #>
-    # Check 1: HCS Compute event log
+    # Check 1: HCS Compute event log — check ALL levels including Information
     try {
-        $hcsFilter = @{
-            LogName   = "Microsoft-Windows-Hyper-V-Compute-Admin"
-            Level     = @(1, 2)  # Critical, Error
+        # Check for 0xC037010D (shutdown failures) — these are Information-level
+        $hcsInfoFilter = @{
+            LogName   = "Microsoft-Windows-Hyper-V-Compute-Operational"
             StartTime = (Get-Date).AddMinutes(-5)
         }
-        $hcsEvents = @(Get-WinEvent -FilterHashtable $hcsFilter -MaxEvents 10 -ErrorAction SilentlyContinue)
-        if ($hcsEvents) {
-            foreach ($evt in $hcsEvents) {
+        $hcsInfoEvents = @(Get-WinEvent -FilterHashtable $hcsInfoFilter -MaxEvents 50 -ErrorAction SilentlyContinue)
+
+        $shutdownFailures = 0
+        $constructFailures = 0
+        foreach ($evt in $hcsInfoEvents) {
+            $msg = $evt.Message
+            if ($msg -match "0xC037010D") { $shutdownFailures++ }
+            if ($msg -match "0x800707DE") { $constructFailures++ }
+        }
+
+        # Construct failure (0x800707DE) is the most actionable
+        if ($constructFailures -gt 0) {
+            if ($shutdownFailures -gt 0) {
+                Log "  HCS: $constructFailures construct failures + $shutdownFailures shutdown failures in 5 min" -Colour DarkYellow -Indent
+            }
+            return "construct_failure"
+        }
+
+        # Shutdown failures indicate stale state building up
+        if ($shutdownFailures -gt 3) {
+            return "json_corruption"
+        }
+
+        # Also check Critical/Error level (original check)
+        $hcsCritFilter = @{
+            LogName   = "Microsoft-Windows-Hyper-V-Compute-Admin"
+            Level     = @(1, 2)
+            StartTime = (Get-Date).AddMinutes(-5)
+        }
+        $hcsCritEvents = @(Get-WinEvent -FilterHashtable $hcsCritFilter -MaxEvents 10 -ErrorAction SilentlyContinue)
+        if ($hcsCritEvents) {
+            foreach ($evt in $hcsCritEvents) {
                 $xml = $evt.ToXml()
                 if ($xml -match "0xC037010D" -or $xml -match "Invalid JSON document") {
                     return "json_corruption"
@@ -394,8 +428,9 @@ function Test-RecentHcsErrors {
         }
     } catch {}
 
-    # Check 2: Claude log files for HCS error patterns
-    $hcsPatterns = @("HCS operation failed", "failed to create compute system", "HcsWaitForOperationResult")
+    # Check 2: Claude log files (keep existing logic)
+    $hcsPatterns = @("HCS operation failed", "failed to create compute system",
+                     "HcsWaitForOperationResult", "0x800707DE")
     $claudeLogDir = Join-Path $env:APPDATA "Claude\logs"
     if (Test-Path $claudeLogDir) {
         try {
@@ -416,6 +451,50 @@ function Test-RecentHcsErrors {
     return $null
 }
 
+function Close-StaleHcsVms {
+    <#
+    .SYNOPSIS
+        Finds and closes stale cowork-vm entries in HCS via hcsdiag.
+        Returns the number of VMs closed.
+    #>
+    param(
+        [string]$Action = "close",   # "close" or "kill"
+        [switch]$KeepOne             # Keep one instance (the active one) — only close extras
+    )
+    $closed = 0
+    $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+    if (-not (Test-Path $hcsdiagPath)) { return 0 }
+    try {
+        $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+        if ($hcsList -notmatch "cowork-vm") { return 0 }
+        # Parse GUID + name pairs
+        $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+        $entries = @()
+        $currentGuid = $null
+        foreach ($line in ($hcsList -split "`r?`n")) {
+            if ($line -match "^\s*$guidPattern\s*$") {
+                $currentGuid = $Matches[1]
+            } elseif ($currentGuid -and $line -match "cowork-vm") {
+                $entries += $currentGuid
+                $currentGuid = $null
+            } elseif ($line -match "^\s*$guidPattern") {
+                # New GUID line without matching cowork-vm for previous
+                $currentGuid = $Matches[1]
+            }
+        }
+        # If KeepOne, skip the last entry (most likely the active one)
+        if ($KeepOne -and $entries.Count -le 1) { return 0 }
+        $toClose = if ($KeepOne) { $entries[0..($entries.Count - 2)] } else { $entries }
+        foreach ($guid in $toClose) {
+            try {
+                & $hcsdiagPath $Action $guid 2>&1 | Out-Null
+                $closed++
+            } catch {}
+        }
+    } catch {}
+    return $closed
+}
+
 # ====================================================================
 # MAIN
 # ====================================================================
@@ -430,7 +509,7 @@ Write-Host "  +-------------------------------------------+" -ForegroundColor Cy
 Write-Host ""
 
 # -- Prevent concurrent Fix runs ----------------------------------------
-$fixMutexName = "Global\ClaudeDesktopFix_v4.7"
+$fixMutexName = "Global\ClaudeDesktopFix_v4.8"
 $fixMutex = $null
 try {
     $fixMutex = [System.Threading.Mutex]::new($false, $fixMutexName)
@@ -584,6 +663,8 @@ if ($script:SelectedMode -eq "Diagnostic") {
     $diagHcs = Test-RecentHcsErrors
     if ($diagHcs -eq "json_corruption") {
         Log "  HCS health    : JSON corruption detected (0xC037010D)" -Colour Red
+    } elseif ($diagHcs -eq "construct_failure") {
+        Log "  HCS health    : Construct failure detected (0x800707DE)" -Colour Red
     } elseif ($diagHcs -eq "hcs_error") {
         Log "  HCS health    : Errors detected" -Colour Yellow
     } else {
@@ -625,6 +706,86 @@ if ($script:SelectedMode -eq "Diagnostic") {
                 $deMsg  = ($de.Message -split "`n")[0]
                 Log "    [$deTime] $deMsg" -Colour DarkGray
             }
+        }
+    } catch {}
+
+    # HCS state via hcsdiag (v4.8.0)
+    if ($script:IsAdmin) {
+        try {
+            $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+            if (Test-Path $hcsdiagPath) {
+                $diagHcsList = & $hcsdiagPath list 2>&1 | Out-String
+                $vmEntries = ([regex]::Matches($diagHcsList, "cowork-vm")).Count
+                if ($vmEntries -gt 0) {
+                    Log "  HCS VMs       : $vmEntries cowork-vm instance(s)" -Colour $(if ($vmEntries -gt 1) { "Yellow" } else { "Green" })
+                } else {
+                    Log "  HCS VMs       : None" -Colour DarkGray
+                }
+            }
+        } catch {}
+    }
+
+    # 0xC037010D frequency (v4.8.0)
+    try {
+        $diagShutdownFilter = @{
+            LogName   = "Microsoft-Windows-Hyper-V-Compute-Operational"
+            StartTime = (Get-Date).AddHours(-24)
+        }
+        $diagShutdownEvents = @(Get-WinEvent -FilterHashtable $diagShutdownFilter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match "0xC037010D" })
+        $last1h = @($diagShutdownEvents | Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-1) }).Count
+        $last24h = $diagShutdownEvents.Count
+        $statusColour = if ($last1h -gt 10) { "Red" } elseif ($last1h -gt 3) { "Yellow" } else { "Green" }
+        Log "  Shutdown fails: $last1h (1h) / $last24h (24h)" -Colour $statusColour
+    } catch {}
+
+    # 0x800707DE frequency (v4.8.0)
+    try {
+        $diagConstructEvents = @(Get-WinEvent -FilterHashtable $diagShutdownFilter -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match "0x800707DE" })
+        if ($diagConstructEvents.Count -gt 0) {
+            Log "  Construct fails: $($diagConstructEvents.Count) (24h)" -Colour Red
+        }
+    } catch {}
+
+    # Session file count (v4.8.0)
+    $sessionDir = Join-Path $env:APPDATA "Claude\local-agent-mode-sessions"
+    if (Test-Path $sessionDir) {
+        $sessionFiles = @(Get-ChildItem $sessionDir -Recurse -File -ErrorAction SilentlyContinue)
+        $sessionSize = ($sessionFiles | Measure-Object -Property Length -Sum).Sum
+        $sessionCol = if ($sessionFiles.Count -gt 1000) { "Red" } elseif ($sessionFiles.Count -gt 500) { "Yellow" } else { "Green" }
+        Log "  Session files : $($sessionFiles.Count) ($([math]::Round($sessionSize/1MB,1)) MB)" -Colour $sessionCol
+    }
+
+    # vmcompute handle count (v4.8.0)
+    try {
+        $diagVmcompute = Get-Process -Name "vmcompute" -ErrorAction SilentlyContinue
+        if ($diagVmcompute) {
+            $hc = $diagVmcompute.HandleCount
+            $hcCol = if ($hc -gt 10000) { "Red" } elseif ($hc -gt 5000) { "Yellow" } else { "Green" }
+            Log "  vmcompute     : $hc handles" -Colour $hcCol
+        }
+    } catch {}
+
+    # CoworkVMService recovery config (v4.8.0)
+    try {
+        $svcRecovery = & sc.exe qfailure CoworkVMService 2>&1
+        if ($svcRecovery -match "RESTART") {
+            Log "  Svc recovery  : Configured" -Colour Green
+        } else {
+            Log "  Svc recovery  : NOT CONFIGURED (run Prevent to fix)" -Colour Yellow
+        }
+    } catch {}
+
+    # Defender exclusion completeness (v4.8.0)
+    try {
+        $procExcl = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
+        $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "cowork-svc.exe")
+        $missingExcl = @($requiredProcs | Where-Object { $procExcl -notcontains $_ })
+        if ($missingExcl.Count -gt 0) {
+            Log "  Defender procs: MISSING $($missingExcl -join ', ') (run Prevent to fix)" -Colour Yellow
+        } else {
+            Log "  Defender procs: All exclusions present" -Colour Green
         }
     } catch {}
 
@@ -708,9 +869,38 @@ public static class FixActivityCheck {
 }
 
 # ====================================================================
+# STEP 0 -- Pre-emptive HCS state cleanup (v4.8.0)
+# ====================================================================
+Log "[0/10] Checking for stale HCS compute systems..." -Colour Yellow
+if ($script:IsAdmin) {
+    try {
+        $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+        if (Test-Path $hcsdiagPath) {
+            $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+            if ($hcsList -match "cowork-vm") {
+                Log "Found stale cowork-vm in HCS — cleaning up" -Colour DarkYellow -Indent
+                $cleaned = Close-StaleHcsVms -Action "close"
+                if ($cleaned -gt 0) {
+                    Log "Closed $cleaned stale HCS compute system(s)" -Colour Green -Indent
+                }
+            } else {
+                Log "HCS state clean — no stale cowork-vm found" -Colour Green -Indent
+            }
+        } else {
+            Log "hcsdiag.exe not found — skipping HCS cleanup" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "HCS cleanup failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
+    }
+} else {
+    Log "Skipped (requires admin)" -Colour DarkGray -Indent
+}
+Start-Sleep -Seconds 1
+
+# ====================================================================
 # STEP 1 -- Kill all Claude processes
 # ====================================================================
-Log "[1/9] Terminating Claude processes..." -Colour Yellow
+Log "[1/10] Terminating Claude processes..." -Colour Yellow
 
 $claudeProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
 if ($claudeProcs.Count -gt 0) {
@@ -751,7 +941,7 @@ Start-Sleep -Seconds 1
 # ====================================================================
 # STEP 2 -- Stop CoworkVMService
 # ====================================================================
-Log "[2/9] Stopping $ServiceName..." -Colour Yellow
+Log "[2/10] Stopping $ServiceName..." -Colour Yellow
 
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 if (-not $svc) {
@@ -785,7 +975,7 @@ Start-Sleep -Seconds 1
 # ====================================================================
 # STEP 3 -- HCS service recovery
 # ====================================================================
-Log "[3/9] Checking HCS service health..." -Colour Yellow
+Log "[3/10] Checking HCS service health..." -Colour Yellow
 
 try {
     $hcsDetected = Test-RecentHcsErrors
@@ -804,6 +994,9 @@ try {
             Log "unlikely to resolve JSON corruption. If Cowork fails to start" -Colour DarkGray -Indent
             Log "after this fix, perform the nuclear reset above." -Colour DarkGray -Indent
         }
+    }
+    if ($hcsDetected -eq "construct_failure") {
+        Log "HCS construct failure (0x800707DE) — stale state from failed shutdowns" -Colour DarkYellow -Indent
     }
     if ($hcsDetected) {
         if ($script:IsAdmin) {
@@ -870,7 +1063,7 @@ try {
 # ====================================================================
 # STEP 4 -- Verify no orphan processes remain
 # ====================================================================
-Log "[4/9] Checking for orphan processes..." -Colour Yellow
+Log "[4/10] Checking for orphan processes..." -Colour Yellow
 
 $remaining = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
     ($_.Name -eq $ProcessName) -or ($_.Name -eq $ServiceExe)
@@ -897,7 +1090,7 @@ if ($remaining.Count -gt 0) {
 # ====================================================================
 # STEP 5 -- Kill orphan HCS compute systems
 # ====================================================================
-Log "[5/9] Checking for orphan compute systems..." -Colour Yellow
+Log "[5/10] Checking for orphan compute systems..." -Colour Yellow
 try {
     $orphanKilled = $false
     # Method 1: hcsdiag (most reliable for HCS compute systems)
@@ -939,25 +1132,10 @@ try {
             }
         }
     }
-    # Method 2: Hyper-V cmdlets fallback (Stop-VM -TurnOff)
-    try {
-        $claudeVm = Get-VM -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -match "claude" }
-        if ($claudeVm) {
-            foreach ($vm in $claudeVm) {
-                if ($vm.State -ne "Off") {
-                    if ($PSCmdlet.ShouldProcess($vm.Name, "Stop-VM -TurnOff")) {
-                        Stop-VM -Name $vm.Name -TurnOff -Force -ErrorAction SilentlyContinue
-                        Log "Force-stopped VM '$($vm.Name)' via Hyper-V" -Colour Green -Indent
-                        $orphanKilled = $true
-                    }
-                }
-            }
-        }
-    } catch {
-        Log "Hyper-V VM check skipped: $($_.Exception.Message)" -Colour DarkGray -Indent
-    }
-    # Method 3: Kill hung vmwp.exe (VM Worker Process)
+    # Note: Get-VM does not see HCS compute systems (like cowork-vm).
+    # All cleanup is handled by hcsdiag above. (v4.8.0)
+
+    # Method 2: Kill hung vmwp.exe (VM Worker Process)
     try {
         $vmwpProcs = @(Get-CimInstance Win32_Process -Filter "Name='vmwp.exe'" -ErrorAction SilentlyContinue)
         if ($vmwpProcs.Count -gt 0) {
@@ -1017,7 +1195,8 @@ Start-Sleep -Seconds 1
 # ====================================================================
 # Quick mode and Smart mode (before escalation) skip cache purge.
 # Deep mode and Smart-escalated do full purge with VHDX backup/restore.
-$skipCachePurge = $KeepCache -or ($script:SelectedMode -eq "Quick")
+$skipCachePurge = $KeepCache -or ($script:SelectedMode -in "Quick","Smart")
+$vhdxBackedUp = @{}
 
 # -- VHDX integrity check helper --
 function Test-VhdxHeader {
@@ -1034,7 +1213,7 @@ function Test-VhdxHeader {
 
 if ($skipCachePurge) {
     $skipReason = if ($KeepCache) { "-KeepCache" } else { "$($script:SelectedMode) mode" }
-    Log "[6/9] Keeping VM cache ($skipReason)" -Colour DarkGray
+    Log "[6/10] Keeping VM cache ($skipReason)" -Colour DarkGray
     foreach ($item in @(
         @{ Path = $VmCachePath; Label = "claude-code-vm" },
         @{ Path = $BundlePath;  Label = "vm_bundles" }
@@ -1047,7 +1226,41 @@ if ($skipCachePurge) {
         }
     }
 } else {
-    Log "[6/9] Smart cache purge..." -Colour Yellow
+    Log "[6/10] Smart cache purge..." -Colour Yellow
+
+    # Phase 0: HCS state cleanup before cache purge (v4.8.0)
+    if ($script:IsAdmin) {
+        try {
+            $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+            if (Test-Path $hcsdiagPath) {
+                $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+                if ($hcsList -match "cowork-vm") {
+                    $cleaned = Close-StaleHcsVms -Action "close"
+                    if ($cleaned -gt 0) {
+                        Log "HCS: closed $cleaned stale cowork-vm(s)" -Colour Green -Indent
+                    }
+                }
+            }
+        } catch {
+            Log "HCS deep cleanup failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
+        }
+    }
+
+    # Phase 0b: Clean old session conversation logs (>7 days)
+    $sessionLogDir = Join-Path $env:APPDATA "Claude\local-agent-mode-sessions"
+    if (Test-Path $sessionLogDir) {
+        try {
+            $oldLogs = Get-ChildItem $sessionLogDir -Recurse -File -ErrorAction SilentlyContinue |
+                       Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) }
+            if ($oldLogs.Count -gt 0) {
+                $oldSize = ($oldLogs | Measure-Object -Property Length -Sum).Sum
+                $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
+                Log "Cleaned $($oldLogs.Count) old session logs ($([math]::Round($oldSize/1MB,1)) MB)" -Colour Green -Indent
+            }
+        } catch {
+            Log "Session log cleanup failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
+        }
+    }
 
     # Phase 1: Backup sessiondata.vhdx and smol-bin.vhdx
     $backupDir = Join-Path $LogDir "vhdx-backup"
@@ -1182,7 +1395,7 @@ try {
 # ====================================================================
 # STEP 7 -- Restart CoworkVMService (with extended polling)
 # ====================================================================
-Log "[7/9] Starting $ServiceName..." -Colour Yellow
+Log "[7/10] Starting $ServiceName..." -Colour Yellow
 
 if ($PSCmdlet.ShouldProcess($ServiceName, "Start")) {
     if ($script:IsAdmin) {
@@ -1229,8 +1442,30 @@ if ($script:SelectedMode -eq "Smart") {
     $smartSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $smartSvc -or $smartSvc.Status -ne "Running") {
         Log "Smart mode: service not running after quick fix -- escalating to Deep" -Colour Yellow
-        # Run the cache purge that was skipped
-        Log "[6/9] Escalated cache purge..." -Colour Yellow
+        # Run the cache purge that was skipped — with VHDX backup
+        Log "[7/10] Escalated cache purge..." -Colour Yellow
+        # Phase 0: HCS cleanup
+        if ($script:IsAdmin) {
+            try { Close-StaleHcsVms -Action "close" | Out-Null } catch {}
+        }
+        # Phase 1: Backup VHDX before nuke
+        $escalateBackupDir = Join-Path $LogDir "vhdx-backup"
+        if (-not (Test-Path $escalateBackupDir)) { New-Item $escalateBackupDir -ItemType Directory -Force | Out-Null }
+        foreach ($vhdx in @('sessiondata.vhdx', 'smol-bin.vhdx')) {
+            foreach ($cd in @($VmCachePath, $BundlePath)) {
+                if (-not $cd -or -not (Test-Path $cd)) { continue }
+                $src = Get-ChildItem $cd -Recurse -Filter $vhdx -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($src) {
+                    $dest = Join-Path $escalateBackupDir $vhdx
+                    try {
+                        Copy-Item $src.FullName $dest -Force -ErrorAction Stop
+                        Log "Backed up $vhdx before escalation" -Colour Green -Indent
+                    } catch {}
+                    break
+                }
+            }
+        }
+        # Phase 2: Nuke
         foreach ($item in @(
             @{ Path = $VmCachePath; Label = "claude-code-vm" },
             @{ Path = $BundlePath;  Label = "vm_bundles" }
@@ -1255,6 +1490,24 @@ if ($script:SelectedMode -eq "Smart") {
                 Log "[!] Service still failed after deep purge" -Colour Red -Indent
             }
         }
+        # Phase 3: Restore VHDX after service restart
+        foreach ($vhdx in @('sessiondata.vhdx', 'smol-bin.vhdx')) {
+            $backup = Join-Path $escalateBackupDir $vhdx
+            if (Test-Path $backup) {
+                foreach ($cd in @($BundlePath, $VmCachePath)) {
+                    if (Test-Path $cd) {
+                        $target = Join-Path $cd $vhdx
+                        if (-not (Test-Path $target)) {
+                            try {
+                                Copy-Item $backup $target -Force -ErrorAction Stop
+                                Log "Restored $vhdx from escalation backup" -Colour Green -Indent
+                            } catch {}
+                        }
+                        break
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1262,10 +1515,10 @@ if ($script:SelectedMode -eq "Smart") {
 # STEP 8 -- Relaunch Claude Desktop
 # ====================================================================
 if ($SkipLaunch) {
-    Log "[8/9] Skipping Claude launch (-SkipLaunch)" -Colour DarkGray
-    Log "[9/9] Skipping health check (-SkipLaunch)" -Colour DarkGray
+    Log "[8/10] Skipping Claude launch (-SkipLaunch)" -Colour DarkGray
+    Log "[9/10] Skipping health check (-SkipLaunch)" -Colour DarkGray
 } else {
-    Log "[8/9] Launching Claude Desktop..." -Colour Yellow
+    Log "[8/10] Launching Claude Desktop..." -Colour Yellow
 
     $claudeExe = Find-ClaudeExe
 
@@ -1379,7 +1632,7 @@ if ($SkipLaunch) {
     }
 
     # ====================================================================
-    # STEP 9 -- Wait for Cowork workspace readiness
+    # STEP 9 -- Wait for Cowork workspace readiness (now Step 9/10)
     # ====================================================================
     # Detection strategy (in order of reliability):
     #   A. Log file: cowork_vm_node.log -- "Startup complete" or "Keepalive"
@@ -1388,7 +1641,7 @@ if ($SkipLaunch) {
     #   D. File size stability fallback (last resort)
     # The named pipe RPC is NOT usable (requires signed client executable).
     # ====================================================================
-    Log "[9/9] Waiting for Cowork workspace..." -Colour Yellow
+    Log "[9/10] Waiting for Cowork workspace..." -Colour Yellow
 
     $vmReady = $false
     $vmLogDir = Join-Path $ClaudeAppData "logs"
@@ -1408,14 +1661,19 @@ if ($SkipLaunch) {
             $fi = Get-Item $vmLogFile -ErrorAction Stop
             if ($fi.Length -le $Baseline) { return $null }
             # Read only the new portion of the log
-            $stream = New-Object System.IO.FileStream(
-                $vmLogFile, [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-            $stream.Position = $Baseline
-            $reader = New-Object System.IO.StreamReader($stream)
-            $newContent = $reader.ReadToEnd()
-            $reader.Close()
-            $stream.Close()
+            $stream = $null
+            $reader = $null
+            try {
+                $stream = New-Object System.IO.FileStream(
+                    $vmLogFile, [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                $stream.Position = $Baseline
+                $reader = New-Object System.IO.StreamReader($stream)
+                $newContent = $reader.ReadToEnd()
+            } finally {
+                if ($reader) { try { $reader.Close() } catch {} }
+                if ($stream) { try { $stream.Close() } catch {} }
+            }
             # Check for completion markers (most definitive first)
             if ($newContent -match "Startup complete") { return "startup-complete" }
             if ($newContent -match "\[Keepalive\]") { return "keepalive" }
@@ -1425,16 +1683,25 @@ if ($SkipLaunch) {
         } catch { return $null }
     }
 
-    # Helper: check Hyper-V VM state (may not work without Hyper-V module)
+    # Helper: check HCS compute system state via hcsdiag (v4.8.0)
     function Test-HyperVReady {
         try {
-            $vm = Get-VM -VMName "claudevm" -ErrorAction Stop
-            if ($vm.State -eq "Running") {
-                # Check heartbeat if available
-                $hb = Get-VMIntegrationService -VMName "claudevm" -Name "Heartbeat" -ErrorAction SilentlyContinue
-                if ($hb -and $hb.PrimaryStatusDescription -eq "OK") {
-                    return "running+heartbeat"
-                }
+            $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+            if (-not (Test-Path $hcsdiagPath)) { return $null }
+            $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+            if ($hcsList -match "cowork-vm") {
+                # Also check Integration Services heartbeat if available
+                try {
+                    $claudeVm = Get-VM -ErrorAction SilentlyContinue |
+                                Where-Object { $_.Name -match "claude" } |
+                                Select-Object -First 1
+                    if ($claudeVm -and $claudeVm.State -eq "Running") {
+                        $hb = Get-VMIntegrationService -VMName $claudeVm.Name -Name "Heartbeat" -ErrorAction SilentlyContinue
+                        if ($hb -and $hb.PrimaryStatusDescription -eq "OK") {
+                            return "running+heartbeat"
+                        }
+                    }
+                } catch {}
                 return "running"
             }
             return $null
@@ -1528,6 +1795,49 @@ if ($SkipLaunch) {
     }
 }
 
+# -- Post-fix retry loop (v4.8.0) --
+# If workspace didn't come up after the full fix, retry service restart
+if (-not $vmReady -and -not $SkipLaunch) {
+    Log "" -Colour White
+    Log "Workspace not ready — attempting retry cycle ($MaxRetries max)..." -Colour Yellow
+    for ($retryNum = 1; $retryNum -le $MaxRetries; $retryNum++) {
+        Log "Retry $retryNum/$MaxRetries -- quick service restart..." -Colour Yellow -Indent
+        if ($script:IsAdmin) {
+            # Quick cycle: stop service, hcsdiag cleanup, restart service
+            Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            try {
+                    $cleaned = Close-StaleHcsVms -Action "close"
+                    if ($cleaned -gt 0) {
+                        Log "Cleaned $cleaned stale HCS state(s)" -Colour Green -Indent
+                    }
+            } catch {}
+            Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            # Wait up to 60s for workspace
+            $retryElapsed = 0
+            while ($retryElapsed -lt 60) {
+                Start-Sleep -Seconds 5
+                $retryElapsed += 5
+                $retryStatus = Test-VmLogReady -Baseline $logBaselineSize
+                if ($retryStatus) {
+                    Log "Workspace ready on retry $retryNum ($retryStatus)" -Colour Green -Indent
+                    $vmReady = $true
+                    break
+                }
+            }
+            if ($vmReady) { break }
+            Log "Retry $retryNum failed" -Colour DarkYellow -Indent
+        } else {
+            Log "Retry requires admin — skipping" -Colour DarkGray -Indent
+            break
+        }
+    }
+    if (-not $vmReady) {
+        Log "All $MaxRetries retries exhausted — manual intervention may be needed" -Colour Red
+    }
+}
+
 # -- Bring this window to the front (Claude may have taken focus) ----
 try { [Win32Window]::BringToFront() } catch {}
 
@@ -1577,8 +1887,6 @@ try {
 Write-Host ""
 Log "Log saved to: $LogFile" -Colour DarkGray -Indent
 
-Save-Log
-
 } catch {
     Write-Host ""
     Write-Host "  +-------------------------------------------+" -ForegroundColor Red
@@ -1588,8 +1896,9 @@ Save-Log
     Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "  Line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkGray
     Write-Host ""
-    Save-Log
 } finally {
+    Save-Log
+    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     if ($fixMutex) {
         try { $fixMutex.ReleaseMutex(); $fixMutex.Dispose() } catch {}
     }
