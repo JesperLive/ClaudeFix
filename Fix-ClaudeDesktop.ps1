@@ -38,7 +38,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 4.8.5
+    Version : 4.8.6
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -89,7 +89,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "4.8.5"
+$Version         = "4.8.6"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -1166,33 +1166,6 @@ try {
         }
     } else {
         Log "No HCS issues detected" -Colour DarkGray -Indent
-    }
-
-    # Boot-fix mode: always restart vmcompute to clear stale state from sleep/reboot
-    # After sleep/wake, hcsdiag may show clean but vmcompute can hold stale VM registrations
-    # that cause "VM is already running" errors when Claude tries to start the workspace.
-    if ($SkipLaunch -and -not $hcsDetected -and $script:IsAdmin) {
-        Log "Boot-fix mode -- proactive vmcompute restart (clears stale post-sleep state)" -Colour DarkYellow -Indent
-        try {
-            Stop-Service vmcompute -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
-            Start-Service vmcompute -ErrorAction SilentlyContinue
-            $vmcElapsed = 0
-            $vmcRunning = $false
-            while ($vmcElapsed -lt 15) {
-                Start-Sleep -Seconds 3
-                $vmcElapsed += 3
-                $vmcSvc = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
-                if ($vmcSvc -and $vmcSvc.Status -eq "Running") { $vmcRunning = $true; break }
-            }
-            if ($vmcRunning) {
-                Log "vmcompute restarted (proactive boot cleanup)" -Colour Green -Indent
-            } else {
-                Log "vmcompute did not come back after proactive restart" -Colour DarkYellow -Indent
-            }
-        } catch {
-            Log "Proactive vmcompute restart failed: $($_.Exception.Message)" -Colour DarkYellow -Indent
-        }
     }
 } catch {
     Log "[!] HCS check failed: $($_.Exception.Message) -- continuing" -Colour DarkGray -Indent

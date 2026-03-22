@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.8.3
+    Version : 4.8.6
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -73,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.8.5"
+$Version          = "4.8.6"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"

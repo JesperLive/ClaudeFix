@@ -115,13 +115,14 @@ The underlying HCS error (`failed to create compute system: HcsWaitForOperationR
 
 ### Tracked Issues
 
-- [#26554](https://github.com/anthropics/claude-code/issues/26554) -- VirtioFS mount fails with "bad address"
+- [#26554](https://github.com/anthropics/claude-code/issues/26554) -- VirtioFS mount fails with "bad address" (closed March 18 2026 as "completed" -- no linked PR or fix details; underlying architecture unchanged)
 - [#27576](https://github.com/anthropics/claude-code/issues/27576) -- Mount failure after ~1 hour of use
 - [#28890](https://github.com/anthropics/claude-code/issues/28890) -- Mount goes stale after idle
 - [#29587](https://github.com/anthropics/claude-code/issues/29587) -- Cowork fails after brief use
 - [#29848](https://github.com/anthropics/claude-code/issues/29848) -- Recurring VM crashes
 - [#31520](https://github.com/anthropics/claude-code/issues/31520) -- Community recovery script for VirtioFS failures (ClaudeFix covers all steps and more)
-- [#31703](https://github.com/anthropics/claude-code/issues/31703) -- HCS/VM service failures on v1.1.5368 (still open as of March 2026)
+- [#31703](https://github.com/anthropics/claude-code/issues/31703) -- HCS/VM service failures on v1.1.5368 (still open as of March 2026, no Anthropic response)
+- [#32172](https://github.com/anthropics/claude-code/issues/32172) -- HCS 0x800707DE construct failure after VirtioFS mount error (still open as of March 2026, no Anthropic response)
 - [#29045](https://github.com/anthropics/claude-code/issues/29045) — Claude Desktop spawns Hyper-V VM on every launch, even for chat-only use
 - [#27801](https://github.com/anthropics/claude-code/issues/27801) — "Failed to start Claude's workspace" — VM service not running, persists after reboot
 
@@ -151,6 +152,7 @@ The menu is skipped when:
 
 | Step | Action |
 |------|--------|
+| 0 | Pre-emptive HCS state cleanup (stale cowork-vm entries) and session file housekeeping (>7 days) |
 | 1 | Captures Claude.exe path, then force-kills all claude.exe processes |
 | 2 | Stops CoworkVMService (graceful with admin, force-kill without) |
 | 3 | Checks for HCS errors and restarts vmcompute service if needed; escalates to vmms and HvHost (Deep mode only) |
@@ -450,6 +452,14 @@ Current versions: Fix 4.8.5, Watch 4.8.5, Prevent 4.8.5
 ---
 
 ## Changelog
+
+### v4.8.6 -- Audit Cleanup (2026-03-22)
+- **Dead code removal** (Fix) -- removed legacy $SkipLaunch vmcompute restart path from Step 3 (obsoleted by BootPrep in v4.8.4)
+- **Stale .NOTES headers** (Watch, Prevent) -- corrected comment-block version numbers that were behind the runtime $Version
+- **Issue tracker updates** (README) -- updated #26554 closure status (closed as "completed" with no linked fix), added #32172 (HCS 0x800707DE, still open)
+- **Step 0 documented** (README) -- added Step 0 row to Fix "What It Does" table (pre-emptive HCS state cleanup + session file housekeeping)
+- **Removed 24 obsolete files** -- deleted one-off diagnostic scripts and outdated CodePrompt files from Claude\ subfolder
+- **Version bump** -- all three scripts updated to v4.8.6; Watch-ClaudeHealth mutex updated to v4.8.6
 
 ### v4.8.5 — Power Plan Fix (2026-03-09)
 
