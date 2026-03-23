@@ -15,6 +15,7 @@
     - Hyper-V Integration Services heartbeat
     - VM log staleness (hung VM detection)
     - vmcompute handle leak detection (HCS service health)
+    - cowork-service.log for isGuestConnected RPC timeout patterns
     - Host clock drift (NTP/time sync)
 
     SAFETY FEATURES (v3.3+):
@@ -47,7 +48,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 4.8.6
+    Version : 5.0.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -62,10 +63,13 @@ param(
 Set-StrictMode -Version Latest
 
 # -- Constants -----------------------------------------------------------
-$Version        = "4.8.6"
+$Version        = "5.0.0"
 $ServiceName    = "CoworkVMService"
 $ClaudeAppData  = Join-Path $env:APPDATA "Claude"
-$ClaudeLogDir   = Join-Path $ClaudeAppData "logs"
+$ClaudeLogDirPD = Join-Path $env:ProgramData "Claude\Logs"
+$ClaudeLogDirAD = Join-Path $ClaudeAppData "logs"
+# Prefer ProgramData (new location since March 2025)
+$ClaudeLogDir   = if (Test-Path $ClaudeLogDirPD) { $ClaudeLogDirPD } else { $ClaudeLogDirAD }
 $WatchLogDir    = Join-Path $ClaudeAppData "watch-logs"
 
 # Error patterns that indicate VirtioFS mount failure
@@ -77,7 +81,10 @@ $ErrorPatterns = @(
     "HCS operation failed",
     "failed to create compute system",
     "HcsWaitForOperationResult",
-    "VM is already running"
+    "VM is already running",
+    "Request timed out: isGuestConnected",
+    "isGuestConnected.*timeout",
+    "guest connection failed"
 )
 
 # -- Win32 APIs for user activity detection ------------------------------
@@ -155,6 +162,35 @@ function Update-LogFile {
     }
 }
 
+# -- hcsdiag helper (timeout-protected) ----------------------------------
+function Invoke-HcsDiag {
+    <#
+    .SYNOPSIS
+        Runs hcsdiag.exe with a timeout. Returns output string or $null on timeout.
+    #>
+    param(
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds = 15
+    )
+    $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
+    if (-not (Test-Path $hcsdiagPath)) { return $null }
+    $job = Start-Job -ScriptBlock {
+        param($p, $a)
+        & $p @a 2>&1 | Out-String
+    } -ArgumentList $hcsdiagPath, $Arguments
+    $completed = Wait-Job $job -Timeout $TimeoutSeconds
+    if ($completed) {
+        $result = Receive-Job $job
+        Remove-Job $job -Force
+        return $result
+    } else {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        Write-WatchLog "hcsdiag timed out after ${TimeoutSeconds}s (args: $($Arguments -join ' '))"
+        return $null
+    }
+}
+
 # -- State ---------------------------------------------------------------
 $script:StartTime            = Get-Date
 $script:LastFixTime          = [datetime]::MinValue
@@ -170,6 +206,7 @@ $script:ServiceDownCount     = 0     # Consecutive service-down checks
 $script:EventLogHitCount     = 0     # Consecutive event log hits
 $script:LastVmcomputeCheck   = [datetime]::MinValue
 $script:VmcomputeLeakCount   = 0     # Consecutive vmcompute handle leak checks
+$script:GuestFailCount       = 0     # Consecutive guest connection failures
 $script:LastHcsStateLogTime  = [datetime]::MinValue
 $script:LastShutdownFailLogTime = [datetime]::MinValue
 $script:FixHistory           = New-Object System.Collections.ArrayList
@@ -518,7 +555,14 @@ function Test-VmLogStaleness {
         - Only triggers if the log was PREVIOUSLY active (VmLogEverActive)
           This prevents false positives when user is in Chat mode (no Cowork)
     #>
-    $vmLogFile = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+    $vmLogFile = Join-Path $ClaudeLogDir "coworkd.log"
+    if (-not (Test-Path $vmLogFile)) {
+        $vmLogFile = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+    }
+    # Also check old AppData path as final fallback
+    if (-not (Test-Path $vmLogFile)) {
+        $vmLogFile = Join-Path $ClaudeLogDirAD "cowork_vm_node.log"
+    }
     if (-not (Test-Path $vmLogFile)) {
         $script:VmLogStaleCount = 0
         return $null
@@ -659,10 +703,8 @@ function Test-HcsStateHealth {
 
     # Check 1: Stale cowork-vm in hcsdiag (should not exist while service is healthy)
     try {
-        $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
-        if (Test-Path $hcsdiagPath) {
-            $hcsList = & $hcsdiagPath list 2>&1 | Out-String
-            # Count cowork-vm entries
+        $hcsList = Invoke-HcsDiag -Arguments "list"
+        if ($hcsList) {
             $vmCount = ([regex]::Matches($hcsList, "cowork-vm")).Count
             # During active Cowork sessions, 1-2 HCS instances is normal
             # (VM runtime + network/storage component). Only flag 3+.
@@ -700,17 +742,32 @@ function Test-HcsStateHealth {
             if ($shutdownCount -gt 10) {
                 $issues += "HCS shutdown failure spike: $shutdownCount events in last hour"
             }
-            # Spike detection: >5 in last 5 minutes triggers vmcompute restart
+            # Spike detection: excessive shutdown failures may indicate real corruption
             $fiveMinAgo = (Get-Date).AddMinutes(-5)
             $recentSpike = @($allShutdownEvents | Where-Object { $_.TimeCreated -gt $fiveMinAgo })
-            if ($recentSpike.Count -gt 5) {
-                Write-WatchLog "HCS SPIKE: $($recentSpike.Count) shutdown failures in 5 min -- restarting vmcompute"
+            if ($recentSpike.Count -gt 15) {
+                # Before restarting vmcompute, check if there is an active session
+                $coworkSvc = Get-Service -Name "CoworkVMService" -ErrorAction SilentlyContinue
+                $claudeRunning = @(Get-Process -Name "claude" -ErrorAction SilentlyContinue).Count -gt 0
+                $fixRunning = $false
                 try {
-                    Restart-Service -Name "vmcompute" -Force -ErrorAction Stop
-                    Start-Sleep -Seconds 3
-                    Write-WatchLog "vmcompute restarted (pre-emptive, cleared stale HCS state)"
-                } catch {
-                    Write-WatchLog "vmcompute restart failed: $($_.Exception.Message)"
+                    $fixMutex = [System.Threading.Mutex]::OpenExisting("Global\ClaudeDesktopFix_v4.8")
+                    $fixMutex.Dispose()
+                    $fixRunning = $true
+                } catch {}
+                if ($claudeRunning -and $coworkSvc -and $coworkSvc.Status -eq "Running") {
+                    Write-WatchLog "HCS SPIKE: $($recentSpike.Count) failures in 5 min but active session detected -- skipping vmcompute restart"
+                } elseif ($fixRunning) {
+                    Write-WatchLog "HCS SPIKE: $($recentSpike.Count) failures in 5 min but Fix is running -- skipping vmcompute restart"
+                } else {
+                    Write-WatchLog "HCS SPIKE: $($recentSpike.Count) shutdown failures in 5 min -- restarting vmcompute"
+                    try {
+                        Restart-Service -Name "vmcompute" -Force -ErrorAction Stop
+                        Start-Sleep -Seconds 3
+                        Write-WatchLog "vmcompute restarted (pre-emptive, cleared stale HCS state)"
+                    } catch {
+                        Write-WatchLog "vmcompute restart failed: $($_.Exception.Message)"
+                    }
                 }
             }
         }
@@ -732,6 +789,62 @@ function Test-HcsStateHealth {
     if ($issues.Count -gt 0) {
         return ($issues -join "; ")
     }
+    return $null
+}
+
+function Test-GuestConnectionHealth {
+    <#
+    .SYNOPSIS
+        Monitors cowork-service.log for isGuestConnected RPC timeout patterns.
+        Returns $null if healthy, or a trigger string if guest connection is failing.
+    #>
+    # Skip during startup grace period
+    if (Test-StartupGracePeriod) { return $null }
+
+    $candidatePaths = @(
+        (Join-Path $env:ProgramData "Claude\Logs\cowork-service.log"),
+        (Join-Path $ClaudeAppData "logs\cowork-service.log")
+    )
+    $svcLogPath = $null
+    foreach ($p in $candidatePaths) {
+        if (Test-Path $p) { $svcLogPath = $p; break }
+    }
+    if (-not $svcLogPath) { return $null }
+
+    try {
+        $lines = Get-Content $svcLogPath -Tail 100 -ErrorAction Stop
+        $now = Get-Date
+        $recentLines = @()
+        foreach ($line in $lines) {
+            # Handle both "HH:mm:ss.fff" and "yyyy-MM-dd HH:mm:ss.fff" formats
+            if ($line -match '^\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})') {
+                try {
+                    $ts = [datetime]::ParseExact($Matches[1].Trim(), "yyyy-MM-dd HH:mm:ss.fff",
+                        [System.Globalization.CultureInfo]::InvariantCulture)
+                    if (($now - $ts).TotalSeconds -le 60) {
+                        $recentLines += $line
+                    }
+                } catch {}
+            } elseif ($line -match '^\s*(\d{2}:\d{2}:\d{2}\.\d{3})') {
+                try {
+                    $ts = [datetime]::ParseExact($Matches[1], "HH:mm:ss.fff",
+                        [System.Globalization.CultureInfo]::InvariantCulture)
+                    $ts = $now.Date.Add($ts.TimeOfDay)
+                    if ($ts -gt $now) { $ts = $ts.AddDays(-1) }
+                    if (($now - $ts).TotalSeconds -le 60) {
+                        $recentLines += $line
+                    }
+                } catch {}
+            }
+        }
+
+        $polls = @($recentLines | Where-Object { $_ -match "method=isGuestConnected" })
+        $responses = @($recentLines | Where-Object { $_ -match "Sent response" })
+
+        if ($polls.Count -gt 10 -and $responses.Count -eq 0) {
+            return "Guest connection timeout: $($polls.Count) polls, 0 responses in 60s"
+        }
+    } catch {}
     return $null
 }
 
@@ -869,7 +982,9 @@ function Test-UserActivity {
         }
 
         # Check 3: VM log active within 120s (was 30s -- covers Code thinking phases)
-        $vmLog = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+        $vmLog = Join-Path $ClaudeLogDir "coworkd.log"
+        if (-not (Test-Path $vmLog)) { $vmLog = Join-Path $ClaudeLogDir "cowork_vm_node.log" }
+        if (-not (Test-Path $vmLog)) { $vmLog = Join-Path $ClaudeLogDirAD "cowork_vm_node.log" }
         if (Test-Path $vmLog) {
             $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
             if ($ageSec -lt 120) {
@@ -913,7 +1028,9 @@ function Test-CoworkSessionActive {
         have zero local CPU but are still actively running. This check
         prevents Watch from killing Claude during those gaps.
     #>
-    $vmLogFile = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+    $vmLogFile = Join-Path $ClaudeLogDir "coworkd.log"
+    if (-not (Test-Path $vmLogFile)) { $vmLogFile = Join-Path $ClaudeLogDir "cowork_vm_node.log" }
+    if (-not (Test-Path $vmLogFile)) { $vmLogFile = Join-Path $ClaudeLogDirAD "cowork_vm_node.log" }
     if (-not (Test-Path $vmLogFile)) { return $false }
     try {
         # Only read the last 200 lines to stay fast
@@ -948,6 +1065,16 @@ function Test-CoworkSessionActive {
 
 function Invoke-AutoFix {
     param([string]$Reason)
+
+    # Do not trigger auto-fix if Fix-ClaudeDesktop is already running
+    try {
+        $fixMutex = [System.Threading.Mutex]::OpenExisting("Global\ClaudeDesktopFix_v4.8")
+        $fixMutex.Dispose()
+        Write-WatchLog "AUTO-FIX SKIPPED: Fix-ClaudeDesktop is already running"
+        return
+    } catch {
+        # Mutex does not exist -- Fix is not running, proceed
+    }
 
     $now = Get-Date
     $elapsed = ($now - $script:LastFixTime).TotalMinutes
@@ -1087,7 +1214,9 @@ function Invoke-AutoFix {
 
     # Cancel if VM log became active during the 30s window
     if (-not $cancelFix) {
-        $vmLog = Join-Path $ClaudeLogDir "cowork_vm_node.log"
+        $vmLog = Join-Path $ClaudeLogDir "coworkd.log"
+        if (-not (Test-Path $vmLog)) { $vmLog = Join-Path $ClaudeLogDir "cowork_vm_node.log" }
+        if (-not (Test-Path $vmLog)) { $vmLog = Join-Path $ClaudeLogDirAD "cowork_vm_node.log" }
         if (Test-Path $vmLog) {
             $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
             if ($ageSec -lt 120) { $cancelFix = $true; $cancelReason = "VM log became active" }
@@ -1159,10 +1288,11 @@ function Invoke-AutoFix {
     $script:EventLogHitCount   = 0
     $script:HeartbeatFailCount = 0
     $script:VmcomputeLeakCount = 0
+    $script:GuestFailCount     = 0
 }
 
 # -- Prevent duplicate instances -----------------------------------------
-$mutexName = "Global\ClaudeHealthMonitor_v4.8.6"
+$mutexName = "Global\ClaudeHealthMonitor_v5.0.0"
 $script:Mutex = $null
 try {
     $script:Mutex = [System.Threading.Mutex]::new($false, $mutexName)
@@ -1184,7 +1314,7 @@ Write-WatchLog "  Cooldown      : ${Cooldown} min"
 Write-WatchLog "  Fix script    : $fixScript"
 Write-WatchLog "  Log directory : $ClaudeLogDir"
 Write-WatchLog "  Safety        : user-activity block, 180s grace period, consecutive-check gates, cowork-session awareness"
-Write-WatchLog "  Monitors      : logs, service(x2), events(x2)+HCS, NAT, heartbeat(x3), staleness(x5), vmcompute-health, hcs-state, time sync"
+Write-WatchLog "  Monitors      : logs, service(x2), events(x2)+HCS, NAT, heartbeat(x3), staleness(x5), vmcompute-health, hcs-state, guest-connect(x3), time sync"
 Write-WatchLog "================================================================"
 
 try {
@@ -1257,9 +1387,8 @@ try {
                         # Don't auto-fix -- this is informational + pre-emptive cleanup
                         # Try hcsdiag close for stale VMs proactively
                         try {
-                            $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
-                            if (Test-Path $hcsdiagPath) {
-                                $hcsList = & $hcsdiagPath list 2>&1 | Out-String
+                            $hcsList = Invoke-HcsDiag -Arguments "list"
+                            if ($hcsList) {
                                 $vmEntries = ([regex]::Matches($hcsList, "cowork-vm")).Count
                                 if ($vmEntries -gt 1) {
                                     # Parse all cowork-vm GUIDs
@@ -1278,8 +1407,29 @@ try {
                                     if ($vmGuids.Count -gt 1) {
                                         $staleGuids = $vmGuids[0..($vmGuids.Count - 2)]
                                         foreach ($guid in $staleGuids) {
-                                            & $hcsdiagPath close $guid 2>&1 | Out-Null
-                                            Write-WatchLog "HCS: proactively closed stale cowork-vm ($guid)"
+                                            # Validate GUID format before closing
+                                            if ($guid -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+                                                Write-WatchLog "HCS: skipping invalid GUID: $guid"
+                                                continue
+                                            }
+                                            # Double-check this GUID is actually a cowork-vm
+                                            $verifyList = Invoke-HcsDiag -Arguments "list"
+                                            if ($verifyList) {
+                                                $lines = $verifyList -split "`r?`n"
+                                                $guidIdx = $null
+                                                for ($i = 0; $i -lt $lines.Count; $i++) {
+                                                    if ($lines[$i] -match $guid) { $guidIdx = $i; break }
+                                                }
+                                                if ($null -ne $guidIdx) {
+                                                    $contextWindow = ($lines[($guidIdx)..([math]::Min($guidIdx + 2, $lines.Count - 1))]) -join " "
+                                                    if ($contextWindow -match "cowork-vm") {
+                                                        Invoke-HcsDiag -Arguments "close",$guid | Out-Null
+                                                        Write-WatchLog "HCS: proactively closed stale cowork-vm ($guid)"
+                                                    } else {
+                                                        Write-WatchLog "HCS: GUID $guid is not cowork-vm -- skipping close"
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1291,6 +1441,20 @@ try {
                     if ($script:LastHcsStateLogTime -ne [datetime]::MinValue) {
                         $script:LastHcsStateLogTime = [datetime]::MinValue
                     }
+                }
+
+                # Check 10: Guest connection health (cowork-service.log)
+                $guestHealth = Test-GuestConnectionHealth
+                if ($guestHealth) {
+                    $script:GuestFailCount++
+                    Write-WatchLog "CHECK 10 FAIL ($($script:GuestFailCount)/3): $guestHealth"
+                    if ($script:GuestFailCount -ge 3) {
+                        Invoke-AutoFix -Reason "guest-connect-timeout"
+                        $script:GuestFailCount = 0
+                        continue
+                    }
+                } else {
+                    $script:GuestFailCount = 0
                 }
 
                 # ---- Maintenance (non-fix actions) ----

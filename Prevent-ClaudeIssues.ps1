@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 4.8.6
+    Version : 2.0.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -73,7 +73,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "4.8.6"
+$Version          = "2.0.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -1189,10 +1189,25 @@ if ($Undo) {
                 Unregister-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
-            # Wrap in a delayed command: wait 30s after logon before running BootPrep.
-            # Short delay gives vmcompute time to start, but runs before user opens Claude.
+            # Wrap in a delayed command: wait 45s after logon before running BootPrep.
+            # Increased from 30s to avoid race with Claude auto-launch VM construction.
+            # Pre-check: skip if CoworkVMService is already running (Claude got here first)
+            # or if Claude process is running (do not disrupt active session).
             # BootPrep is non-destructive: only restarts vmcompute, does not kill Claude.
-            $delayedCmd = "Start-Sleep -Seconds 30; & '$fixScript' -BootPrep -Quiet"
+            $delayedCmd = @"
+Start-Sleep -Seconds 45
+`$svc = Get-Service -Name 'CoworkVMService' -ErrorAction SilentlyContinue
+if (`$svc -and `$svc.Status -eq 'Running') {
+    # Service already running -- Claude got here first, do not restart vmcompute
+    exit 0
+}
+`$claude = Get-Process -Name 'claude' -ErrorAction SilentlyContinue
+if (`$claude) {
+    # Claude is running -- do not disrupt
+    exit 0
+}
+& '$fixScript' -BootPrep -Quiet
+"@
             $bootAction = New-ScheduledTaskAction -Execute "PowerShell.exe" `
                               -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$delayedCmd`""
 
@@ -1217,12 +1232,12 @@ if ($Undo) {
                 -Trigger $bootTrigger `
                 -Settings $bootSettings `
                 -Principal $bootPrincipal `
-                -Description "Non-destructive vmcompute restart at logon to prevent construct failures." `
+                -Description "Non-destructive vmcompute restart at logon (45s delay, skips if Claude already running)." `
                 -Force | Out-Null
 
-            Log "Boot-fix task created (runs 30s after logon, non-destructive)" -Colour Green -Indent
+            Log "Boot-fix task created (runs 45s after logon, skips if Claude running)" -Colour Green -Indent
             Log "Task: Task Scheduler > $TaskPath$BootTaskName" -Colour DarkGray -Indent
-            Log "Runs: $fixScript -BootPrep -Quiet (after 30s delay)" -Colour DarkGray -Indent
+            Log "Runs: $fixScript -BootPrep -Quiet (after 45s delay, with service pre-check)" -Colour DarkGray -Indent
         } catch {
             Log "[!] Could not create boot task: $($_.Exception.Message)" -Colour Red -Indent
         }

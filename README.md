@@ -31,14 +31,18 @@ VM service not running. The service failed to start.
 ```
 VM boot failed: VM is already running
 ```
+```
+Request timed out: isGuestConnected
+```
 
-Two scripts: one **prevents** the crash, the other **fixes** it when it happens anyway.
+Four tools: one prevents the crash, one fixes it, one monitors health, and one stops Claude cleanly.
 
 | Script | Purpose | Run when |
 |--------|---------|----------|
-| `Prevent-ClaudeIssues.bat` | Configure Windows to minimise crashes | Once |
-| `Fix-ClaudeDesktop.bat` | Reset and relaunch when it breaks | Every time it breaks |
-| `Watch-ClaudeHealth.bat` | Foreground health monitor (auto-installed by Prevent) | Optional / manual |
+| Prevent-ClaudeIssues.bat | Configure Windows to minimise crashes | Once |
+| Fix-ClaudeDesktop.bat | Reset and relaunch when it breaks | Every time it breaks |
+| Stop-ClaudeDesktop.bat | Clean shutdown without repair | When you want to fully close Claude |
+| Watch-ClaudeHealth.bat | Foreground health monitor (auto-installed by Prevent) | Optional / manual |
 
 ---
 
@@ -113,6 +117,10 @@ The underlying HCS error (`failed to create compute system: HcsWaitForOperationR
 - Boot race conditions where services start before the kernel is ready
 - Antivirus filter drivers interfering with compute system creation
 
+### Guest Connection Timeout
+
+A third class of failure occurs after the VM boots but the guest operating system never establishes its connection back to the host. Claude Desktop polls `cowork-svc.exe` via a named pipe (`\\.\pipe\cowork-vm-service`) every ~1 second with `isGuestConnected` RPC calls. If the guest never reports as connected, the UI shows `"Request timed out: isGuestConnected"`. This can be caused by: the VM booting but vsock/networking failing to initialise, `cowork-svc.exe` being CPU-starved by its own Authenticode signature verification loop (each poll re-hashes the 204 MB `claude.exe` binary, consuming ~960ms per call), or HCS state corruption preventing guest-host communication. The service log at `C:\ProgramData\Claude\Logs\cowork-service.log` records each RPC call. See issue #31848 for the Authenticode CPU burn.
+
 ### Tracked Issues
 
 - [#26554](https://github.com/anthropics/claude-code/issues/26554) -- VirtioFS mount fails with "bad address" (closed March 18 2026 as "completed" -- no linked PR or fix details; underlying architecture unchanged)
@@ -125,6 +133,8 @@ The underlying HCS error (`failed to create compute system: HcsWaitForOperationR
 - [#32172](https://github.com/anthropics/claude-code/issues/32172) -- HCS 0x800707DE construct failure after VirtioFS mount error (still open as of March 2026, no Anthropic response)
 - [#29045](https://github.com/anthropics/claude-code/issues/29045) — Claude Desktop spawns Hyper-V VM on every launch, even for chat-only use
 - [#27801](https://github.com/anthropics/claude-code/issues/27801) — "Failed to start Claude's workspace" — VM service not running, persists after reboot
+- [#31848](https://github.com/anthropics/claude-code/issues/31848) -- cowork-svc.exe CPU burn from Authenticode re-verification on every isGuestConnected poll (still open as of March 2026)
+- [#31314](https://github.com/anthropics/claude-code/issues/31314) -- cowork-svc.exe 195 MB/s sustained I/O from signature polling loop (still open as of March 2026)
 
 ---
 
@@ -161,7 +171,7 @@ The menu is skipped when:
 | 6 | Smart cache purge: backs up session VHDXs, nukes VM cache, restores session data; cleans temp files and legacy paths |
 | 7 | Restarts CoworkVMService (admin) or defers to Claude auto-restart (non-admin); restores VHDX backups |
 | 8 | Relaunches Claude Desktop with elevated privileges via scheduled task (Method 0), falling back to MSIX shell protocol or direct exe launch |
-| 9 | Monitors cowork_vm_node.log for boot completion, confirms workspace is ready |
+| 9 | Monitors coworkd.log and cowork-service.log for boot completion and guest connection state, confirms workspace is ready |
 
 **Step 8** first attempts to relaunch Claude with elevated privileges via the `LaunchClaudeAdmin` scheduled task created by Prevent (Method 0). This gives Claude a full admin token without a UAC prompt. If the task doesn't exist or fails, it falls through to three standard methods: Method A launches MSIX installs via `shell:AppsFolder` protocol (no duplicate taskbar icons), Method B launches traditional `.exe` installs directly, and Method C uses Start Menu shortcuts as a last resort. All methods respect `-WhatIf` and each has a `$launched` guard to prevent double-launch.
 
@@ -169,7 +179,7 @@ The menu is skipped when:
 
 **Step 3** checks recent Windows Event Log entries and Claude logs for HCS error patterns (`HCS operation failed`, `failed to create compute system`, `HcsWaitForOperationResult`). If detected and running as admin, it stops and restarts the `vmcompute` service. If `vmcompute` fails to restart within 15 seconds, it escalates: first restarting `vmms` (Virtual Machine Management), then in Deep mode only, restarting `HvHost` (which affects all Hyper-V VMs). This step is wrapped in a try/catch so failures don't block the rest of the fix process. Without admin, HCS errors are logged but require manual elevation.
 
-**Step 9** monitors the VM boot log for definitive completion markers (`"Startup complete"`, `"[Keepalive]"`), showing real-time progress through the boot stages. Falls back to Hyper-V heartbeat checks and directory monitoring if logs are unavailable. After completion, the PowerShell window is brought to the foreground and the taskbar icon flashes until you dismiss it.
+**Step 9** monitors the VM boot log for definitive completion markers (`"Startup complete"`, `"[Keepalive]"`), showing real-time progress through the boot stages. Additionally monitors `cowork-service.log` for `isGuestConnected` RPC state -- if the guest reports connected, this accelerates readiness detection; if guest-timeout is detected after 90 seconds, performs targeted recovery (HCS cleanup + service restart) instead of waiting for the full 240-second timeout. Falls back to Hyper-V heartbeat checks and directory monitoring if logs are unavailable. After completion, the PowerShell window is brought to the foreground and the taskbar icon flashes until you dismiss it.
 
 **Step 6 -- Smart Cache Purge:** Instead of blindly deleting everything, the script now backs up `sessiondata.vhdx` and `smol-bin.vhdx` before purging (with VHDX header integrity validation), then restores them after the service restart. If `smol-bin.vhdx` can't be backed up, it attempts recovery from the MSIX package. The step also cleans Claude temp files (`%TEMP%\anthropic-*`, `%TEMP%\claude-*`) and legacy `AnthropicClaude\sessions` and `vm-state` directories. Quick mode skips this step entirely.
 
@@ -194,7 +204,7 @@ The menu is skipped when:
 
 ### Diagnostics
 
-Each run writes a timestamped log to `%APPDATA%\Claude\fix-logs\`. Recent `CoworkVMService` errors from the Windows Event Log are shown in the summary.
+Each run writes a timestamped log to `%APPDATA%\Claude\fix-logs\`. The health monitor logs to `%APPDATA%\Claude\watch-logs\`. Recent CoworkVMService errors from the Windows Event Log are shown in the summary.
 
 ---
 
@@ -219,7 +229,7 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 11 | VM worker priority | AboveNormal | Prevents host from deprioritizing vmwp.exe under load |
 | 12 | HCS service recovery | Auto-restart 30s/60s/120s | Configures vmcompute to auto-restart on failure with escalating delays |
 | 13 | CoworkVMService recovery | Auto-restart 10s/30s/60s | Configures CoworkVMService to auto-restart on failure (independent of vmcompute) |
-| 14 | HCS state cleanup | Pre-emptive close | Closes stale cowork-vm entries in HCS before they accumulate and cause 0xC037010D errors |
+| 14 | HCS state cleanup | Pre-emptive close | Closes stale cowork-vm entries in HCS before they accumulate and block new VM creation |
 | 15 | Service startup timeout | 120000ms | Prevents boot race conditions where services start before dependencies are ready |
 | 16 | WinNAT rules | Verified / repaired | Ensures VM has outbound network connectivity |
 | 17 | Firewall policies | Checked | Detects Group Policy blocking Hyper-V network rules |
@@ -228,7 +238,7 @@ Run once. Configures Windows to keep the Cowork VM alive as long as possible.
 | 20 | Antivirus exclusions | Configured / advised | Prevents AV filter drivers from blocking VirtioFS disk ops |
 | 21 | WSL2 conflict detection | Checked | Warns about WSL2 distros and Docker Desktop that may conflict with Claude's VM |
 | 22 | Health monitor | Every 30 seconds | Detects VirtioFS errors and auto-runs the full fix script |
-| 23 | Boot-fix task | At logon | Runs the full fix script at every logon for a clean start |
+| 23 | Boot-fix task | At logon (45s delay) | Runs the full fix script at every logon for a clean start |
 | 24 | Shortcuts | Desktop + Start Menu | Quick access to Fix-ClaudeDesktop |
 | 25 | Claude elevation | Scheduled task + Desktop shortcut | Ensures Claude Desktop launches with full admin privileges |
 | 26 | Admin token policy | LocalAccountTokenFilterPolicy=1 | Disables remote/network admin token filtering |
@@ -251,7 +261,7 @@ Battery settings are not changed -- laptop users keep normal battery behaviour.
 
 ### HCS State Cleanup
 
-**HCS state cleanup** (step 14) -- Over time, stale `cowork-vm` entries can accumulate in the Host Compute Service after unclean shutdowns. These orphan entries cause `0xC037010D` errors ("The virtual machine or container exited unexpectedly") when the service tries to create a new compute system. The prevention script proactively enumerates HCS entries via `hcsdiag list` and closes any stale cowork-vm instances. This is also performed by the health monitor on every cycle (Check 8) and by the fix script during cache purge.
+**HCS state cleanup** (step 14) -- Over time, stale `cowork-vm` entries can accumulate in the Host Compute Service after unclean shutdowns. These orphan entries can block new VM creation when the service tries to create a new compute system. The prevention script proactively enumerates HCS entries via `hcsdiag list` and closes any stale cowork-vm instances. This is also performed by the health monitor on every cycle (Check 8) and by the fix script during cache purge.
 
 **Service startup timeout** (step 15) -- The default `ServicesPipeTimeout` of 30 seconds can be too short on heavily loaded systems or during Windows Update reboots. If services like `vmcompute` don't start within this window, dependent services fail silently. Setting it to 120 seconds (120000ms) gives boot-time services more room. This is idempotent -- if the timeout is already >=120000ms (set by another tool), it's left untouched. Requires a reboot to take effect.
 
@@ -271,9 +281,9 @@ Battery settings are not changed -- laptop users keep normal battery behaviour.
 
 ### The Health Monitor
 
-A persistent background process that starts at logon and polls every 30 seconds. It monitors nine sources for VirtioFS failures:
+A persistent background process that starts at logon and polls every 30 seconds. It monitors ten sources for VirtioFS failures:
 
-1. **Claude log files** -- scans all `*.log` files in `%APPDATA%\Claude\logs\` for error patterns like "Plan9 mount failed" and "bad address"
+1. **Claude log files** -- scans coworkd.log in `C:\ProgramData\Claude\Logs\` (with `%APPDATA%\Claude\logs\` fallback) for error patterns like "Plan9 mount failed" and "bad address"
 2. **Service status** -- detects when `CoworkVMService` stops while `claude.exe` is still running (2 consecutive checks)
 3. **Windows Event Log** -- checks for Claude-specific `CoworkVMService` errors and Hyper-V Worker/VMMS errors (2 consecutive checks, Claude-only matching)
 4. **WinNAT health** -- detects missing NAT rules and auto-repairs them (every 60 seconds, warning only)
@@ -281,7 +291,8 @@ A persistent background process that starts at logon and polls every 30 seconds.
 6. **VM log staleness** -- catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if VM was previously active)
 7. **Clock drift** -- checks NTP drift every 5 minutes and auto-resyncs if >5 seconds (warning only)
 8. **vmcompute health** -- monitors `vmcompute.exe` handle count every 60 seconds. Warning at 5000 handles, critical trigger at 10000 handles (2 consecutive checks required). Catches handle leaks that precede HCS failures
-9. **HCS state health** -- monitors for stale cowork-vm entries in HCS via hcsdiag and tracks 0xC037010D shutdown failure frequency in the Hyper-V Compute event log. Proactively closes stale VMs (keeping the active one) and auto-restarts vmcompute if >5 shutdown failures occur within 5 minutes
+9. **HCS state health** -- monitors for stale cowork-vm entries in HCS via hcsdiag and tracks 0xC037010D shutdown failure frequency in the Hyper-V Compute event log. Proactively closes stale VMs (keeping the active one) and auto-restarts vmcompute if >15 shutdown failures occur within 5 minutes. Guarded by active session detection and Fix mutex check to prevent interference with running sessions
+10. **Guest connection health** -- monitors `cowork-service.log` for `isGuestConnected` RPC polling patterns. Detects sustained polling with zero guest responses, indicating a guest connection timeout (3 consecutive checks required before trigger)
 
 ### Safety Features (v4.3)
 
@@ -295,7 +306,7 @@ The entire toolkit is designed to **never interrupt active work** — whether yo
 - **Extended VM log window** -- activity check uses 120s window (was 30s). Code's "thinking" phases can leave the VM log quiet for minutes; the old 30s window caused false negatives
 - **User input window** -- 3 minutes (was 2). More buffer for reading/reviewing before auto-fix considers you idle
 - **Fix script activity guard** -- `Fix-ClaudeDesktop.ps1` itself now checks for active use when called with `-Quiet` (by the monitor or boot task). Three checks: CPU sampling, VM log, user input. Blocks and exits if anything is active. Manual runs (no `-Quiet`) always proceed
-- **BootPrep mode** (v4.8.4) -- the logon task now uses non-destructive `-BootPrep` mode with a 30-second delay instead of the previous 180-second full fix. It unconditionally restarts `vmcompute` for a clean HCS state without killing Claude, stopping services, or purging cache. If Claude is already running with an active workspace, it exits silently
+- **BootPrep mode** (v4.8.4) -- the logon task now uses non-destructive `-BootPrep` mode with a 45-second delay instead of the previous 180-second full fix. It unconditionally restarts `vmcompute` for a clean HCS state without killing Claude, stopping services, or purging cache. If Claude is already running with an active workspace, it exits silently
 - **Startup grace period** -- all heuristic checks (including log scanning, event log, heartbeat, staleness) are skipped for the first 180 seconds after the monitor starts, preventing false triggers from pre-existing events
 - **Consecutive-check gates** -- every heuristic trigger requires multiple consecutive failures before firing (service: 2, event log: 2, heartbeat: 3, staleness: 5). Only the log-file pattern check (actual VirtioFS error strings) triggers immediately
 - **Tightened event log matching** -- Hyper-V VMMS events must mention "claude" or "cowork" (no generic "failed"/"unexpected" matching). Worker events: Critical/Error only
@@ -304,6 +315,9 @@ The entire toolkit is designed to **never interrupt active work** — whether yo
 - **30s pre-fix warning with notification** -- before any auto-fix, a Windows balloon notification with an audible chime warns you. You have 30 seconds to switch to Claude to cancel. If you don't, the fix proceeds. If you do switch to Claude, the fix cancels and a second notification tells you to run Fix-ClaudeDesktop.bat manually if Cowork is broken
 - **Smart cancellation** -- the 30s grace period only cancels if Claude is *actively being used* (foreground window, CPU activity, VM log alive, or active Code session). General mouse/keyboard activity in other apps does **not** cancel the fix — so a genuinely hung VM still gets repaired while you're browsing or gaming
 - **Default Switch NAT awareness** -- the NAT health check now recognises Hyper-V's "Default Switch" as providing NAT natively (via HNS), eliminating false "WinNAT missing" warnings on standard configurations
+- **Invoke-HcsDiag timeout wrapper** (v5.0.0) -- all hcsdiag calls across Fix and Watch are wrapped with a 15-second Start-Job timeout to prevent indefinite hangs when HCS is corrupted
+- **vmcompute restart session guard** (v5.0.0) -- the health monitor checks for active Claude sessions and Fix mutex before restarting vmcompute, preventing disruption of running Cowork sessions
+- **ServiceTimeout raised** (v5.0.0) -- Fix script service stop timeout increased from 8s to 30s, preventing premature force-kills that cause HCS corruption
 
 When a failure is detected **and the user is idle**, it shows a warning notification with a 30-second countdown, then runs `Fix-ClaudeDesktop.ps1 -Quiet`. If you switch to Claude during the countdown, the fix cancels and you're notified to run it manually. If the user was already detected as active before the countdown, it logs a `BLOCKED` message and waits.
 
@@ -331,17 +345,17 @@ These three settings are the most commonly overlooked causes of VirtioFS failure
 
 ### The Boot-Fix Task
 
-A scheduled task runs at every user logon as the current user (elevated). It waits **30 seconds** (to let Windows services initialise), then executes `Fix-ClaudeDesktop.ps1 -BootPrep -Quiet` for a non-destructive vmcompute preparation.
+A scheduled task runs at every user logon as the current user (elevated). It waits 45 seconds (to let Windows services initialise), then executes `Fix-ClaudeDesktop.ps1 -BootPrep -Quiet` for a non-destructive vmcompute preparation.
 
 **BootPrep mode** (added in v4.8.4) is a lightweight, non-destructive boot preparation mode that:
 
-1. Waits up to 30 seconds for `vmcompute` to be running
+1. Waits up to 45 seconds for `vmcompute` to be running
 2. Checks for an active Cowork workspace via `hcsdiag` — if Claude is already running with an active VM, it exits cleanly
 3. Cleans any stale VMs left from a previous session (only if Claude is not running)
 4. **Unconditionally restarts `vmcompute`** to ensure a fresh HCS state before Claude launches
 
 Unlike the previous approach (v4.8.0–v4.8.3 used `-SkipLaunch -Quiet` with a 180-second delay), BootPrep:
-- Runs in 30 seconds instead of 180, so the system is ready faster
+- Runs in 45 seconds instead of 180, so the system is ready faster
 - Never kills Claude processes or stops CoworkVMService
 - Never purges cache or touches VM bundle files
 - Is safe to run even if Claude is already open (it detects and exits)
@@ -405,8 +419,35 @@ If you have third-party antivirus, add the recommended exclusion paths shown by 
 **Claude launches with a duplicate taskbar icon**
 When using the "Claude (Admin)" shortcut, MSIX installs will show a second Claude icon on the taskbar. This is expected -- Windows enforces medium integrity for MSIX apps launched through the shell protocol (`shell:AppsFolder`), so the only way to get a full admin token is to launch the `.exe` directly, which bypasses icon grouping. Close the non-admin Claude first if you want a single icon. The regular fix script (`Fix-ClaudeDesktop`) uses the shell protocol and does not have this issue.
 
+**"Request timed out: isGuestConnected"**
+The VM booted but the guest OS did not connect back to the host. Run `Fix-ClaudeDesktop.bat` -- Step 9 now detects this specific failure and performs targeted recovery (HCS cleanup + service restart). If it recurs frequently, the Authenticode verification loop in `cowork-svc.exe` may be starving the service of CPU. See issue #31848. The health monitor (installed by Prevent) also detects this pattern automatically.
+
 **Logs are piling up in `%APPDATA%\Claude\fix-logs\`**
 The fix script auto-cleans logs older than 30 days. You can safely delete everything in that folder manually if needed.
+
+---
+
+## Stop-ClaudeDesktop
+
+Clean shutdown without repair. Double-click `Stop-ClaudeDesktop.bat` when you want to fully close Claude Desktop without triggering a fix cycle.
+
+### What It Does
+
+1. Stops `CoworkVMService` gracefully (waits up to 45s for the VM to shut down)
+2. Cleans any remaining HCS compute systems
+3. Kills all Claude Desktop UI processes
+4. Restarts the service in idle state (ready for next launch)
+5. Verifies clean state
+
+The service is restarted after stopping because Windows ignores ETW named pipe triggers for manually-stopped services. Without the restart, opening Claude Desktop would fail to auto-start `CoworkVMService`.
+
+### When to Use
+
+- Before a planned reboot
+- When you want to fully close Claude without leaving VM processes behind
+- When Claude is misbehaving and you want a clean stop before reopening
+
+Unlike `Fix-ClaudeDesktop`, this does not purge cache, restart HCS services, or relaunch Claude.
 
 ---
 
@@ -424,7 +465,7 @@ After a reboot, Claude Desktop may briefly close and reopen itself on the first 
 
 **This does not affect functionality.** No data is lost, no settings are changed, and the workspace starts correctly. ClaudeFix's BootPrep mode prevents the more serious `0x800707DE` construct failure — the close-reopen is a separate Claude Desktop bug that cannot be fixed externally.
 
-Relevant log pattern in `%APPDATA%\Claude\logs\cowork_vm_node.log`:
+Relevant log pattern in `C:\ProgramData\Claude\Logs\coworkd.log` (or legacy `%APPDATA%\Claude\logs\cowork_vm_node.log`):
 ```
 [VM:start] Beginning startup, VM instance ID: ...
 [VM:start] Beginning startup, VM instance ID: ...  (duplicate)
@@ -439,6 +480,7 @@ Auto-reinstalling workspace after startup failure
 ```
 Fix-ClaudeDesktop.bat       -- Fix launcher (double-click when broken)
 Fix-ClaudeDesktop.ps1       -- Fix script
+Stop-ClaudeDesktop.bat      -- Clean shutdown launcher (double-click to stop Claude)
 Prevent-ClaudeIssues.bat    -- Prevention launcher (run once)
 Prevent-ClaudeIssues.ps1    -- Prevention script
 Watch-ClaudeHealth.bat      -- Health monitor launcher (manual foreground mode)
@@ -447,11 +489,40 @@ README.md                   -- This file
 LICENSE                     -- MIT licence
 ```
 
-Current versions: Fix 4.8.5, Watch 4.8.5, Prevent 4.8.5
+Current versions: Fix 5.3.1, Watch 5.0.0, Prevent 2.0.0
 
 ---
 
 ## Changelog
+
+### v5.3.1 -- Close Mode Fix (2026-03-23)
+
+- **Close mode rewrite** (Fix) -- stop-then-restart pattern. Stops CoworkVMService (triggers graceful VM shutdown ~31s), cleans HCS orphans, kills Claude UI, restarts service so it is ready for the next launch. Fixes the Windows behaviour where manually-stopped services ignore ETW named pipe triggers
+- **Stop-ClaudeDesktop.bat** -- new launcher for clean shutdown via Close mode. Double-click to stop Claude without running a repair
+- **Test-RecentHcsErrors Admin log fix** (Fix) -- Admin log code path now skips 0xC037010D events with continue instead of returning shutdown_stale, which was bypassing the >15 threshold on any single event
+- **Version bump** -- Fix updated to v5.3.1
+
+### v5.0.0 -- HCS Safety & Close Mode (2026-03-23)
+
+- **Invoke-HcsDiag helper** (Fix + Watch) -- all hcsdiag calls wrapped with Start-Job + 15s timeout to prevent indefinite hangs when HCS is corrupted. 14 call sites in Fix, 3 in Watch
+- **ServiceTimeout raised** (Fix) -- service stop timeout increased from 8s to 30s. Prevents premature force-kills that cause HCS state corruption
+- **Graceful service polling** (Fix) -- WaitForStatus replaced with polling loop, preventing PowerShell timeout exceptions during slow VM shutdowns
+- **VHDX handle verification** (Fix) -- 3 sites now verify VHDX files are not locked before backup/restore operations
+- **0xC037010D threshold raised** (Fix) -- from 8 to 15 in Test-RecentHcsErrors. This event occurs on every normal VM shutdown (property query bug) and is not a blocker
+- **vmcompute restart guards** (Watch) -- active session detection + Fix mutex check before vmcompute restart. Threshold raised from >5 to >15. Prevents disrupting running Cowork sessions
+- **Log paths updated** (Fix + Watch) -- primary log path changed to C:\ProgramData\Claude\Logs\coworkd.log with fallback to %APPDATA%\Claude\logs\cowork_vm_node.log
+- **BootPrep delay increased** (Prevent) -- boot-fix task delay raised from 30s to 45s with smart pre-check: skips if CoworkVMService or Claude is already running
+- **Version bump** -- Fix 5.0.0, Watch 5.0.0, Prevent 2.0.0
+
+### v4.9.0 -- Guest Connection Timeout Detection (2026-03-22)
+
+- **New detection source** (Fix) -- reads `C:\ProgramData\Claude\Logs\cowork-service.log` for `isGuestConnected` RPC state via new `Test-CoworkServiceLog` helper
+- **Guest timeout in HCS detection** (Fix) -- `Test-RecentHcsErrors` now returns `"guest_connect_failure"` when repeated `isGuestConnected` polls get no guest response
+- **Targeted Step 9 recovery** (Fix) -- when guest-timeout is detected after 90s, performs HCS cleanup + service restart instead of waiting for the full 240s timeout
+- **Guest connection health monitor** (Watch) -- new Check 10 monitors `cowork-service.log` for sustained `isGuestConnected` polling with zero guest responses (3 consecutive checks required before trigger)
+- **Error patterns expanded** (Watch) -- added `isGuestConnected` timeout patterns to log-scan error list
+- **README updated** with `isGuestConnected` error documentation, new tracked issues (#31848, #31314), troubleshooting entry, and updated step descriptions
+- **Version bump** -- Fix and Watch updated to v4.9.0
 
 ### v4.8.6 -- Audit Cleanup (2026-03-22)
 - **Dead code removal** (Fix) -- removed legacy $SkipLaunch vmcompute restart path from Step 3 (obsoleted by BootPrep in v4.8.4)
@@ -511,7 +582,7 @@ Current versions: Fix 4.8.5, Watch 4.8.5, Prevent 4.8.5
 - **Grace period increased from 90s to 180s** -- gives Claude's VM more time to initialise before heuristic checks start
 - **Persistent failure backoff** -- if the fix script runs 3+ times within 30 minutes and the problem persists, the watchdog stops retrying and shows a notification with Hyper-V nuclear reset instructions (DISM disable/enable)
 - **Fix script mutual exclusion** -- a global mutex (`Global\ClaudeDesktopFix_v4.6`) prevents concurrent Fix runs from the watchdog, boot-fix task, and manual invocation
-- **HCS JSON corruption detection** -- `Test-RecentHcsErrors` now distinguishes fatal 0xC037010D ("Invalid JSON document") from recoverable HCS errors, and warns the user that a Hyper-V nuclear reset is needed
+- **HCS JSON corruption detection** -- `Test-RecentHcsErrors` now detects Invalid JSON document patterns in HCS error logs (distinct from normal 0xC037010D shutdown events), and warns the user that a Hyper-V nuclear reset is needed
 - **Watchdog delayed 120s at logon** -- was immediate; prevents the watchdog from racing Claude's own VM initialisation
 - **Boot-fix delayed 180s at logon** -- was 90s; same race condition mitigation
 
@@ -537,4 +608,4 @@ MIT
 
 ---
 
-*Built out of frustration with rebooting the PC every time Claude decides to break.*
+*Out of frustration, built with [Claude Desktop](https://claude.ai), for [Anthropic](https://github.com/anthropics).*
