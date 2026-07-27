@@ -1,5 +1,7 @@
 # Claude Desktop / Cowork VM Fix for Windows
 
+> **Maintenance status (2026-07-27):** Hotfix-only / dormant. No active development; bug reports for breakage on current Claude Desktop builds will be triaged and patched as one-off fixes, but no new features or proactive Claude-build tracking. If a Claude Desktop update breaks the toolkit and no fix lands within 7 days of report, file an issue and use the manual recovery steps in the Troubleshooting section.
+
 **Fix "VirtioFS mount failed", "HCS operation failed", and "Failed to start Claude's workspace" errors in Claude Desktop Cowork mode on Windows — without rebooting.**
 
 If you're seeing any of these errors in Claude Desktop's Cowork mode, this toolkit will fix and prevent them:

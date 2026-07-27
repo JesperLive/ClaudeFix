@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 2.0.0
+    Version : 2.0.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -73,13 +73,14 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version          = "2.0.0"
+$Version          = "2.0.1"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
 $ServiceName      = "CoworkVMService"
-$BackupFile       = Join-Path $env:APPDATA "Claude\power-plan-backup.txt"
-$CsBackupFile     = Join-Path $env:APPDATA "Claude\connected-standby-backup.txt"
+$ClaudeAppData    = Join-Path $env:APPDATA "Claude"
+$BackupFile       = Join-Path $ClaudeAppData "power-plan-backup.txt"
+$CsBackupFile     = Join-Path $ClaudeAppData "connected-standby-backup.txt"
 
 # -- Helpers ---------------------------------------------------------
 function Log {
@@ -92,6 +93,36 @@ function Log {
 function Step {
     param([int]$Num, [int]$Total, [string]$Message)
     Log "[$Num/$Total] $Message" -Colour Yellow
+}
+
+function Initialize-ClaudeAppData {
+    # %APPDATA%\Claude is created by Claude Desktop on first launch. This script
+    # is meant to be runnable BEFORE Claude Desktop is installed, and it also
+    # self-elevates -- which can land it in a different account's profile that
+    # has never launched Claude. Either way the folder may not exist yet, and
+    # every state file this script writes lives inside it.
+    if (Test-Path -LiteralPath $script:ClaudeAppData) { return $true }
+    try {
+        New-Item -Path $script:ClaudeAppData -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Save-StateFile {
+    param([string]$Path, [string]$Value, [string]$Label)
+    if (-not (Initialize-ClaudeAppData)) {
+        Log "Could not create $script:ClaudeAppData -- $Label not saved" -Colour DarkYellow -Indent
+        return $false
+    }
+    try {
+        $Value | Out-File -FilePath $Path -Encoding ascii -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Log "Could not write $Label -- continuing" -Colour DarkYellow -Indent
+        return $false
+    }
 }
 
 function Get-ActivePlanGuid {
@@ -382,75 +413,95 @@ if ($Undo) {
     # ================================================================
     $steps = 26
 
+    # Claude Desktop may not be installed yet, so its AppData folder may not
+    # exist. Create it up front -- several steps below write state files there.
+    if (-not (Initialize-ClaudeAppData)) {
+        Log "[!] Could not create $ClaudeAppData" -Colour Yellow
+        Log "Backups and state files will be skipped; setup continues" -Colour DarkGray -Indent
+        Write-Host ""
+    }
+
     # ----------------------------------------------------------------
     # 1. Power plan -- Ultimate Performance (with deduplication)
     # ----------------------------------------------------------------
     Step 1 $steps "Configuring power plan..."
-
-    # Back up current plan
-    $currentPlan = Get-ActivePlanGuid
-    if ($currentPlan -match "^[0-9a-fA-F\-]{36}$") {
-        $currentPlan | Out-File -FilePath $BackupFile -Encoding ascii -Force
-        Log "Backed up current plan: $currentPlan" -Colour DarkGray -Indent
-    }
-
-    $ultimateGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
-    $highPerfGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
-
-    # Find all existing "Ultimate Performance" plans
-    $planLines = powercfg /list | Where-Object { $_ -match 'Ultimate Performance' }
-    $ultimatePlans = @()
-    foreach ($line in $planLines) {
-        if ($line -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-            $ultimatePlans += $Matches[1]
-        }
-    }
-
-    if ($ultimatePlans.Count -gt 0) {
-        # Keep the first one, delete the rest
-        $keepGuid = $ultimatePlans[0]
-        if ($ultimatePlans.Count -gt 1) {
-            $deleteCount = 0
-            for ($i = 1; $i -lt $ultimatePlans.Count; $i++) {
-                powercfg /delete $ultimatePlans[$i] 2>$null
-                $deleteCount++
+    try {
+        # Back up current plan
+        $currentPlan = Get-ActivePlanGuid
+        if ($currentPlan -match "^[0-9a-fA-F\-]{36}$") {
+            if (Save-StateFile -Path $BackupFile -Value $currentPlan -Label "power plan backup") {
+                Log "Backed up current plan: $currentPlan" -Colour DarkGray -Indent
             }
-            Log "Cleaned up $deleteCount duplicate Ultimate Performance plan(s)" -Colour DarkGray -Indent
         }
-        powercfg /setactive $keepGuid
-        Log "Set to: Ultimate Performance" -Colour Green -Indent
-    } else {
-        # No Ultimate Performance plan exists -- create one
-        $dupResult = powercfg /duplicatescheme $ultimateGuid 2>&1
-        if ($LASTEXITCODE -eq 0 -and $dupResult -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-            $newGuid = $Matches[1]
-            powercfg /setactive $newGuid
-            Log "Set to: Ultimate Performance (created)" -Colour Green -Indent
-        } else {
-            # Ultimate Performance not available on this system -- fall back to High Performance
-            powercfg /setactive $highPerfGuid
-            Log "Set to: High Performance (Ultimate not available)" -Colour Green -Indent
-        }
-    }
 
-    # Verify activation
-    $verifyPlan = Get-ActivePlanGuid
-    $verifyName = (powercfg /getactivescheme) -replace '.*\(', '' -replace '\).*', ''
-    Log "Active plan verified: $verifyName ($verifyPlan)" -Colour DarkGray -Indent
+        $ultimateGuid = "e9a42b02-d5df-448d-aa00-03f14749eb61"
+        $highPerfGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c"
+
+        # Find all existing "Ultimate Performance" plans
+        $planLines = powercfg /list | Where-Object { $_ -match 'Ultimate Performance' }
+        $ultimatePlans = @()
+        foreach ($line in $planLines) {
+            if ($line -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+                $ultimatePlans += $Matches[1]
+            }
+        }
+
+        if ($ultimatePlans.Count -gt 0) {
+            # Keep the first one, delete the rest
+            $keepGuid = $ultimatePlans[0]
+            if ($ultimatePlans.Count -gt 1) {
+                $deleteCount = 0
+                for ($i = 1; $i -lt $ultimatePlans.Count; $i++) {
+                    powercfg /delete $ultimatePlans[$i] 2>$null
+                    $deleteCount++
+                }
+                Log "Cleaned up $deleteCount duplicate Ultimate Performance plan(s)" -Colour DarkGray -Indent
+            }
+            powercfg /setactive $keepGuid
+            Log "Set to: Ultimate Performance" -Colour Green -Indent
+        } else {
+            # No Ultimate Performance plan exists -- create one
+            $dupResult = powercfg /duplicatescheme $ultimateGuid 2>&1
+            if ($LASTEXITCODE -eq 0 -and $dupResult -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+                $newGuid = $Matches[1]
+                powercfg /setactive $newGuid
+                Log "Set to: Ultimate Performance (created)" -Colour Green -Indent
+            } else {
+                # Ultimate Performance not available on this system -- fall back to High Performance
+                powercfg /setactive $highPerfGuid
+                Log "Set to: High Performance (Ultimate not available)" -Colour Green -Indent
+            }
+        }
+
+        # Verify activation
+        $verifyPlan = Get-ActivePlanGuid
+        $verifyName = (powercfg /getactivescheme) -replace '.*\(', '' -replace '\).*', ''
+        Log "Active plan verified: $verifyName ($verifyPlan)" -Colour DarkGray -Indent
+    } catch {
+        Log "Could not configure power plan -- not critical" -Colour DarkGray -Indent
+    }
 
     # ----------------------------------------------------------------
     # 2. Disable sleep on AC
     # ----------------------------------------------------------------
     Step 2 $steps "Disabling sleep on AC power..."
-    powercfg /change standby-timeout-ac 0
-    Log "Sleep on AC: Never" -Colour Green -Indent
+    try {
+        powercfg /change standby-timeout-ac 0
+        Log "Sleep on AC: Never" -Colour Green -Indent
+    } catch {
+        Log "Could not change sleep timeout -- not critical" -Colour DarkGray -Indent
+    }
 
     # ----------------------------------------------------------------
     # 3. Disable hibernate (also kills Fast Startup)
     # ----------------------------------------------------------------
     Step 3 $steps "Disabling hibernate..."
-    powercfg /h off
-    Log "Hibernate: Off" -Colour Green -Indent
+    try {
+        powercfg /h off
+        Log "Hibernate: Off" -Colour Green -Indent
+    } catch {
+        Log "Could not disable hibernate -- not critical" -Colour DarkGray -Indent
+    }
 
     # ----------------------------------------------------------------
     # 4. Disable USB selective suspend on AC
@@ -469,8 +520,12 @@ if ($Undo) {
     # 5. Disable hard disk sleep + PCI-E power management on AC
     # ----------------------------------------------------------------
     Step 5 $steps "Disabling disk sleep and PCI-E power management on AC..."
-    powercfg /change disk-timeout-ac 0
-    Log "Hard disk sleep on AC: Never" -Colour Green -Indent
+    try {
+        powercfg /change disk-timeout-ac 0
+        Log "Hard disk sleep on AC: Never" -Colour Green -Indent
+    } catch {
+        Log "Could not change disk timeout -- not critical" -Colour DarkGray -Indent
+    }
 
     try {
         $activePlan = Get-ActivePlanGuid
@@ -505,7 +560,7 @@ if ($Undo) {
         $csRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Power"
         $csKey = Get-ItemProperty -Path $csRegPath -Name "CsEnabled" -ErrorAction SilentlyContinue
         if ($null -ne $csKey -and $csKey.CsEnabled -ne $null) {
-            $csKey.CsEnabled.ToString() | Out-File -FilePath $CsBackupFile -Encoding ascii -Force
+            Save-StateFile -Path $CsBackupFile -Value $csKey.CsEnabled.ToString() -Label "Connected Standby backup" | Out-Null
             if ($csKey.CsEnabled -eq 1) {
                 Set-ItemProperty -Path $csRegPath -Name "CsEnabled" -Value 0 -Type DWord -Force
                 Log "Connected Standby: Disabled (was enabled)" -Colour Green -Indent
@@ -593,9 +648,10 @@ if ($Undo) {
                     Log "Dynamic Memory disabled for VM '$vmName'" -Colour Green -Indent
                 } else {
                     Log "VM '$vmName' is running -- Dynamic Memory will be disabled on next restart" -Colour DarkYellow -Indent
-                    $flagFile = Join-Path $env:APPDATA "Claude\disable-dynamic-memory.flag"
-                    $vmName | Out-File -FilePath $flagFile -Encoding ascii -Force
-                    Log "Flag written: $flagFile" -Colour DarkGray -Indent
+                    $flagFile = Join-Path $ClaudeAppData "disable-dynamic-memory.flag"
+                    if (Save-StateFile -Path $flagFile -Value $vmName -Label "dynamic memory flag") {
+                        Log "Flag written: $flagFile" -Colour DarkGray -Indent
+                    }
                 }
             } else {
                 Log "Dynamic Memory already disabled for VM '$vmName'" -Colour DarkGray -Indent
@@ -811,8 +867,7 @@ if ($Undo) {
     # 18. Storage location detection
     # ----------------------------------------------------------------
     Step 18 $steps "Checking workspace storage location..."
-    $claudeAppData = Join-Path $env:APPDATA "Claude"
-    $vmCachePath = Join-Path $claudeAppData "claude-code-vm"
+    $vmCachePath = Join-Path $ClaudeAppData "claude-code-vm"
     $storageWarnings = @()
 
     # Check if APPDATA is on a cloud-sync folder
@@ -1035,8 +1090,14 @@ if ($Undo) {
 
     $wsl2Warnings = @()
 
-    # Check WSL feature
-    $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+    # Check WSL feature (the DISM module is absent on some Windows editions,
+    # which is a command-resolution error that -ErrorAction cannot suppress)
+    $wslFeature = $null
+    try {
+        $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+    } catch {
+        Log "Could not query Windows optional features -- skipping WSL check" -Colour DarkGray -Indent
+    }
     if ($wslFeature -and $wslFeature.State -eq 'Enabled') {
         $wsl2Warnings += "WSL feature is enabled"
 
@@ -1078,28 +1139,33 @@ if ($Undo) {
     Step 22 $steps "Installing health monitor..."
 
     # Find Watch-ClaudeHealth.ps1 in the same folder as this script
-    $myDir = Split-Path $PSCommandPath -Parent
+    $myDir = $null
     $watchScript = $null
-    if ($myDir) {
-        $candidate = Join-Path $myDir "Watch-ClaudeHealth.ps1"
-        if (Test-Path $candidate) { $watchScript = $candidate }
-    }
-    if (-not $watchScript) {
-        $fallbackPaths = @(
-            "C:\ClaudeFix\Watch-ClaudeHealth.ps1",
-            (Join-Path $env:USERPROFILE "Desktop\Watch-ClaudeHealth.ps1"),
-            (Join-Path $env:USERPROFILE "Documents\Watch-ClaudeHealth.ps1")
-        )
-        foreach ($fb in $fallbackPaths) {
-            if (Test-Path $fb) { $watchScript = $fb; break }
+    try {
+        if ($PSCommandPath) { $myDir = Split-Path $PSCommandPath -Parent }
+        if ($myDir) {
+            $candidate = Join-Path $myDir "Watch-ClaudeHealth.ps1"
+            if (Test-Path $candidate) { $watchScript = $candidate }
         }
-    }
+        if (-not $watchScript) {
+            $fallbackPaths = @(
+                "C:\ClaudeFix\Watch-ClaudeHealth.ps1",
+                (Join-Path $env:USERPROFILE "Desktop\Watch-ClaudeHealth.ps1"),
+                (Join-Path $env:USERPROFILE "Documents\Watch-ClaudeHealth.ps1")
+            )
+            foreach ($fb in $fallbackPaths) {
+                if (Test-Path $fb) { $watchScript = $fb; break }
+            }
+        }
 
-    # Clean up old basic watchdog script (replaced by health monitor)
-    $oldWatchdog = Join-Path $env:APPDATA "Claude\cowork-watchdog.ps1"
-    if (Test-Path $oldWatchdog) {
-        Remove-Item $oldWatchdog -Force -ErrorAction SilentlyContinue
-        Log "Removed old basic watchdog script" -Colour DarkGray -Indent
+        # Clean up old basic watchdog script (replaced by health monitor)
+        $oldWatchdog = Join-Path $ClaudeAppData "cowork-watchdog.ps1"
+        if (Test-Path $oldWatchdog) {
+            Remove-Item $oldWatchdog -Force -ErrorAction SilentlyContinue
+            Log "Removed old basic watchdog script" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not locate health monitor script -- skipping" -Colour DarkGray -Indent
     }
 
     if ($watchScript) {
@@ -1168,19 +1234,23 @@ if ($Undo) {
     Step 23 $steps "Creating boot-time fix task..."
 
     $fixScript = $null
-    if ($myDir) {
-        $candidate = Join-Path $myDir "Fix-ClaudeDesktop.ps1"
-        if (Test-Path $candidate) { $fixScript = $candidate }
-    }
-    if (-not $fixScript) {
-        $fallbackPaths = @(
-            "C:\ClaudeFix\Fix-ClaudeDesktop.ps1",
-            (Join-Path $env:USERPROFILE "Desktop\Fix-ClaudeDesktop.ps1"),
-            (Join-Path $env:USERPROFILE "Documents\Fix-ClaudeDesktop.ps1")
-        )
-        foreach ($fb in $fallbackPaths) {
-            if (Test-Path $fb) { $fixScript = $fb; break }
+    try {
+        if ($myDir) {
+            $candidate = Join-Path $myDir "Fix-ClaudeDesktop.ps1"
+            if (Test-Path $candidate) { $fixScript = $candidate }
         }
+        if (-not $fixScript) {
+            $fallbackPaths = @(
+                "C:\ClaudeFix\Fix-ClaudeDesktop.ps1",
+                (Join-Path $env:USERPROFILE "Desktop\Fix-ClaudeDesktop.ps1"),
+                (Join-Path $env:USERPROFILE "Documents\Fix-ClaudeDesktop.ps1")
+            )
+            foreach ($fb in $fallbackPaths) {
+                if (Test-Path $fb) { $fixScript = $fb; break }
+            }
+        }
+    } catch {
+        Log "Could not locate fix script -- skipping boot task" -Colour DarkGray -Indent
     }
 
     if ($fixScript) {
@@ -1252,17 +1322,29 @@ if (`$claude) {
     Step 24 $steps "Creating Fix Claude Desktop shortcuts..."
 
     $fixBat = $null
-    if ($myDir) {
-        $candidate = Join-Path $myDir "Fix-ClaudeDesktop.bat"
-        if (Test-Path $candidate) { $fixBat = $candidate }
-    }
-    if (-not $fixBat -and $fixScript) {
-        $fixBatCandidate = Join-Path (Split-Path $fixScript -Parent) "Fix-ClaudeDesktop.bat"
-        if (Test-Path $fixBatCandidate) { $fixBat = $fixBatCandidate }
+    try {
+        if ($myDir) {
+            $candidate = Join-Path $myDir "Fix-ClaudeDesktop.bat"
+            if (Test-Path $candidate) { $fixBat = $candidate }
+        }
+        if (-not $fixBat -and $fixScript) {
+            $fixBatCandidate = Join-Path (Split-Path $fixScript -Parent) "Fix-ClaudeDesktop.bat"
+            if (Test-Path $fixBatCandidate) { $fixBat = $fixBatCandidate }
+        }
+    } catch {
+        Log "Could not locate fix launcher -- skipping shortcuts" -Colour DarkGray -Indent
     }
 
+    $shell = $null
     if ($fixBat) {
-        $shell = New-Object -ComObject WScript.Shell
+        try {
+            $shell = New-Object -ComObject WScript.Shell
+        } catch {
+            Log "Windows Script Host is unavailable -- cannot create shortcuts" -Colour DarkYellow -Indent
+        }
+    }
+
+    if ($fixBat -and $shell) {
 
         $desktopPath = [Environment]::GetFolderPath("Desktop")
         $desktopLnk = Join-Path $desktopPath "Fix Claude Desktop.lnk"
@@ -1390,8 +1472,8 @@ if ($exe) { Start-Process $exe } else { throw 'Claude Desktop not found. Is it i
         Log "Scheduled task created: $TaskPath$elevTaskName (Highest + Interactive)" -Colour Green -Indent
 
         # Create a launcher .cmd that triggers the task (one-liner, no $, no PS needed)
-        $launcherDir = Join-Path $env:APPDATA "Claude"
-        $launcherCmd = Join-Path $launcherDir "Launch-Claude-Admin.cmd"
+        Initialize-ClaudeAppData | Out-Null
+        $launcherCmd = Join-Path $ClaudeAppData "Launch-Claude-Admin.cmd"
         $cmdContent = @"
 @echo off
 REM -- Claude Desktop (Admin) Launcher
@@ -1420,7 +1502,7 @@ if errorlevel 1 (
         $shell = New-Object -ComObject WScript.Shell
         $sc = $shell.CreateShortcut($adminLnkPath)
         $sc.TargetPath = $launcherCmd
-        $sc.WorkingDirectory = $launcherDir
+        $sc.WorkingDirectory = $ClaudeAppData
         $sc.Description = "Claude Desktop (Elevated via scheduled task)"
         # Try to use Claude's own icon (falls back to generic if path is stale after update)
         $claudeIcon = $null
@@ -1546,6 +1628,11 @@ if errorlevel 1 (
     Write-Host ""
     Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "  Line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "  Setup stopped early, so some steps did not run." -ForegroundColor DarkYellow
+    Write-Host "  Nothing was left half-applied -- rerun the script once the" -ForegroundColor DarkGray
+    Write-Host "  cause above is resolved, or open an issue at" -ForegroundColor DarkGray
+    Write-Host "  https://github.com/JesperLive/ClaudeFix/issues" -ForegroundColor DarkGray
 }
 
 Write-Host ""

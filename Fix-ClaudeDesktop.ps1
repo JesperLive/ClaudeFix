@@ -101,7 +101,7 @@ if (-not $script:IsAdmin) {
 Set-StrictMode -Version Latest
 
 # -- Constants -------------------------------------------------------
-$Version         = "5.3.1"
+$Version         = "5.4.0"
 $ServiceName     = "CoworkVMService"
 $ServiceExe      = "cowork-svc"
 $ProcessName     = "claude"
@@ -115,6 +115,7 @@ $StartPollMax    = 20   # increased from 12 -- give the service more time after 
 $PostLaunchWait  = 10   # seconds to wait after launching Claude before health check
 $MaxRetries      = 3    # how many times to retry the full fix cycle
 $script:CapturedClaudeExe = $null  # set in Step 1 from running process
+$script:ServicePrereq     = $null  # set by Test-CoworkServicePrereq
 
 # -- Logging ---------------------------------------------------------
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
@@ -336,8 +337,141 @@ function Find-ClaudeExe {
     return $null
 }
 
+# -- Service prerequisite check ---------------------------------------
+function Test-CoworkServicePrereq {
+    <#
+    .SYNOPSIS
+        Works out whether CoworkVMService is able to start at all.
+    .DESCRIPTION
+        "sc start" answers a blocked service with FAILED 87 (the parameter is
+        incorrect) or FAILED 1058 (service disabled), and neither says why.
+        Without this check the script retries, escalates to a cache purge, and
+        reports failure against a service that was never going to start.
+
+        Checks follow Anthropic's own remediation steps for Cowork on Windows:
+        https://support.claude.com/en/articles/12622703-deploy-claude-desktop-for-windows
+
+        Returns a hashtable: Found, StartType, Blocked, Reason, Fixes, Repaired
+    #>
+    $r = @{
+        Found     = $false
+        StartType = "Unknown"
+        Blocked   = $false
+        Reason    = $null
+        Fixes     = @()
+        Repaired  = $false
+    }
+
+    # 1. Virtual Machine Platform -- the documented Cowork requirement.
+    if ($script:IsAdmin) {
+        try {
+            $vmp = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
+            if ($vmp -and $vmp.State -ne "Enabled") {
+                $r.Blocked = $true
+                $r.Reason  = "The Virtual Machine Platform feature is $($vmp.State). Cowork runs in a Hyper-V VM and cannot start without it."
+                $r.Fixes  += "Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All"
+                $r.Fixes  += "Then RESTART the machine (use Restart, not shut down -- Fast Startup can leave the services uninitialised)"
+                return $r
+            }
+        } catch {}
+    }
+
+    # 2. Host Compute Service stack. Anthropic reports this as
+    #    "Missing HCS services: HNS, vmcompute, vfpext".
+    $missingHcs = @()
+    foreach ($n in @('vmcompute', 'hns')) {
+        if (-not (Get-Service -Name $n -ErrorAction SilentlyContinue)) { $missingHcs += $n }
+    }
+    if ($missingHcs.Count -gt 0) {
+        $r.Blocked = $true
+        $r.Reason  = "The Host Compute Service stack is not registered (missing: $($missingHcs -join ', ')), so the Cowork VM has nothing to run on."
+        $r.Fixes  += "Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All"
+        $r.Fixes  += "Then RESTART the machine"
+        return $r
+    }
+
+    # 3. Hypervisor must be set to launch at boot. VMware and VirtualBox
+    #    installs are the usual reason this gets switched off.
+    if ($script:IsAdmin) {
+        try {
+            $bcd = & bcdedit /enum "{current}" 2>$null
+            $hvLine = $bcd | Where-Object { $_ -match 'hypervisorlaunchtype' }
+            if ($hvLine -and $hvLine -notmatch '(?i)auto') {
+                $r.Blocked = $true
+                $r.Reason  = "The Windows hypervisor is not set to launch at boot ($($hvLine.Trim()))."
+                $r.Fixes  += "bcdedit /set hypervisorlaunchtype auto"
+                $r.Fixes  += "Then RESTART the machine"
+                return $r
+            }
+        } catch {}
+    }
+
+    # 4. The service itself.
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        $r.Blocked = $true
+        $r.Reason  = "CoworkVMService is not registered. A per-user MSIX install can finish without registering the Cowork virtualisation service, which leaves Claude installed but Cowork unable to start."
+        $r.Fixes  += "Reinstall machine-wide: Add-AppxProvisionedPackage -Online -PackagePath 'Claude.msix' -SkipLicense -Regions 'all'"
+        return $r
+    }
+    $r.Found = $true
+
+    try {
+        $r.StartType = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop).StartMode
+    } catch {
+        try { $r.StartType = $svc.StartType.ToString() } catch {}
+    }
+
+    # 5. Start type Disabled is what answers "sc start" with 1058.
+    if ($r.StartType -eq "Disabled") {
+        if ($script:IsAdmin) {
+            try {
+                Set-Service -Name $ServiceName -StartupType Automatic -ErrorAction Stop
+                $r.StartType = "Auto"
+                $r.Repaired  = $true
+            } catch {
+                $r.Blocked = $true
+                $r.Reason  = "CoworkVMService start type is Disabled and could not be re-enabled: $($_.Exception.Message)"
+                $r.Fixes  += "Set-Service -Name CoworkVMService -StartupType Automatic"
+                return $r
+            }
+        } else {
+            $r.Blocked = $true
+            $r.Reason  = "CoworkVMService start type is Disabled."
+            $r.Fixes  += "Rerun this script as Administrator, or run: Set-Service -Name CoworkVMService -StartupType Automatic"
+            return $r
+        }
+    }
+
+    # 6. Duplicate package-family registrations produce error 87 on start.
+    try {
+        $pkgs = @(Get-AppxPackage -Name "*Claude*" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like "Claude*" })
+        if ($pkgs.Count -gt 1) {
+            $r.Blocked = $true
+            $r.Reason  = "$($pkgs.Count) Claude packages are registered ($(($pkgs | ForEach-Object { $_.PackageFullName }) -join '; ')). Duplicate entries in the Claude package family make the service start fail with error 87."
+            $r.Fixes  += "Remove the stale package with Remove-AppxPackage, keeping only the current version"
+            return $r
+        }
+    } catch {}
+
+    return $r
+}
+
 # -- Service restart function ----------------------------------------
 function Restart-CoworkService {
+    $script:ServicePrereq = Test-CoworkServicePrereq
+    if ($script:ServicePrereq.Repaired) {
+        Log "Service start type was Disabled -- re-enabled (Automatic)" -Colour Green -Indent
+    }
+    if ($script:ServicePrereq.Blocked) {
+        Log "[!] $($script:ServicePrereq.Reason)" -Colour Red -Indent
+        foreach ($f in $script:ServicePrereq.Fixes) {
+            Log "  -> $f" -Colour Yellow -Indent
+        }
+        return $false
+    }
+
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $svc) {
         Log "[!] Service not found" -Colour Red -Indent
@@ -1947,7 +2081,12 @@ if (-not $skipCachePurge -and $vhdxBackedUp -and $vhdxBackedUp.Count -gt 0) {
 # -- Smart mode escalation: if service didn't start, escalate to Deep --
 if ($script:SelectedMode -eq "Smart") {
     $smartSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $smartSvc -or $smartSvc.Status -ne "Running") {
+    $prereqBlocked = ($null -ne $script:ServicePrereq -and $script:ServicePrereq.Blocked)
+    if ($prereqBlocked) {
+        Log "Smart mode: not escalating to Deep -- $($script:ServicePrereq.Reason)" -Colour Yellow
+        Log "Purging the VM cache cannot fix that. Resolve it and rerun." -Colour DarkGray -Indent
+    }
+    if (-not $prereqBlocked -and (-not $smartSvc -or $smartSvc.Status -ne "Running")) {
         Log "Smart mode: service not running after quick fix -- escalating to Deep" -Colour Yellow
         # Run the cache purge that was skipped -- with VHDX backup
         Log "[7/10] Escalated cache purge..." -Colour Yellow
@@ -2701,6 +2840,23 @@ if ($fSvc) {
 }
 Write-Host "  VM Service:       $svcStatusText" -ForegroundColor $svcStatusColor
 Write-Host "  Claude processes: $($fProcs.Count) active" -ForegroundColor Cyan
+
+# If the service can never start, say so here rather than leaving the reader
+# to guess from an "sc start" error code.
+if (-not $svcOk -and $null -ne $script:ServicePrereq -and $script:ServicePrereq.Blocked) {
+    Write-Host ""
+    Write-Host "  Why the service is not running:" -ForegroundColor Yellow
+    Write-Host "    $($script:ServicePrereq.Reason)" -ForegroundColor Red
+    if ($script:ServicePrereq.Fixes.Count -gt 0) {
+        Write-Host ""
+        Write-Host "  To fix it (elevated PowerShell):" -ForegroundColor Yellow
+        foreach ($f in $script:ServicePrereq.Fixes) {
+            Write-Host "    $f" -ForegroundColor White
+        }
+    }
+    Write-Host ""
+    Write-Host "  Reference: https://support.claude.com/en/articles/12622703-deploy-claude-desktop-for-windows" -ForegroundColor DarkGray
+}
 
 # Quick peek at recent event log errors
 try {
