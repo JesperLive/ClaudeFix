@@ -14,7 +14,9 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      # v5, not v4. v4 targets Node 20, which GitHub now force-runs on Node 24
+      # and warns about on every run.
+      - uses: actions/checkout@v5
 
       - name: Syntax
         shell: powershell
