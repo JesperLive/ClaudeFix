@@ -48,7 +48,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 6.0.0
+    Version : 6.0.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -455,6 +455,56 @@ function Import-ClaudeEnvironment {
         return $obj
     } catch { return $null }
 }
+
+function Get-CoworkHcsGuids {
+    <#
+    .SYNOPSIS
+        Pulls the distinct compute system GUIDs for cowork-vm out of the text
+        that "hcsdiag list" prints.
+    .DESCRIPTION
+        This parse lived in four places: Close-StaleHcsVms in Fix, the HCS
+        cleanup step in Prevent, and both the counting check and the kill path
+        in Watch. All four had at least one of these two bugs, and fixing one
+        copy did nothing for the other three. It lives here now.
+
+        The output looks like this, with the name repeated on both lines and an
+        uppercase GUID mid-line:
+
+            cowork-vm-1699151a
+                VM,           Running, DE1517EC-...-77A48CB1AD97, cowork-vm-1699151a
+
+        Bug one: the GUID never appears on a line by itself, so a parser that
+        looks for a leading GUID and then a following name finds nothing, or
+        pairs a GUID with the wrong name.
+
+        Bug two: counting occurrences of the string "cowork-vm" returns 2 for a
+        single VM, because the name is on both lines. Watch used that count
+        against a threshold of 1, so "Multiple cowork-vm instances in HCS" was a
+        standing false positive on every healthy machine.
+
+        Matching the name first and then extracting the GUID from that same
+        line, then taking distinct values, fixes both. Order matters: the second
+        -match is what leaves the capture in $Matches.
+
+        Takes the text rather than running hcsdiag itself. The three scripts
+        invoke it differently (Fix wraps it in a job with a timeout, Watch
+        caches the result for 25 seconds) and none of that belongs in a parser.
+        It also means the parser is testable without a Hyper-V host.
+    #>
+    param([string]$ListOutput)
+
+    if (-not $ListOutput) { return @() }
+    if ($ListOutput -notmatch 'cowork-vm') { return @() }
+
+    $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+    $found = @()
+    foreach ($line in ($ListOutput -split "`r?`n")) {
+        if ($line -match 'cowork-vm') {
+            if ($line -match $guidPattern) { $found += $Matches[1] }
+        }
+    }
+    return @($found | Select-Object -Unique)
+}
 #endregion ClaudeEnv
 
 # -- Runtime discovery ---------------------------------------------------
@@ -464,7 +514,7 @@ function Import-ClaudeEnvironment {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -----------------------------------------------------------
-$ToolkitVersion = "6.0.0"
+$ToolkitVersion = "6.0.1"
 $ServiceName    = $script:ClaudeEnv.ServiceName
 $ProcessName    = $script:ClaudeEnv.ProcessName
 $ClaudeAppData  = $script:ClaudeEnv.AppDataDir
@@ -718,6 +768,9 @@ $script:LastHcsStateLogTime  = [datetime]::MinValue
 $script:LastShutdownFailLogTime = [datetime]::MinValue
 $script:FixHistory           = New-Object System.Collections.ArrayList
 $script:StatePath            = Join-Path $WatchLogDir "watch-state.json"
+# Seeded from the current state so the first poll does not report a transition
+# that did not happen.
+$script:ClaudeWasRunning     = (@(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0)
 
 function Import-WatchState {
     <#
@@ -1423,14 +1476,7 @@ function Test-HcsStateHealth {
             # healthy VM, which is above the threshold of 1 used when no Cowork
             # session is active. That made "Multiple cowork-vm instances in HCS"
             # a standing false positive on a completely normal machine.
-            $hcsGuidPat = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
-            $hcsSeen = @{}
-            foreach ($hcsLine in ($hcsList -split "`r?`n")) {
-                if ($hcsLine -match "cowork-vm") {
-                    if ($hcsLine -match $hcsGuidPat) { $hcsSeen[$Matches[1]] = $true }
-                }
-            }
-            $vmCount = $hcsSeen.Count
+            $vmCount = @(Get-CoworkHcsGuids -ListOutput ([string]$hcsList)).Count
             # During active Cowork sessions, 1-2 HCS instances is normal
             # (VM runtime + network/storage component). Only flag 3+.
             # When no Cowork session is active, flag 2+ (stale leftovers).
@@ -2285,6 +2331,33 @@ try {
 
             $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
 
+            # Record Claude disappearing. Reported, never acted on.
+            #
+            # Every check below sits inside "if ($claudeRunning)", so when
+            # Claude is gone this monitor previously did nothing at all: no
+            # detection, no note, nothing. A user report describes exactly that
+            # shape, an app that died and stayed dead for over an hour with
+            # zero log activity to point at afterwards.
+            #
+            # This monitor cannot tell a crash from someone quitting, and
+            # relaunching an app the user closed on purpose would be worse than
+            # useless, so it does not try. What it can do is leave a timestamp,
+            # which is the thing that was missing.
+            #
+            # Whether the service is still up is recorded alongside it: Close
+            # mode stops the service, so a live service with no Claude leans
+            # towards an unexpected exit rather than a clean shutdown.
+            if ($claudeRunning -ne $script:ClaudeWasRunning) {
+                if (-not $claudeRunning) {
+                    $svcNow = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+                    $svcState = if ($svcNow) { "$($svcNow.Status)" } else { "absent" }
+                    Write-WatchLog "Claude is no longer running (service: $svcState). Not acting: a crash and a deliberate quit look the same from here."
+                } else {
+                    Write-WatchLog "Claude is running again"
+                }
+                $script:ClaudeWasRunning = $claudeRunning
+            }
+
             if ($claudeRunning) {
                 # ---- Critical checks (trigger auto-fix) ----
 
@@ -2386,22 +2459,12 @@ try {
                         #      call would have done nothing while logging
                         #      "proactively closed stale cowork-vm".
                         #
-                        # Real format, name on one line and detail on the next:
-                        #   cowork-vm-1699151a
-                        #       VM,   Running, DE1517EC-...-77A48CB1AD97, cowork-vm-1699151a
+                        # The parse now lives in Get-CoworkHcsGuids in the shared
+                        # ClaudeEnv region. This was the third of four copies.
                         try {
                             $hcsList = Get-HcsListCached
                             if ($hcsList) {
-                                $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
-                                $vmGuids = @()
-                                foreach ($line in ($hcsList -split "`r?`n")) {
-                                    # Order matters: the second -match is what
-                                    # leaves the GUID capture in $Matches.
-                                    if ($line -match "cowork-vm") {
-                                        if ($line -match $guidPattern) { $vmGuids += $Matches[1] }
-                                    }
-                                }
-                                $vmGuids = @($vmGuids | Select-Object -Unique)
+                                $vmGuids = @(Get-CoworkHcsGuids -ListOutput ([string]$hcsList))
 
                                 # Keep the newest entry, which is the live VM,
                                 # and kill anything else left behind.

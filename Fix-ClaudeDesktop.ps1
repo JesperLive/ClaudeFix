@@ -63,7 +63,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.0.0
+    Version : 6.0.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -514,6 +514,56 @@ function Import-ClaudeEnvironment {
         return $obj
     } catch { return $null }
 }
+
+function Get-CoworkHcsGuids {
+    <#
+    .SYNOPSIS
+        Pulls the distinct compute system GUIDs for cowork-vm out of the text
+        that "hcsdiag list" prints.
+    .DESCRIPTION
+        This parse lived in four places: Close-StaleHcsVms in Fix, the HCS
+        cleanup step in Prevent, and both the counting check and the kill path
+        in Watch. All four had at least one of these two bugs, and fixing one
+        copy did nothing for the other three. It lives here now.
+
+        The output looks like this, with the name repeated on both lines and an
+        uppercase GUID mid-line:
+
+            cowork-vm-1699151a
+                VM,           Running, DE1517EC-...-77A48CB1AD97, cowork-vm-1699151a
+
+        Bug one: the GUID never appears on a line by itself, so a parser that
+        looks for a leading GUID and then a following name finds nothing, or
+        pairs a GUID with the wrong name.
+
+        Bug two: counting occurrences of the string "cowork-vm" returns 2 for a
+        single VM, because the name is on both lines. Watch used that count
+        against a threshold of 1, so "Multiple cowork-vm instances in HCS" was a
+        standing false positive on every healthy machine.
+
+        Matching the name first and then extracting the GUID from that same
+        line, then taking distinct values, fixes both. Order matters: the second
+        -match is what leaves the capture in $Matches.
+
+        Takes the text rather than running hcsdiag itself. The three scripts
+        invoke it differently (Fix wraps it in a job with a timeout, Watch
+        caches the result for 25 seconds) and none of that belongs in a parser.
+        It also means the parser is testable without a Hyper-V host.
+    #>
+    param([string]$ListOutput)
+
+    if (-not $ListOutput) { return @() }
+    if ($ListOutput -notmatch 'cowork-vm') { return @() }
+
+    $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+    $found = @()
+    foreach ($line in ($ListOutput -split "`r?`n")) {
+        if ($line -match 'cowork-vm') {
+            if ($line -match $guidPattern) { $found += $Matches[1] }
+        }
+    }
+    return @($found | Select-Object -Unique)
+}
 #endregion ClaudeEnv
 
 # -- Runtime discovery -----------------------------------------------
@@ -523,7 +573,7 @@ function Import-ClaudeEnvironment {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.0.0"
+$ToolkitVersion  = "6.0.1"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName
@@ -1441,15 +1491,9 @@ function Close-StaleHcsVms {
         an unsupported verb makes hcsdiag print usage and exit without doing
         anything, which reads as success to the caller.
 
-        "hcsdiag list" prints the compute system name on its own line and the
-        detail on the next line, with an uppercase GUID mid-line:
-
-            cowork-vm-1699151a
-                VM,           Running, DE1517EC-...-77A48CB1AD97, cowork-vm-1699151a
-
-        The GUID therefore never appears on a line by itself. Match cowork-vm
-        first, then pull the GUID out of that same line. Order matters: the
-        second -match is what leaves the GUID capture in $Matches.
+        The parse of "hcsdiag list" lives in Get-CoworkHcsGuids in the shared
+        ClaudeEnv region, because Prevent and Watch need exactly the same thing
+        and used to each carry their own subtly different copy.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1459,17 +1503,8 @@ function Close-StaleHcsVms {
     $killed = 0
     try {
         $hcsList = Invoke-HcsDiag -Arguments "list"
-        if (-not $hcsList) { return 0 }
-        if ($hcsList -notmatch "cowork-vm") { return 0 }
-
-        $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
-        $entries = @()
-        foreach ($line in ($hcsList -split "`r?`n")) {
-            if ($line -match "cowork-vm") {
-                if ($line -match $guidPattern) { $entries += $Matches[1] }
-            }
-        }
-        $entries = @($entries | Select-Object -Unique)
+        $entries = Get-CoworkHcsGuids -ListOutput ([string]$hcsList)
+        if ($entries.Count -eq 0) { return 0 }
 
         foreach ($guid in $entries) {
             try {

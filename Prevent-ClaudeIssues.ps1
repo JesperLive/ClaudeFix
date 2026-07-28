@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 6.0.0
+    Version : 6.0.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -58,8 +58,19 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $elevateArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptFile`""
     if ($Undo) { $elevateArgs += " -Undo" }
 
+    # -WhatIf has to survive the elevation boundary. Without this line, running
+    # the script unelevated with -WhatIf relaunched it elevated WITHOUT -WhatIf
+    # and applied every change for real, which is the exact opposite of what was
+    # asked for. Fix-ClaudeDesktop already forwarded it; this one did not.
+    if ($WhatIfPreference) { $elevateArgs += " -WhatIf" }
+
     try {
-        Start-Process PowerShell -ArgumentList $elevateArgs -Verb RunAs
+        # -Wait -PassThru so the child's exit code reaches the launcher. Without
+        # it the outer shell returned 0 the moment UAC was accepted, so a failed
+        # elevated run looked like success to Prevent-ClaudeIssues.bat.
+        $elevated = Start-Process PowerShell -ArgumentList $elevateArgs -Verb RunAs -Wait -PassThru
+        if ($elevated) { exit $elevated.ExitCode }
+        exit 0
     } catch {
         Write-Host "  [!] UAC elevation was declined or failed." -ForegroundColor Red
         Write-Host "      This script requires Administrator privileges." -ForegroundColor Yellow
@@ -67,7 +78,10 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
         Write-Host "  Press any key to close..." -ForegroundColor DarkGray
         [void][System.Console]::ReadKey($true)
     }
-    exit
+    # Explicit 1, not a bare exit. Declining UAC means nothing was configured,
+    # and the launcher treats 1 as "the script explained itself and paused",
+    # which is exactly what just happened above.
+    exit 1
 }
 
 Set-StrictMode -Version Latest
@@ -465,6 +479,56 @@ function Import-ClaudeEnvironment {
         return $obj
     } catch { return $null }
 }
+
+function Get-CoworkHcsGuids {
+    <#
+    .SYNOPSIS
+        Pulls the distinct compute system GUIDs for cowork-vm out of the text
+        that "hcsdiag list" prints.
+    .DESCRIPTION
+        This parse lived in four places: Close-StaleHcsVms in Fix, the HCS
+        cleanup step in Prevent, and both the counting check and the kill path
+        in Watch. All four had at least one of these two bugs, and fixing one
+        copy did nothing for the other three. It lives here now.
+
+        The output looks like this, with the name repeated on both lines and an
+        uppercase GUID mid-line:
+
+            cowork-vm-1699151a
+                VM,           Running, DE1517EC-...-77A48CB1AD97, cowork-vm-1699151a
+
+        Bug one: the GUID never appears on a line by itself, so a parser that
+        looks for a leading GUID and then a following name finds nothing, or
+        pairs a GUID with the wrong name.
+
+        Bug two: counting occurrences of the string "cowork-vm" returns 2 for a
+        single VM, because the name is on both lines. Watch used that count
+        against a threshold of 1, so "Multiple cowork-vm instances in HCS" was a
+        standing false positive on every healthy machine.
+
+        Matching the name first and then extracting the GUID from that same
+        line, then taking distinct values, fixes both. Order matters: the second
+        -match is what leaves the capture in $Matches.
+
+        Takes the text rather than running hcsdiag itself. The three scripts
+        invoke it differently (Fix wraps it in a job with a timeout, Watch
+        caches the result for 25 seconds) and none of that belongs in a parser.
+        It also means the parser is testable without a Hyper-V host.
+    #>
+    param([string]$ListOutput)
+
+    if (-not $ListOutput) { return @() }
+    if ($ListOutput -notmatch 'cowork-vm') { return @() }
+
+    $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+    $found = @()
+    foreach ($line in ($ListOutput -split "`r?`n")) {
+        if ($line -match 'cowork-vm') {
+            if ($line -match $guidPattern) { $found += $Matches[1] }
+        }
+    }
+    return @($found | Select-Object -Unique)
+}
 #endregion ClaudeEnv
 
 # -- Runtime discovery -----------------------------------------------
@@ -473,11 +537,17 @@ function Import-ClaudeEnvironment {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.0.0"
+$ToolkitVersion   = "6.0.1"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
 $ClaudeAppData    = $script:ClaudeEnv.AppDataDir
+
+# Both discovered. $ServiceName was removed in the first pass as an unused
+# variable, which it was: everything referred to the literal "CoworkVMService"
+# instead. It is back because those references now use it.
+$ServiceName      = $script:ClaudeEnv.ServiceName
+$ServiceExe       = $script:ClaudeEnv.ServiceProcessName
 
 if (-not $ClaudeAppData) {
     Write-Host "  [!] Could not locate the per-user Claude folder under %APPDATA%." -ForegroundColor Red
@@ -651,7 +721,7 @@ if ($Undo) {
         Log "Could not restore Dynamic Memory, Hyper-V module may not be available" -Colour DarkGray -Indent
     }
     # Clean up flag file
-    $flagFile = Join-Path $env:APPDATA "Claude\disable-dynamic-memory.flag"
+    $flagFile = Join-Path $ClaudeAppData "disable-dynamic-memory.flag"
     if (Test-Path $flagFile) {
         Remove-Item $flagFile -Force -ErrorAction SilentlyContinue
     }
@@ -663,8 +733,8 @@ if ($Undo) {
         Log "vmcompute failure recovery: Reset to defaults" -Colour Green -Indent
 
         # Reset CoworkVMService failure actions (v4.8.0)
-        & sc.exe failure CoworkVMService actions= "" reset= 0 2>&1 | Out-Null
-        Log "CoworkVMService failure recovery: Reset to defaults" -Colour Green -Indent
+        & sc.exe failure $ServiceName actions= "" reset= 0 2>&1 | Out-Null
+        Log "$ServiceName failure recovery: Reset to defaults" -Colour Green -Indent
 
         # Remove ServicesPipeTimeout only if we set it (value is exactly 120000)
         try {
@@ -708,7 +778,7 @@ if ($Undo) {
         Log "No tasks to remove" -Colour DarkGray -Indent
     }
     # Clean up old watchdog script if present
-    $oldWatchdog = Join-Path $env:APPDATA "Claude\cowork-watchdog.ps1"
+    $oldWatchdog = Join-Path $ClaudeAppData "cowork-watchdog.ps1"
     if (Test-Path $oldWatchdog) {
         Remove-Item $oldWatchdog -Force -ErrorAction SilentlyContinue
         Log "Removed old watchdog script" -Colour DarkGray -Indent
@@ -761,8 +831,8 @@ if ($Undo) {
             Log "Removed: $adminLnk" -Colour Green -Indent
         }
         # Remove launcher scripts
-        $launcherCmd = Join-Path $env:APPDATA "Claude\Launch-Claude-Admin.cmd"
-        $launcherPs1 = Join-Path $env:APPDATA "Claude\Launch-Claude-Admin.ps1"
+        $launcherCmd = Join-Path $ClaudeAppData "Launch-Claude-Admin.cmd"
+        $launcherPs1 = Join-Path $ClaudeAppData "Launch-Claude-Admin.ps1"
         foreach ($lf in @($launcherCmd, $launcherPs1)) {
             if (Test-Path $lf) {
                 Remove-Item $lf -Force -ErrorAction SilentlyContinue
@@ -1122,17 +1192,17 @@ if ($Undo) {
     # ----------------------------------------------------------------
     Step 13 $steps "Configuring CoworkVMService recovery..."
     try {
-        $svc = Get-Service -Name "CoworkVMService" -ErrorAction SilentlyContinue
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($svc) {
-            & sc.exe failure CoworkVMService reset= 300 actions= restart/30000/restart/60000/restart/120000 2>&1 | Out-Null
-            $verifyResult = & sc.exe qfailure CoworkVMService 2>&1
+            & sc.exe failure $ServiceName reset= 300 actions= restart/30000/restart/60000/restart/120000 2>&1 | Out-Null
+            $verifyResult = & sc.exe qfailure $ServiceName 2>&1
             if ($verifyResult -match "RESTART") {
-                Log "CoworkVMService failure recovery: restart after 30s/60s/120s (reset 300s)" -Colour Green -Indent
+                Log "$ServiceName failure recovery: restart after 30s/60s/120s (reset 300s)" -Colour Green -Indent
             } else {
-                Log "CoworkVMService failure recovery set (could not verify)" -Colour DarkGray -Indent
+                Log "$ServiceName failure recovery set (could not verify)" -Colour DarkGray -Indent
             }
         } else {
-            Log "CoworkVMService not installed, skipping" -Colour DarkGray -Indent
+            Log "$ServiceName not installed, skipping" -Colour DarkGray -Indent
         }
     } catch {
         Log "Could not configure CoworkVMService recovery, not critical" -Colour DarkGray -Indent
@@ -1142,22 +1212,37 @@ if ($Undo) {
     # 14. Pre-emptive HCS state cleanup (v4.8.0)
     # ----------------------------------------------------------------
     Step 14 $steps "Pre-emptive HCS state cleanup..."
-    if (Test-Path "$env:SystemRoot\System32\hcsdiag.exe") {
+    # Three corrections in v6.0.0:
+    #   1. hcsdiag has no "close" verb. The verbs are list, exec, console, read,
+    #      write, share and kill. Every call this block made was a silent no-op
+    #      that then logged success.
+    #   2. The parse was wrong, in its own way, and is now Get-CoworkHcsGuids in
+    #      the shared ClaudeEnv region. Fix and Watch had their own copies with
+    #      their own variations on the same two mistakes.
+    #   3. It ran unconditionally. If Claude was open, "stale" meant the VM the
+    #      user was actively working in. Now it only acts when Claude is closed.
+    $hcsExe = $script:ClaudeEnv.HcsDiagPath
+    if ($hcsExe) {
         try {
-            $hcsList = & "$env:SystemRoot\System32\hcsdiag.exe" list 2>&1 | Out-String
-            if ($hcsList -match "cowork-vm") {
-                $lines = $hcsList -split "`n"
-                $currentGuid = $null
-                foreach ($line in $lines) {
-                    if ($line -match "^([0-9a-f-]{36})") { $currentGuid = $Matches[1] }
-                    if ($line -match "cowork-vm" -and $currentGuid) {
-                        & "$env:SystemRoot\System32\hcsdiag.exe" close $currentGuid 2>&1 | Out-Null
-                        Log "Closed stale HCS compute system: $currentGuid" -Colour Green -Indent
-                        $currentGuid = $null
+            $claudeLive = @(Get-Process -Name claude -ErrorAction SilentlyContinue).Count -gt 0
+            $hcsList = & $hcsExe list 2>&1 | Out-String
+            $guids = Get-CoworkHcsGuids -ListOutput ([string]$hcsList)
+
+            if ($guids.Count -eq 0) {
+                Log "HCS state clean" -Colour Green -Indent
+            } elseif ($claudeLive) {
+                Log "$($guids.Count) cowork-vm instance(s) present but Claude is running, leaving them alone" -Colour DarkGray -Indent
+            } else {
+                foreach ($g in $guids) {
+                    if ($PSCmdlet.ShouldProcess($g, "hcsdiag kill")) {
+                        & $hcsExe kill $g 2>&1 | Out-Null
+                        if ($LASTEXITCODE -eq 0) {
+                            Log "Killed stale HCS compute system: $g" -Colour Green -Indent
+                        } else {
+                            Log "hcsdiag kill returned $LASTEXITCODE for ${g}" -Colour DarkYellow -Indent
+                        }
                     }
                 }
-            } else {
-                Log "HCS state clean" -Colour Green -Indent
             }
         } catch {
             Log "HCS cleanup check failed: $($_.Exception.Message)" -Colour DarkGray -Indent
@@ -1277,40 +1362,43 @@ if ($Undo) {
     # 18. Storage location detection
     # ----------------------------------------------------------------
     Step 18 $steps "Checking workspace storage location..."
-    $vmCachePath = Join-Path $ClaudeAppData "claude-code-vm"
+    $vmCachePath = $script:ClaudeEnv.VmCachePath
     $storageWarnings = @()
 
-    # Check if APPDATA is on a cloud-sync folder
+    # Both checks used to read $env:APPDATA. They now read the discovered Claude
+    # folder, which is where the VM cache actually lives. On a default install
+    # the two are the same; if a user has redirected the folder they are not,
+    # and the redirected one is the answer that matters.
     $cloudPaths = @("OneDrive", "Google Drive", "Dropbox", "iCloud", "Box")
     foreach ($cp in $cloudPaths) {
-        if ($env:APPDATA -match [regex]::Escape($cp)) {
-            $storageWarnings += "APPDATA is inside a '$cp' sync folder, this causes mount failures"
+        if ($ClaudeAppData -match [regex]::Escape($cp)) {
+            $storageWarnings += "The Claude folder is inside a '$cp' sync folder, this causes mount failures"
         }
     }
 
-    # Check if APPDATA is on an external/USB drive
+    # Check if the Claude folder is on an external/USB drive
     try {
-        $appDataDrive = (Split-Path $env:APPDATA -Qualifier) + "\"
+        $appDataDrive = (Split-Path $ClaudeAppData -Qualifier) + "\"
         $driveInfo = Get-Volume -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue
         if ($driveInfo) {
             $diskNumber = (Get-Partition -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue).DiskNumber
             if ($null -ne $diskNumber) {
                 $disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
                 if ($disk -and $disk.BusType -match "USB|Thunderbolt|1394") {
-                    $storageWarnings += "APPDATA is on an external $($disk.BusType) drive, use a local SSD instead"
+                    $storageWarnings += "The Claude folder is on an external $($disk.BusType) drive, use a local SSD instead"
                 }
             }
 
             # Check if it's a network drive
             $logDisk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($appDataDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue
             if ($logDisk -and $logDisk.DriveType -eq 4) {
-                $storageWarnings += "APPDATA is on a network drive, VirtioFS requires local storage"
+                $storageWarnings += "The Claude folder is on a network drive, VirtioFS requires local storage"
             }
         }
     } catch { $null = $_ }
 
     # Check the VM cache path specifically for problematic locations
-    if (Test-Path $vmCachePath) {
+    if ($vmCachePath -and (Test-Path $vmCachePath)) {
         try {
             $vmDrive = (Split-Path $vmCachePath -Qualifier) + "\"
             $vmDriveType = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($vmDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue).DriveType
@@ -1421,7 +1509,7 @@ if ($Undo) {
             try {
                 $exclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath
                 $neededPaths = @(
-                    (Join-Path $env:APPDATA "Claude"),
+                    $ClaudeAppData,
                     (Join-Path $env:ProgramFiles "Hyper-V"),
                     "$env:SystemRoot\System32\vmwp.exe",
                     "$env:SystemRoot\System32\vmms.exe"
@@ -1447,17 +1535,16 @@ if ($Undo) {
                         }
                     }
                     # Also add process exclusions
+                    $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "$ServiceExe.exe")
                     try {
-                        Add-MpPreference -ExclusionProcess "vmwp.exe" -ErrorAction SilentlyContinue
-                        Add-MpPreference -ExclusionProcess "vmms.exe" -ErrorAction SilentlyContinue
-                        Add-MpPreference -ExclusionProcess "vmcompute.exe" -ErrorAction SilentlyContinue
-                        Add-MpPreference -ExclusionProcess "cowork-svc.exe" -ErrorAction SilentlyContinue
-                        Log "  + Process exclusions: vmwp.exe, vmms.exe, vmcompute.exe, cowork-svc.exe" -Colour Green -Indent
+                        foreach ($rp in $requiredProcs) {
+                            Add-MpPreference -ExclusionProcess $rp -ErrorAction SilentlyContinue
+                        }
+                        Log "  + Process exclusions: $($requiredProcs -join ', ')" -Colour Green -Indent
                     } catch { $null = $_ }
                     # Verify process exclusions were applied (v4.8.0)
                     try {
                         $procExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
-                        $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "cowork-svc.exe")
                         $missingProcs = @()
                         foreach ($rp in $requiredProcs) {
                             if (-not ($procExclusions -contains $rp)) { $missingProcs += $rp }
@@ -1479,13 +1566,13 @@ if ($Undo) {
                 Log "Could not check Defender exclusions, not critical" -Colour DarkGray -Indent
             }
         } else {
-            # Third-party AV -- can only advise
+            # Third-party AV, can only advise
             Log "Recommended exclusion paths for your AV:" -Colour DarkYellow -Indent
-            Log "  - $env:APPDATA\Claude\" -Colour White -Indent
+            Log "  - $ClaudeAppData\" -Colour White -Indent
             Log "  - $env:ProgramFiles\Hyper-V\" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmwp.exe" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmms.exe" -Colour White -Indent
-            Log "  - Process: vmcompute.exe, cowork-svc.exe" -Colour White -Indent
+            Log "  - Process: vmcompute.exe, $ServiceExe.exe" -Colour White -Indent
             Log "Adding these exclusions prevents AV filter drivers from" -Colour DarkGray -Indent
             Log "interfering with VirtioFS disk operations" -Colour DarkGray -Indent
         }
@@ -1628,7 +1715,7 @@ if ($Undo) {
             Log "Health monitor installed (starts 120s after logon, polls every 30s)" -Colour Green -Indent
             Log "Task: Task Scheduler > $TaskPath$TaskName" -Colour DarkGray -Indent
             Log "Script: $watchScript" -Colour DarkGray -Indent
-            Log "Logs: $env:APPDATA\Claude\watch-logs\" -Colour DarkGray -Indent
+            Log "Logs: $ClaudeAppData\watch-logs\" -Colour DarkGray -Indent
         } catch {
             Log "[!] Could not create health monitor task: $($_.Exception.Message)" -Colour Red -Indent
             Log "You can run Watch-ClaudeHealth.bat manually instead" -Colour DarkGray -Indent
@@ -1671,19 +1758,24 @@ if ($Undo) {
 
             # Wrap in a delayed command: wait 45s after logon before running BootPrep.
             # Increased from 30s to avoid race with Claude auto-launch VM construction.
-            # Pre-check: skip if CoworkVMService is already running (Claude got here first)
-            # or if Claude process is running (do not disrupt active session).
+            # Pre-check: skip if the VM service is already running (Claude got here
+            # first) or if Claude itself is running (do not disrupt active session).
             # BootPrep is non-destructive: only restarts vmcompute, does not kill Claude.
+            #
+            # The service name is interpolated from discovery at install time rather
+            # than written as a literal. The generated task is a standalone script
+            # with no access to the discovery region, so the value has to be baked in
+            # here, on the machine the task is being installed on.
             $delayedCmd = @"
 Start-Sleep -Seconds 45
-`$svc = Get-Service -Name 'CoworkVMService' -ErrorAction SilentlyContinue
+`$svc = Get-Service -Name '$ServiceName' -ErrorAction SilentlyContinue
 if (`$svc -and `$svc.Status -eq 'Running') {
-    # Service already running -- Claude got here first, do not restart vmcompute
+    # Service already running, Claude got here first, do not restart vmcompute
     exit 0
 }
 `$claude = Get-Process -Name 'claude' -ErrorAction SilentlyContinue
 if (`$claude) {
-    # Claude is running -- do not disrupt
+    # Claude is running, do not disrupt
     exit 0
 }
 & '$fixScript' -BootPrep -Quiet

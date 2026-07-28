@@ -392,4 +392,54 @@ function Import-ClaudeEnvironment {
         return $obj
     } catch { return $null }
 }
+
+function Get-CoworkHcsGuids {
+    <#
+    .SYNOPSIS
+        Pulls the distinct compute system GUIDs for cowork-vm out of the text
+        that "hcsdiag list" prints.
+    .DESCRIPTION
+        This parse lived in four places: Close-StaleHcsVms in Fix, the HCS
+        cleanup step in Prevent, and both the counting check and the kill path
+        in Watch. All four had at least one of these two bugs, and fixing one
+        copy did nothing for the other three. It lives here now.
+
+        The output looks like this, with the name repeated on both lines and an
+        uppercase GUID mid-line:
+
+            cowork-vm-1699151a
+                VM,           Running, DE1517EC-...-77A48CB1AD97, cowork-vm-1699151a
+
+        Bug one: the GUID never appears on a line by itself, so a parser that
+        looks for a leading GUID and then a following name finds nothing, or
+        pairs a GUID with the wrong name.
+
+        Bug two: counting occurrences of the string "cowork-vm" returns 2 for a
+        single VM, because the name is on both lines. Watch used that count
+        against a threshold of 1, so "Multiple cowork-vm instances in HCS" was a
+        standing false positive on every healthy machine.
+
+        Matching the name first and then extracting the GUID from that same
+        line, then taking distinct values, fixes both. Order matters: the second
+        -match is what leaves the capture in $Matches.
+
+        Takes the text rather than running hcsdiag itself. The three scripts
+        invoke it differently (Fix wraps it in a job with a timeout, Watch
+        caches the result for 25 seconds) and none of that belongs in a parser.
+        It also means the parser is testable without a Hyper-V host.
+    #>
+    param([string]$ListOutput)
+
+    if (-not $ListOutput) { return @() }
+    if ($ListOutput -notmatch 'cowork-vm') { return @() }
+
+    $guidPattern = '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+    $found = @()
+    foreach ($line in ($ListOutput -split "`r?`n")) {
+        if ($line -match 'cowork-vm') {
+            if ($line -match $guidPattern) { $found += $Matches[1] }
+        }
+    }
+    return @($found | Select-Object -Unique)
+}
 #endregion ClaudeEnv

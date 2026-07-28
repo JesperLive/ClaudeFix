@@ -17,3 +17,9 @@ watch-logs/
 vhdx-backup/
 claude-env.json
 watch-state.json
+
+# Stub launchers written by .ci/Test-BatExitCodes.ps1. They live in the repo
+# root rather than %TEMP% because every launcher checks for its .ps1 next to
+# itself. They are removed in a finally block, so one surviving here means a
+# test run was interrupted.
+_battest_*

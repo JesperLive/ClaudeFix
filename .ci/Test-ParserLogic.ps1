@@ -65,6 +65,26 @@ cowork-vm-1699151a
     VM,                       `tRunning, DE1517EC-BF1D-5A0B-B459-77A48CB1AD97, cowork-vm-1699151a
 "@
 
+# Close-StaleHcsVms delegates the parse to Get-CoworkHcsGuids in the shared
+# ClaudeEnv region, so the region has to be in scope here. Dot-sourcing the
+# canonical copy also means these cases cover what Prevent and Watch call, not
+# just what Fix calls.
+. (Join-Path $PSScriptRoot 'ClaudeEnv.region.ps1')
+
+# The double-count case, tested against the shared parser directly. One VM
+# produces two lines that both contain "cowork-vm". Watch counted string
+# matches and compared the result against a threshold of 1, so a single healthy
+# VM read as "Multiple cowork-vm instances in HCS" forever.
+$oneVmGuids = @(Get-CoworkHcsGuids -ListOutput $realHcsList)
+Assert-Case "one VM yields one GUID, not two" ($oneVmGuids.Count -eq 1) "got $($oneVmGuids.Count)"
+Assert-Case "raw string count really is 2 (why the bug existed)" `
+    ([regex]::Matches($realHcsList, 'cowork-vm').Count -eq 2) `
+    ("got " + [regex]::Matches($realHcsList, 'cowork-vm').Count)
+Assert-Case "empty input yields no GUIDs" (@(Get-CoworkHcsGuids -ListOutput '').Count -eq 0) ""
+Assert-Case "null input yields no GUIDs" (@(Get-CoworkHcsGuids -ListOutput $null).Count -eq 0) ""
+Assert-Case "a GUID with no cowork-vm on its line is ignored" `
+    (@(Get-CoworkHcsGuids -ListOutput "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE`ncowork-vm-x").Count -eq 0) ""
+
 $script:HcsListToReturn = $realHcsList
 $script:KilledGuids     = @()
 

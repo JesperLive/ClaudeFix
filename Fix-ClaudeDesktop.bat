@@ -20,12 +20,19 @@ echo.
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
 
-:: PS1 already shows "Press any key to close..." so we just exit.
-:: Only pause on PS1 launch failure (errorlevel from powershell itself).
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo   [!] PowerShell exited with error code %ERRORLEVEL%
-    echo       If you see a red error above, please screenshot it.
-    echo.
-    pause
-)
+:: Exit code 1 means the script RAN and reported a problem. From v6.0.0 the
+:: script sets that deliberately when retries are exhausted or an unhandled
+:: error occurs. It has already explained why and waited for a keypress, so
+:: pausing again here would double-prompt and imply the launcher failed.
+::
+:: Anything other than 0 or 1 means PowerShell itself could not run the script,
+:: which is worth stopping for.
+if %ERRORLEVEL% EQU 0 exit /b 0
+if %ERRORLEVEL% EQU 1 exit /b 1
+
+echo.
+echo   [!] PowerShell could not run the script (exit code %ERRORLEVEL%)
+echo       If you see a red error above, please screenshot it.
+echo.
+pause
+exit /b %ERRORLEVEL%

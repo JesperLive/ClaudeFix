@@ -15,9 +15,15 @@ echo.
 echo   Stopping Claude Desktop cleanly...
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" -Close %*
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo   [!] PowerShell exited with error code %ERRORLEVEL%
-    echo.
-    pause
-)
+
+:: Exit code 1 means the script ran and reported a problem, and it has already
+:: said so and waited for a keypress. Only stop here when PowerShell itself
+:: could not run it.
+if %ERRORLEVEL% EQU 0 exit /b 0
+if %ERRORLEVEL% EQU 1 exit /b 1
+
+echo.
+echo   [!] PowerShell could not run the script (exit code %ERRORLEVEL%)
+echo.
+pause
+exit /b %ERRORLEVEL%

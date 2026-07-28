@@ -24,9 +24,18 @@ echo.
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT%" %*
 
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo   [!] PowerShell exited with error code %ERRORLEVEL%
-    echo.
-    pause
+:: Exit code 1 means the monitor refused to start and wrote the reason to the
+:: watch log, for example because Fix-ClaudeDesktop.ps1 was not found next to
+:: it. Pause so a person who double-clicked this can read it.
+if %ERRORLEVEL% EQU 0 exit /b 0
+
+echo.
+if %ERRORLEVEL% EQU 1 (
+    echo   [!] The health monitor stopped on startup. The reason was written to:
+    echo       %APPDATA%\Claude\watch-logs\
+) else (
+    echo   [!] PowerShell could not run the script (exit code %ERRORLEVEL%)
 )
+echo.
+pause
+exit /b %ERRORLEVEL%

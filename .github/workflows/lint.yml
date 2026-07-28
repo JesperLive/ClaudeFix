@@ -42,6 +42,18 @@ jobs:
         shell: powershell
         run: .\.ci\Test-BackupLogic.ps1
 
+      - name: Parser and arithmetic logic
+        shell: powershell
+        run: .\.ci\Test-ParserLogic.ps1
+
+      - name: Launcher exit codes
+        shell: powershell
+        run: .\.ci\Test-BatExitCodes.ps1
+
+      - name: Elevation forwarding
+        shell: powershell
+        run: .\.ci\Test-Elevation.ps1
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: |

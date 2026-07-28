@@ -8,6 +8,49 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.0.1] - 2026-07-28
+
+Follow-up to 6.0.0. Four defects, three of them in code 6.0.0 changed, plus the
+launchers, which no release had ever looked at.
+
+### Fixed
+
+- `Prevent-ClaudeIssues.ps1 -WhatIf` applied every change for real. The script
+  relaunches itself elevated, and that relaunch forwarded `-Undo` but not
+  `-WhatIf`. A dry run therefore became a real run the moment UAC was accepted.
+  The same relaunch also returned success immediately instead of waiting for
+  the elevated process, so a failed run reported as a clean one.
+- All four `.bat` launchers treated any non-zero exit as a launcher failure and
+  asked the user to screenshot an error. 6.0.0 made the repair script exit 1
+  deliberately when retries are exhausted, which turned a normal, already
+  explained outcome into a second alarming prompt.
+- The HCS cleanup step in `Prevent-ClaudeIssues.ps1` still used `hcsdiag close`,
+  which is not a verb hcsdiag has, and still ran even while Claude was open, so
+  "stale" could mean the VM the user was working in. 6.0.0 fixed this in the
+  repair script and the health monitor and missed the third copy.
+- The `hcsdiag list` parse now exists once, in the shared discovery region,
+  instead of four times across three scripts. Each copy had its own version of
+  the same two mistakes, and fixing one did nothing for the others.
+
+### Changed
+
+- The health monitor reports guest-connect as dormant, rather than active, when
+  `cowork-service.log` is stale or missing. On builds that do not write that log
+  the check cannot fire, and the startup banner used to claim it was armed.
+- `Prevent-ClaudeIssues.ps1` uses discovered paths and names throughout rather
+  than only in its constants block. The service name, service executable and
+  Claude data folder are read from discovery at every site, including the boot
+  task it generates, where the value is baked in at install time because that
+  task runs standalone.
+
+### Added
+
+- Two CI gates. One runs each launcher with a stubbed exit code and asserts what
+  the user sees. The other reads the source and asserts that any script which
+  self-elevates forwards `-WhatIf` across the boundary, waits for the child, and
+  propagates its exit code. The parser gate now also runs against the shared
+  hcsdiag parser directly, including the double-count case.
+
 ## [6.0.0] - 2026-07-28
 
 One version across all three scripts. The largest change is that the toolkit
