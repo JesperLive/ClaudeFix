@@ -1,0 +1,125 @@
+# Changelog
+
+Reconstructed from the 14 GitHub releases and their tags. Everything before
+6.0.0 shipped under `UpdateN` and `HotfixN` tags while the three scripts each
+carried their own independent version number, so the version column below is
+the one the release title claimed, not something the tag encodes.
+
+From 6.0.0 onward there is one version for the whole toolkit, and tags are
+semver. The old tags stay where they are.
+
+## [6.0.0] - 2026-07-28
+
+One version across all three scripts. The largest change is that the toolkit
+now discovers where Claude is installed instead of assuming, and that several
+repairs which reported success were not doing anything at all.
+
+### Fixed, and these were not working before
+
+- HCS cleanup did nothing. Every call used `hcsdiag close`, and hcsdiag has no
+  `close` verb. Ten call sites in the repair script and one more in the health
+  monitor logged success for an operation that never ran.
+- The `hcsdiag list` parser could not match real output. It expected a GUID
+  alone on a line; hcsdiag prints it mid-line alongside the name. Both copies
+  of the parser, in two different scripts, always returned an empty list.
+- The health monitor could never repair anything. It preferred a log file last
+  written in March, so its session check reported an active session forever and
+  every repair took the "blocked" branch.
+- Session liveness was derived from log markers that do not exist in the
+  current log format.
+- The VHDX backup checked for 720 MB of free space before copying a file that
+  is over 3 GB. The check passed, the copy ran out of room, the partial was
+  deleted, and the purge then destroyed the original.
+- The VHDX restore ran after the service had been restarted, by which point the
+  service had recreated the directory tree, so the restore declined to
+  overwrite it. A 3 GB backup was abandoned on every deep run, silently.
+- The escalation restore wrote one directory level too shallow and walked the
+  cache directories in the opposite order to the backup.
+- A clock-drift check that has never executed: matching against an array never
+  populates `$Matches`, so reading it threw and an empty catch hid it.
+- A Hyper-V heartbeat monitor that has never fired, because `Get-VM` does not
+  enumerate HCS compute systems. It is now documented as such rather than
+  advertised in the startup banner.
+- Idle-time detection broke after 24.9 days of uptime, because `TickCount` is
+  signed and wraps negative. Every quiet run then decided the user was active
+  and exited without doing anything.
+- The temp-file cleanup never ran: reading `.Length` on a directory throws
+  under StrictMode, and the surrounding empty catch swallowed it.
+
+### Fixed, and these were actively harmful
+
+- `-SkipLaunch` could purge 13 GB of cache and then fail, because the
+  escalation path it fell into read variables that only exist in the branch it
+  had skipped.
+- A single smart run could purge the cache twice, the second time part way
+  through the re-download, so the repair could never converge.
+- The deep escalation had no administrator check, so a non-elevated run could
+  destroy the cache and then be unable to restart the service.
+- One of the three purge blocks had no `-WhatIf` gate at all, so a dry run
+  deleted 13 GB.
+- The health monitor's user-activity guard failed open. Any unexpected error
+  meant "nobody is using this", and the repair proceeded while someone worked.
+- The monitor called the repair script in-process, and the repair script
+  self-elevates, so from an unattended task it either raised a consent dialog
+  nobody could answer while blocking the monitor, or failed.
+- A `New-NetNat` auto-repair could claim a NAT over WSL's or Docker's switch,
+  with a hardcoded /24 and no confirmation.
+- Session transcripts older than 7 days were deleted on every run, in every
+  mode, while the help text stated that conversations were never touched. This
+  is now `-PurgeSessions`, off by default.
+
+### Changed
+
+- Locations are discovered at run time: package, executable, service binary,
+  log directory, VM cache and VHDX inventory. The dead `%ProgramData%\Claude`
+  paths and two hardcoded `C:` drive letters are gone.
+- The health monitor's cooldown and repair history persist across restarts, so
+  a repair loop can no longer escape its own backoff by crashing.
+- Log baselines are keyed on file identity rather than path, so Electron's log
+  rotation can no longer make historical errors look new.
+- Detection runs on signals verifiable on the current build. The eleven legacy
+  error strings, none of which appears anywhere in 35 MB of current logs, are
+  kept as a secondary set.
+- The workspace wait is wall-clock and extends while the cache is still
+  downloading, so a slow connection is no longer mistaken for a hung VM.
+- Exit codes mean something: 0 for a clean run, 1 for an unhandled error or
+  exhausted retries.
+
+### Added
+
+- `-PurgeSessions` for session transcript cleanup, off by default.
+- A storage check for whether the VM cache is readable and its volume has room.
+- CI on every push: syntax, ASCII-only, undefined variables, version
+  agreement, shared-region drift, backup purge logic, and PSScriptAnalyzer.
+- A bug report template that collects the diagnostics these issues always need.
+
+### Removed
+
+- A brute-force filesystem scan for the executable that could not reach a
+  WindowsApps install and whose result was rejected by the launch path anyway.
+- An MSIX recovery path that looked for `resources\app\...` when the real
+  layout is `app\resources\`, for a file that does not ship in the package.
+- A session-file counter that called 10,433 files critical on every poll, held
+  a repair trigger permanently open, and cost 1.8 seconds of disk enumeration
+  every 30 seconds.
+
+## Earlier releases
+
+These shipped before the toolkit had a single version. Titles are as published.
+
+| Tag | Date | Release |
+|---|---|---|
+| Update11 | 2026-07-27 | ClaudeFix v5.4.0: missing AppData folder fix + service prerequisite diagnostics |
+| Update10 | 2026-03-23 | ClaudeFix Hotfix |
+| Update9 | 2026-03-22 | v4.8.6 Audit cleanup, dead code removal, version sync |
+| Hotfix3 | 2026-03-09 | ClaudeFix v4.8.5 Power Plan Fix + Boot Prep + README Overhaul |
+| Update8 | 2026-03-09 | ClaudeFix v4.8.4 Non-Destructive Boot Prep + README Overhaul |
+| Hotfix2 | 2026-03-09 | ClaudeFix v4.8.0: HCS hardening, robustness fixes, encoding fix |
+| Update7 | 2026-03-09 | ClaudeFix v4.8.0: HCS hardening, robustness fixes, README update |
+| Update6 | 2026-03-08 | v4.7.0: Interactive menu, smart VHDX backup/restore, HvHost fallback, vmwp kill, WSL2 detection |
+| Update5 | 2026-03-08 | v4.6.0: Fix race conditions and add persistent failure escalation |
+| Update4 | 2026-03-08 | Update 4 |
+| Update3 | 2026-03-07 | Quick Hotfix and additional information in README |
+| Update2 | 2026-03-07 | ClaudeFix 07/03/2026 |
+| Hotfix | 2026-03-06 | ClaudeFix Hotfix |
+| Release | 2026-03-05 | ClaudeFix Release |

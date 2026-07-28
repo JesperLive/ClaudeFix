@@ -1,0 +1,19 @@
+# Working documents, not part of the toolkit
+AUDIT-*.md
+RELEASE_NOTES.txt
+COMMITMSG.txt
+
+# Backups left by editors and by cowork_util byte-replace
+*.bak
+*.bak.*
+
+# Release artefacts
+*.zip
+
+# Anything the scripts themselves produce, in case someone runs them from a
+# clone rather than from an install
+fix-logs/
+watch-logs/
+vhdx-backup/
+claude-env.json
+watch-state.json

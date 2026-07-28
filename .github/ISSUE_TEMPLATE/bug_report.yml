@@ -1,0 +1,84 @@
+name: Bug report
+description: Something in the toolkit did not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The fields below are the ones that actually get asked for every time,
+        so answering them up front usually saves a round trip.
+
+        If you would rather not paste output by hand: run
+        `Fix-ClaudeDesktop.bat` once and attach
+        `%APPDATA%\Claude\fix-logs\claude-env.json`. It contains everything in
+        the "Environment" section below, gathered automatically.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: input
+    id: script
+    attributes:
+      label: Which script
+      placeholder: Fix-ClaudeDesktop, Watch-ClaudeHealth, or Prevent-ClaudeIssues
+    validations:
+      required: true
+
+  - type: textarea
+    id: env-artifact
+    attributes:
+      label: Environment (paste claude-env.json, or run the commands below)
+      description: |
+        Easiest: attach `%APPDATA%\Claude\fix-logs\claude-env.json`.
+
+        Otherwise, run these in an elevated PowerShell and paste the output:
+
+        ```
+        Get-AppxPackage -Name Claude | Select-Object Name, Version, PackageFullName, InstallLocation
+        sc.exe qc CoworkVMService
+        Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform | Select-Object FeatureName, State
+        Get-Service vmcompute, hns | Select-Object Name, Status, StartType
+        bcdedit /enum "{current}" | Select-String hypervisorlaunchtype
+        [System.Environment]::OSVersion.Version
+        $PSVersionTable.PSVersion
+        ```
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: transcript
+    attributes:
+      label: Run transcript
+      description: |
+        The newest file from `%APPDATA%\Claude\fix-logs\`. If you were using
+        the health monitor, the newest file from `%APPDATA%\Claude\watch-logs\`
+        is more useful.
+
+        Please paste the whole thing rather than the last few lines. The
+        interesting part is usually earlier than it looks.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: toolkit-version
+    attributes:
+      label: Toolkit version
+      description: The banner prints it at the top of every run.
+      placeholder: 6.0.0
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Before submitting
+      options:
+        - label: I ran the script as Administrator (or noted below that I could not)
+        - label: I checked whether the transcript contains anything I would rather not post publicly

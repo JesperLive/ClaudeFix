@@ -1,0 +1,62 @@
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    # windows-latest on purpose. These scripts target Windows PowerShell 5.1,
+    # and several of the things they guard against are 5.1 specific: no
+    # TickCount64, a BOM from Out-File -Encoding utf8, cp1252 console output.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax
+        shell: powershell
+        run: .\.ci\Test-Syntax.ps1
+
+      - name: ASCII only
+        shell: powershell
+        run: .\.ci\Test-Ascii.ps1
+
+      - name: No undefined variables
+        shell: powershell
+        run: .\.ci\Test-UndefinedVars.ps1
+
+      - name: Toolkit version agreement
+        shell: powershell
+        run: .\.ci\Test-Version.ps1
+
+      - name: Shared region in sync
+        shell: powershell
+        run: .\.ci\Test-RegionSync.ps1
+
+      - name: Backup purge decision
+        shell: powershell
+        run: .\.ci\Test-BackupLogic.ps1
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          Import-Module PSScriptAnalyzer
+          $targets = @(
+            'Fix-ClaudeDesktop.ps1',
+            'Watch-ClaudeHealth.ps1',
+            'Prevent-ClaudeIssues.ps1'
+          )
+          $all = @()
+          foreach ($t in $targets) {
+            $all += @(Invoke-ScriptAnalyzer -Path $t -Settings .\PSScriptAnalyzerSettings.psd1)
+          }
+          if ($all.Count -gt 0) {
+            $all | Format-Table Severity, ScriptName, Line, RuleName, Message -AutoSize -Wrap
+            Write-Host ("PSScriptAnalyzer: {0} finding(s)" -f $all.Count)
+            exit 1
+          }
+          Write-Host "PSScriptAnalyzer: clean"

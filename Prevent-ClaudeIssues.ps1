@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Claude Desktop / Cowork -- Preventive Configuration
+    Claude Desktop / Cowork, Preventive Configuration
 
 .DESCRIPTION
     One-shot script that configures Windows to minimise VirtioFS/Plan9
@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 2.0.1
+    Version : 6.0.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -71,14 +71,418 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 
 Set-StrictMode -Version Latest
+# =====================================================================
+# region ClaudeEnv
+#
+# Runtime discovery. This block is byte-identical in Fix-ClaudeDesktop.ps1,
+# Watch-ClaudeHealth.ps1 and Prevent-ClaudeIssues.ps1, and CI fails the build
+# if they drift. The canonical copy lives at .ci/ClaudeEnv.region.ps1.
+#
+# Do not hand-edit a single copy. Edit the canonical file, then resync all
+# three. Three hand-maintained copies is exactly how findings 15, 28, 32 and
+# 53 happened.
+# =====================================================================
+#region ClaudeEnv
+function Get-ClaudeEnvironment {
+    <#
+    .SYNOPSIS
+        Discovers where this machine's Claude Desktop install actually lives.
+    .DESCRIPTION
+        Every location the toolkit acts on is queried at run time rather than
+        guessed at authoring time. Nothing here throws. Anything that cannot be
+        determined stays $null and is recorded in Warnings, so a partial result
+        is still usable by a caller that only needs some of the fields.
+
+        Locations are discoverable and are discovered. Thresholds and log
+        signatures are NOT in scope here: those are not location problems and
+        cannot be fixed by looking harder at the filesystem.
+    .PARAMETER SkipCacheInventory
+        Skip the recursive walk of the VM cache. That walk is the expensive half
+        of discovery and only the backup and purge paths consume its results, so
+        anything that polls should pass this. CacheSizeBytes is left at -1 when
+        skipped, which is distinguishable from a genuine zero.
+    #>
+    param([switch]$SkipCacheInventory)
+
+    $info = [ordered]@{
+        SchemaVersion = 1
+        DiscoveredUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+        PackageFound      = $false
+        PackageFullName   = $null
+        PackageFamilyName = $null
+        PackageVersion    = $null
+        InstallLocation   = $null
+        ApplicationId     = $null
+        Aumid             = $null
+        IsMsix            = $false
+
+        ClaudeExe       = $null
+        ClaudeExeSource = $null
+
+        ServiceName               = 'CoworkVMService'
+        ServiceFound              = $false
+        ServiceStartMode          = $null
+        ServiceBinaryPath         = $null
+        ServiceProcessName        = 'cowork-svc'
+        ServiceRecoveryConfigured = $false
+
+        ProcessName = 'claude'
+
+        AppDataDir  = $null
+        LogDir      = $null
+        VmCachePath = $null
+        BundlePath  = $null
+        SessionsDir = $null
+
+        VmLogFile       = $null
+        VmLogCandidates = @()
+
+        VhdxFiles      = @()
+        CacheSizeBytes = 0
+
+        HcsDiagPath    = $null
+        PsVersion      = $PSVersionTable.PSVersion.ToString()
+        HasTickCount64 = $false
+        IsAdmin        = $false
+
+        Warnings = @()
+    }
+
+    # -- Host capabilities ------------------------------------------------
+    try {
+        $info.IsAdmin = ([Security.Principal.WindowsPrincipal] `
+            [Security.Principal.WindowsIdentity]::GetCurrent()
+            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { $info.Warnings += "Could not determine admin status: $($_.Exception.Message)" }
+
+    # TickCount64 is .NET Core and up. Windows PowerShell 5.1 runs on .NET
+    # Framework and does not have it, which is why the idle-time maths has to
+    # survive the 24.9 day TickCount wrap instead of just using the 64-bit call.
+    try { $null = [Environment]::TickCount64; $info.HasTickCount64 = $true }
+    catch { $info.HasTickCount64 = $false }
+
+    try {
+        $hcs = Join-Path $env:SystemRoot "System32\hcsdiag.exe"
+        if (Test-Path $hcs) { $info.HcsDiagPath = $hcs }
+        else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
+    } catch { $info.Warnings += "hcsdiag probe failed: $($_.Exception.Message)" }
+
+    # -- Per-user data locations -------------------------------------------
+    # %APPDATA% is the only location that exists on current builds. The old
+    # %ProgramData%\Claude tree is gone, so it is not probed here at all.
+    try {
+        if ($env:APPDATA) {
+            $info.AppDataDir  = Join-Path $env:APPDATA "Claude"
+            $info.LogDir      = Join-Path $info.AppDataDir "logs"
+            $info.VmCachePath = Join-Path $info.AppDataDir "claude-code-vm"
+            $info.BundlePath  = Join-Path $info.AppDataDir "vm_bundles"
+            $info.SessionsDir = Join-Path $info.AppDataDir "local-agent-mode-sessions"
+        } else {
+            $info.Warnings += "APPDATA is not set; per-user paths undiscoverable"
+        }
+    } catch { $info.Warnings += "AppData probe failed: $($_.Exception.Message)" }
+
+    # -- MSIX package -------------------------------------------------------
+    try {
+        $pkgs = @(Get-AppxPackage -Name "Claude*" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like "Claude*" })
+        if ($pkgs.Count -gt 1) {
+            $info.Warnings += "$($pkgs.Count) Claude packages registered; duplicates make the service start fail with error 87"
+            $pkgs = @($pkgs | Sort-Object -Property @{ Expression = {
+                try { [version]"$($_.Version)" } catch { [version]"0.0.0.0" }
+            }} -Descending)
+        }
+        if ($pkgs.Count -gt 0) {
+            $p = $pkgs[0]
+            $info.PackageFound     = $true
+            $info.IsMsix           = $true
+            $info.PackageFullName  = "$($p.PackageFullName)"
+            $info.PackageFamilyName = "$($p.PackageFamilyName)"
+            $info.InstallLocation  = "$($p.InstallLocation)"
+            # Get-AppxPackage hands back Version as a String on Windows
+            # PowerShell 5.1, so the PackageVersion struct accessors are not
+            # there. PackageFullName carries the same version as a second source.
+            try { $info.PackageVersion = "$($p.Version)" } catch { $null = $_ }
+            if (-not $info.PackageVersion -and $info.PackageFullName) {
+                try {
+                    $parts = @($info.PackageFullName -split '_')
+                    if ($parts.Count -ge 2) { $info.PackageVersion = $parts[1] }
+                } catch { $null = $_ }
+            }
+        }
+    } catch { $info.Warnings += "Package query failed: $($_.Exception.Message)" }
+
+    # Application Id comes from the manifest. The old hardcoded "App" fallback
+    # produced an invalid AUMID, and it only ever ran when the manifest read had
+    # already failed, which is precisely when a wrong guess does damage.
+    if ($info.InstallLocation) {
+        try {
+            $manifestPath = Join-Path $info.InstallLocation "AppxManifest.xml"
+            if (Test-Path $manifestPath) {
+                [xml]$mx = Get-Content $manifestPath -ErrorAction Stop
+                $ns = New-Object Xml.XmlNamespaceManager($mx.NameTable)
+                $ns.AddNamespace("x", "http://schemas.microsoft.com/appx/manifest/foundation/windows10")
+                $appNode = $mx.SelectSingleNode("//x:Application", $ns)
+                if ($appNode) { $info.ApplicationId = $appNode.GetAttribute("Id") }
+            }
+        } catch { $info.Warnings += "Manifest read failed: $($_.Exception.Message)" }
+    }
+    if (-not $info.ApplicationId -and $info.PackageFound) {
+        # Every shipped Claude manifest to date uses Id="Claude", matching the
+        # package Name. Better than a literal guess, and it is recorded as one.
+        try { $info.ApplicationId = "$($pkgs[0].Name)" } catch { $null = $_ }
+        if ($info.ApplicationId) {
+            $info.Warnings += "Application Id fell back to package name '$($info.ApplicationId)'"
+        }
+    }
+    if ($info.PackageFamilyName -and $info.ApplicationId) {
+        $info.Aumid = "shell:AppsFolder\$($info.PackageFamilyName)!$($info.ApplicationId)"
+    }
+
+    # -- Claude executable ---------------------------------------------------
+    # Ordered by authority, not by convenience. The package branch runs first
+    # because it is the only source that reliably identifies the DESKTOP app,
+    # and it is also what makes a WindowsApps install reachable at all: no
+    # filesystem search path covers WindowsApps and a brute scan cannot read its
+    # TrustedInstaller ACL.
+    #
+    # Reading the path off a running process looks more reliable but is not.
+    # The Claude Code CLI also runs as a process named "claude", out of
+    # %APPDATA%\Claude\claude-code\<version>\claude.exe. Measured on this
+    # machine: 3 of 16 "claude" processes were the CLI. Taking the first
+    # readable one can therefore cache the CLI path and turn every later
+    # relaunch into a CLI start instead of an app start.
+    $cliPattern = '[\\/]claude-code[\\/]'
+    if ($info.InstallLocation) {
+        foreach ($rel in @('app\claude.exe', 'claude.exe')) {
+            try {
+                $cand = Join-Path $info.InstallLocation $rel
+                if (Test-Path $cand) {
+                    $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'package'; break
+                }
+            } catch { $null = $_ }
+        }
+    }
+    if (-not $info.ClaudeExe) {
+        try {
+            foreach ($rp in @(Get-Process -Name $info.ProcessName -ErrorAction SilentlyContinue)) {
+                try {
+                    $cand = $rp.MainModule.FileName
+                    if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                        $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'process'; break
+                    }
+                } catch { $null = $_ }
+            }
+        } catch { $null = $_ }
+    }
+    if (-not $info.ClaudeExe) {
+        try {
+            foreach ($wp in @(Get-CimInstance Win32_Process -Filter "Name LIKE '%claude%'" `
+                              -ErrorAction SilentlyContinue)) {
+                $cand = "$($wp.ExecutablePath)"
+                if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                    $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'wmi'; break
+                }
+            }
+        } catch { $null = $_ }
+    }
+    if (-not $info.ClaudeExe) {
+        foreach ($cand in @(
+            (Join-Path $env:LOCALAPPDATA "Programs\claude\Claude.exe"),
+            (Join-Path $env:LOCALAPPDATA "AnthropicClaude\Claude.exe"),
+            (Join-Path $env:LOCALAPPDATA "Anthropic\Claude\Claude.exe"),
+            (Join-Path $env:ProgramFiles "Claude\Claude.exe")
+        )) {
+            try { if ($cand -and (Test-Path $cand)) {
+                $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'commonpath'; break
+            } } catch { $null = $_ }
+        }
+    }
+    if (-not $info.ClaudeExe) { $info.Warnings += "Claude executable not located" }
+
+    # -- Service -------------------------------------------------------------
+    try {
+        $svc = Get-Service -Name $info.ServiceName -ErrorAction SilentlyContinue
+        if ($svc) {
+            $info.ServiceFound = $true
+            try {
+                $cim = Get-CimInstance Win32_Service `
+                       -Filter "Name='$($info.ServiceName)'" -ErrorAction Stop
+                if ($cim) {
+                    $info.ServiceStartMode = "$($cim.StartMode)"
+                    $raw = "$($cim.PathName)"
+                    if ($raw) {
+                        # PathName may be quoted and may carry arguments.
+                        if ($raw -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
+                        elseif ($raw -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
+                        else { $exe = $raw.Trim() }
+                        $info.ServiceBinaryPath = $exe
+                        try {
+                            $leaf = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+                            if ($leaf) { $info.ServiceProcessName = $leaf }
+                        } catch { $null = $_ }
+                    }
+                }
+            } catch {
+                try { $info.ServiceStartMode = "$($svc.StartType)" } catch { $null = $_ }
+            }
+        } else {
+            $info.Warnings += "$($info.ServiceName) is not registered"
+        }
+    } catch { $info.Warnings += "Service query failed: $($_.Exception.Message)" }
+
+    # Recovery actions are read from the registry, not from parsed sc.exe output.
+    # Matching the literal string RESTART in console text fails on any Windows
+    # whose display language is not English.
+    try {
+        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($info.ServiceName)"
+        if (Test-Path $svcKey) {
+            $fa = (Get-ItemProperty -Path $svcKey -Name FailureActions `
+                   -ErrorAction SilentlyContinue).FailureActions
+            if ($fa) { $info.ServiceRecoveryConfigured = $true }
+        }
+    } catch { $null = $_ }
+
+    # -- VM log selection ----------------------------------------------------
+    # Deliberately restricted to VM-relevant logs. main.log is excluded: it is
+    # the Electron main process log and it can sit frozen for a day at a time on
+    # a perfectly healthy machine, so keying staleness on it is a guaranteed
+    # false positive. Newest wins, and the age is recorded so a caller can
+    # reject a candidate that predates its own lookback window.
+    try {
+        if ($info.LogDir -and (Test-Path $info.LogDir)) {
+            $cands = @()
+            foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
+                try {
+                    $p = Join-Path $info.LogDir $n
+                    if (Test-Path $p) {
+                        $fi = Get-Item $p -ErrorAction SilentlyContinue
+                        if ($fi) {
+                            $cands += [pscustomobject]@{
+                                Name          = $n
+                                Path          = $fi.FullName
+                                LastWriteTime = $fi.LastWriteTime
+                                AgeHours      = [math]::Round( `
+                                    ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
+                                Length        = $fi.Length
+                            }
+                        }
+                    }
+                } catch { $null = $_ }
+            }
+            $cands = @($cands | Sort-Object LastWriteTime -Descending)
+            $info.VmLogCandidates = $cands
+            if ($cands.Count -gt 0) { $info.VmLogFile = $cands[0].Path }
+            else { $info.Warnings += "No VM log present in $($info.LogDir)" }
+        }
+    } catch { $info.Warnings += "VM log probe failed: $($_.Exception.Message)" }
+
+    # -- VM cache inventory --------------------------------------------------
+    # One walk yields both the real cache size and the real VHDX sizes, so the
+    # backup space check can be computed from what is actually on disk instead
+    # of a literal, and the help text can quote a true figure.
+    if ($SkipCacheInventory) {
+        $info.CacheSizeBytes = [long](-1)
+    } else {
+        try {
+            $vhdx  = @()
+            $total = [long]0
+            foreach ($dir in @($info.VmCachePath, $info.BundlePath)) {
+                if (-not $dir -or -not (Test-Path $dir)) { continue }
+                foreach ($f in @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue)) {
+                    $total += $f.Length
+                    if ($f.Extension -eq '.vhdx') {
+                        $vhdx += [pscustomobject]@{
+                            Name   = $f.Name
+                            Path   = $f.FullName
+                            Length = $f.Length
+                        }
+                    }
+                }
+            }
+            $info.VhdxFiles      = @($vhdx)
+            $info.CacheSizeBytes = $total
+        } catch { $info.Warnings += "Cache inventory failed: $($_.Exception.Message)" }
+    }
+
+    return $info
+}
+
+function Save-ClaudeEnvironment {
+    <#
+    .SYNOPSIS
+        Persists a discovery result so sibling scripts and bug reports can use it.
+    .DESCRIPTION
+        Written as UTF-8 without a BOM. Out-File -Encoding utf8 emits a BOM on
+        Windows PowerShell 5.1, which breaks anything reading the file as plain
+        JSON. Never throws: persistence is a convenience, not a dependency.
+    #>
+    param(
+        [Parameter(Mandatory)]$Environment,
+        [Parameter(Mandatory)][string]$Path
+    )
+    try {
+        $dir = Split-Path $Path -Parent
+        if ($dir -and -not (Test-Path $dir)) {
+            New-Item $dir -ItemType Directory -Force | Out-Null
+        }
+        $json = $Environment | ConvertTo-Json -Depth 4
+        [System.IO.File]::WriteAllText($Path, $json, `
+            (New-Object System.Text.UTF8Encoding($false)))
+        return $true
+    } catch { return $false }
+}
+
+function Import-ClaudeEnvironment {
+    <#
+    .SYNOPSIS
+        Reads a persisted discovery result, but only if it still describes this
+        machine's current install.
+    .DESCRIPTION
+        Returns $null when the file is missing, unreadable, from a different
+        schema, or stamped with a package version other than the one asked for.
+        That version stamp is the whole point: the existing .claude-exe-path
+        cache has no stamp, which is why a stale entry there survives until
+        something downstream trips over it.
+
+        Pass -ExpectedPackageVersion from a live query when correctness matters.
+        Omit it to accept whatever was recorded, which is fine for bug reports.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$ExpectedPackageVersion
+    )
+    try {
+        if (-not (Test-Path $Path)) { return $null }
+        $raw = Get-Content $Path -Raw -ErrorAction Stop
+        if (-not $raw) { return $null }
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        if (-not $obj) { return $null }
+        if ($obj.SchemaVersion -ne 1) { return $null }
+        if ($ExpectedPackageVersion -and
+            "$($obj.PackageVersion)" -ne "$ExpectedPackageVersion") { return $null }
+        return $obj
+    } catch { return $null }
+}
+#endregion ClaudeEnv
+
+# -- Runtime discovery -----------------------------------------------
+# -SkipCacheInventory: nothing here needs the VHDX inventory, and the walk is
+# the expensive half of discovery.
+$script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$Version          = "2.0.1"
+$ToolkitVersion   = "6.0.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
-$ServiceName      = "CoworkVMService"
-$ClaudeAppData    = Join-Path $env:APPDATA "Claude"
+$ClaudeAppData    = $script:ClaudeEnv.AppDataDir
+
+if (-not $ClaudeAppData) {
+    Write-Host "  [!] Could not locate the per-user Claude folder under %APPDATA%." -ForegroundColor Red
+    exit 1
+}
 $BackupFile       = Join-Path $ClaudeAppData "power-plan-backup.txt"
 $CsBackupFile     = Join-Path $ClaudeAppData "connected-standby-backup.txt"
 
@@ -113,14 +517,14 @@ function Initialize-ClaudeAppData {
 function Save-StateFile {
     param([string]$Path, [string]$Value, [string]$Label)
     if (-not (Initialize-ClaudeAppData)) {
-        Log "Could not create $script:ClaudeAppData -- $Label not saved" -Colour DarkYellow -Indent
+        Log "Could not create $script:ClaudeAppData, $Label not saved" -Colour DarkYellow -Indent
         return $false
     }
     try {
         $Value | Out-File -FilePath $Path -Encoding ascii -Force -ErrorAction Stop
         return $true
     } catch {
-        Log "Could not write $Label -- continuing" -Colour DarkYellow -Indent
+        Log "Could not write $Label, continuing" -Colour DarkYellow -Indent
         return $false
     }
 }
@@ -133,13 +537,13 @@ function Get-ActivePlanGuid {
 # -- Header ----------------------------------------------------------
 Write-Host ""
 Write-Host "  +----------------------------------------------+" -ForegroundColor Cyan
-Write-Host "  |  CLAUDE DESKTOP / COWORK -- PREVENTION SETUP  |" -ForegroundColor Cyan
-Write-Host "  |  v$Version                                       |" -ForegroundColor DarkGray
+Write-Host "  |  CLAUDE DESKTOP / COWORK, PREVENTION SETUP   |" -ForegroundColor Cyan
+Write-Host "  |  v$ToolkitVersion                                      |" -ForegroundColor DarkGray
 Write-Host "  +----------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
 
 if ($Undo) {
-    Write-Host "  MODE: UNDO -- reverting all changes" -ForegroundColor Yellow
+    Write-Host "  MODE: UNDO, reverting all changes" -ForegroundColor Yellow
     Write-Host ""
 }
 
@@ -160,7 +564,7 @@ if ($Undo) {
             Log "Restored plan: $originalGuid" -Colour Green -Indent
             Remove-Item $BackupFile -Force -ErrorAction SilentlyContinue
         } else {
-            Log "Backup file corrupt -- please set your power plan manually" -Colour Yellow -Indent
+            Log "Backup file corrupt, please set your power plan manually" -Colour Yellow -Indent
         }
         # Clean up any ClaudeFix-created Ultimate Performance plans
         $planLines = powercfg /list | Where-Object { $_ -match 'Ultimate Performance' }
@@ -175,7 +579,7 @@ if ($Undo) {
             Log "Deleted $deleteCount Ultimate Performance plan(s)" -Colour DarkGray -Indent
         }
     } else {
-        Log "No backup found -- power plan was not changed by this script" -Colour DarkGray -Indent
+        Log "No backup found, power plan was not changed by this script" -Colour DarkGray -Indent
     }
 
     Step 2 $steps "Re-enabling hibernate and Fast Startup..."
@@ -187,7 +591,7 @@ if ($Undo) {
         Set-ItemProperty -Path $regPath -Name "HiberbootEnabled" -Value 1 -ErrorAction SilentlyContinue
         Log "Fast Startup: On" -Colour Green -Indent
     } catch {
-        Log "Could not re-enable Fast Startup -- not critical" -Colour DarkGray -Indent
+        Log "Could not re-enable Fast Startup, not critical" -Colour DarkGray -Indent
     }
 
     Step 3 $steps "Resetting sleep timeout to 30 minutes (AC)..."
@@ -202,21 +606,20 @@ if ($Undo) {
             Log "Connected Standby restored to: $originalCs" -Colour Green -Indent
             Remove-Item $CsBackupFile -Force -ErrorAction SilentlyContinue
         } catch {
-            Log "Could not restore Connected Standby -- check manually" -Colour Yellow -Indent
+            Log "Could not restore Connected Standby, check manually" -Colour Yellow -Indent
         }
     } else {
-        Log "No Connected Standby backup found -- was not changed" -Colour DarkGray -Indent
+        Log "No Connected Standby backup found, was not changed" -Colour DarkGray -Indent
     }
 
     Step 5 $steps "Re-enabling network adapter power management..."
     try {
         $nics = Get-NetAdapter -Physical -ErrorAction SilentlyContinue
         foreach ($nic in $nics) {
-            $pnp = Get-PnpDeviceProperty -InstanceId $nic.PnPDeviceID `
-                       -KeyName "DEVPKEY_Device_Class" -ErrorAction SilentlyContinue
-            # Re-enable via registry -- AllowIdleIrpInD3 = 1
-            $regBase = "HKLM:\SYSTEM\CurrentControlSet\Control\Class"
-            # Use powershell to set PnPCapabilities back to 0 (default)
+            # The $pnp query and the $regBase path that used to be here are
+            # gone: both were assigned and never read. Removing the PnP
+            # capabilities value below is what actually restores the default,
+            # and it needs neither of them.
             $devPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($nic.PnPDeviceID)\Device Parameters"
             if (Test-Path $devPath) {
                 Remove-ItemProperty -Path $devPath -Name "PnPCapabilities" -ErrorAction SilentlyContinue
@@ -225,7 +628,7 @@ if ($Undo) {
         Log "Network adapter power management: Restored to defaults" -Colour Green -Indent
         Log "A reboot is required for this change to take effect" -Colour DarkGray -Indent
     } catch {
-        Log "Could not restore network adapter settings -- not critical" -Colour DarkGray -Indent
+        Log "Could not restore network adapter settings, not critical" -Colour DarkGray -Indent
     }
 
     Step 6 $steps "Re-enabling Hyper-V Dynamic Memory..."
@@ -239,13 +642,13 @@ if ($Undo) {
                 Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $true -ErrorAction Stop
                 Log "Dynamic Memory re-enabled for VM '$vmName'" -Colour Green -Indent
             } else {
-                Log "VM '$vmName' is running -- restart it to re-enable Dynamic Memory" -Colour DarkYellow -Indent
+                Log "VM '$vmName' is running, restart it to re-enable Dynamic Memory" -Colour DarkYellow -Indent
             }
         } else {
-            Log "No Claude VM found -- nothing to restore" -Colour DarkGray -Indent
+            Log "No Claude VM found, nothing to restore" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not restore Dynamic Memory -- Hyper-V module may not be available" -Colour DarkGray -Indent
+        Log "Could not restore Dynamic Memory, Hyper-V module may not be available" -Colour DarkGray -Indent
     }
     # Clean up flag file
     $flagFile = Join-Path $env:APPDATA "Claude\disable-dynamic-memory.flag"
@@ -268,17 +671,17 @@ if ($Undo) {
             $current = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -ErrorAction SilentlyContinue).ServicesPipeTimeout
             if ($null -ne $current -and $current -eq 120000) {
                 Remove-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name ServicesPipeTimeout -ErrorAction Stop
-                Log "ServicesPipeTimeout: Removed (was 120000ms -- set by this script)" -Colour Green -Indent
+                Log "ServicesPipeTimeout: Removed (was 120000ms, set by this script)" -Colour Green -Indent
             } elseif ($null -ne $current) {
                 Log "ServicesPipeTimeout: Left at ${current}ms (not set by this script)" -Colour DarkGray -Indent
             } else {
                 Log "ServicesPipeTimeout: Not set" -Colour DarkGray -Indent
             }
         } catch {
-            Log "Could not remove ServicesPipeTimeout -- not critical" -Colour DarkGray -Indent
+            Log "Could not remove ServicesPipeTimeout, not critical" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not revert HCS configuration -- not critical" -Colour DarkGray -Indent
+        Log "Could not revert HCS configuration, not critical" -Colour DarkGray -Indent
     }
 
     Step 8 $steps "Removing scheduled tasks and health monitor..."
@@ -290,7 +693,7 @@ if ($Undo) {
                 Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
                 Log "Stopped running health monitor (PID $($_.ProcessId))" -Colour Green -Indent
             }
-    } catch {}
+    } catch { $null = $_ }
     $removedAny = $false
     foreach ($tName in @($TaskName, $BootTaskName)) {
         try {
@@ -367,7 +770,7 @@ if ($Undo) {
             }
         }
     } catch {
-        Log "Could not fully remove elevation config -- not critical" -Colour DarkGray -Indent
+        Log "Could not fully remove elevation config, not critical" -Colour DarkGray -Indent
     }
 
     Step 11 $steps "Reverting admin token policy..."
@@ -381,7 +784,7 @@ if ($Undo) {
                 Log "LocalAccountTokenFilterPolicy: Removed (restored default filtering)" -Colour Green -Indent
                 $reverted = $true
             }
-        } catch {}
+        } catch { $null = $_ }
         try {
             $fat = (Get-ItemProperty -Path $policyPath -ErrorAction Stop).FilterAdministratorToken
             if ($null -ne $fat -and $fat -eq 0) {
@@ -389,19 +792,19 @@ if ($Undo) {
                 Log "FilterAdministratorToken: Removed (restored default)" -Colour Green -Indent
                 $reverted = $true
             }
-        } catch {}
+        } catch { $null = $_ }
         if (-not $reverted) {
             Log "Token policy was not modified by this script" -Colour DarkGray -Indent
         } else {
             Log "A reboot is required for token policy changes to take effect" -Colour DarkYellow -Indent
         }
     } catch {
-        Log "Could not revert token policy -- not critical" -Colour DarkGray -Indent
+        Log "Could not revert token policy, not critical" -Colour DarkGray -Indent
     }
 
     Write-Host ""
     Write-Host "  +----------------------------------------------+" -ForegroundColor Green
-    Write-Host "  |           UNDO COMPLETE                       |" -ForegroundColor Green
+    Write-Host "  |           UNDO COMPLETE                      |" -ForegroundColor Green
     Write-Host "  +----------------------------------------------+" -ForegroundColor Green
     Write-Host ""
     Write-Host "  NOTE: A reboot is recommended for all changes to take full effect." -ForegroundColor DarkGray
@@ -478,7 +881,7 @@ if ($Undo) {
         $verifyName = (powercfg /getactivescheme) -replace '.*\(', '' -replace '\).*', ''
         Log "Active plan verified: $verifyName ($verifyPlan)" -Colour DarkGray -Indent
     } catch {
-        Log "Could not configure power plan -- not critical" -Colour DarkGray -Indent
+        Log "Could not configure power plan, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -489,7 +892,7 @@ if ($Undo) {
         powercfg /change standby-timeout-ac 0
         Log "Sleep on AC: Never" -Colour Green -Indent
     } catch {
-        Log "Could not change sleep timeout -- not critical" -Colour DarkGray -Indent
+        Log "Could not change sleep timeout, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -500,7 +903,7 @@ if ($Undo) {
         powercfg /h off
         Log "Hibernate: Off" -Colour Green -Indent
     } catch {
-        Log "Could not disable hibernate -- not critical" -Colour DarkGray -Indent
+        Log "Could not disable hibernate, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -513,7 +916,7 @@ if ($Undo) {
         powercfg /setactive $activePlan
         Log "USB selective suspend on AC: Disabled" -Colour Green -Indent
     } catch {
-        Log "Could not change USB setting -- not critical" -Colour DarkGray -Indent
+        Log "Could not change USB setting, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -524,7 +927,7 @@ if ($Undo) {
         powercfg /change disk-timeout-ac 0
         Log "Hard disk sleep on AC: Never" -Colour Green -Indent
     } catch {
-        Log "Could not change disk timeout -- not critical" -Colour DarkGray -Indent
+        Log "Could not change disk timeout, not critical" -Colour DarkGray -Indent
     }
 
     try {
@@ -533,7 +936,7 @@ if ($Undo) {
         powercfg /setactive $activePlan
         Log "PCI-E link state power management on AC: Off" -Colour Green -Indent
     } catch {
-        Log "Could not change PCI-E setting -- not critical" -Colour DarkGray -Indent
+        Log "Could not change PCI-E setting, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -546,10 +949,10 @@ if ($Undo) {
             Set-ItemProperty -Path $regPath -Name "HiberbootEnabled" -Value 0 -Type DWord -Force
             Log "Fast Startup: Disabled (registry)" -Colour Green -Indent
         } else {
-            Log "Fast Startup registry key not found -- may not be supported" -Colour DarkGray -Indent
+            Log "Fast Startup registry key not found, may not be supported" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not disable Fast Startup -- not critical" -Colour DarkGray -Indent
+        Log "Could not disable Fast Startup, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -559,7 +962,11 @@ if ($Undo) {
     try {
         $csRegPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Power"
         $csKey = Get-ItemProperty -Path $csRegPath -Name "CsEnabled" -ErrorAction SilentlyContinue
-        if ($null -ne $csKey -and $csKey.CsEnabled -ne $null) {
+        # $null on the LEFT of both comparisons. With $null on the right,
+        # PowerShell's comparison operators treat an array-valued left side as
+        # a filter and return the non-matching elements rather than a boolean,
+        # so the test can quietly produce the wrong answer.
+        if ($null -ne $csKey -and $null -ne $csKey.CsEnabled) {
             Save-StateFile -Path $CsBackupFile -Value $csKey.CsEnabled.ToString() -Label "Connected Standby backup" | Out-Null
             if ($csKey.CsEnabled -eq 1) {
                 Set-ItemProperty -Path $csRegPath -Name "CsEnabled" -Value 0 -Type DWord -Force
@@ -572,7 +979,7 @@ if ($Undo) {
             Log "Connected Standby: Not supported on this system (no CsEnabled key)" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not change Connected Standby -- not critical" -Colour DarkGray -Indent
+        Log "Could not change Connected Standby, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -593,7 +1000,7 @@ if ($Undo) {
                     -DisplayValue "Disabled" -ErrorAction SilentlyContinue
                 Set-NetAdapterAdvancedProperty -Name $nic.Name -DisplayName "Wake on Pattern Match" `
                     -DisplayValue "Disabled" -ErrorAction SilentlyContinue
-            } catch {}
+            } catch { $null = $_ }
             try {
                 $pnpDevice = Get-PnpDevice -InstanceId $nic.PnPDeviceID -ErrorAction SilentlyContinue
                 if ($pnpDevice) {
@@ -604,7 +1011,7 @@ if ($Undo) {
                         $powerMgmt | Set-CimInstance -Property @{Enable = $false} -ErrorAction SilentlyContinue
                     }
                 }
-            } catch {}
+            } catch { $null = $_ }
         }
         if ($nicCount -gt 0) {
             Log "Disabled power saving on $nicCount adapter(s)" -Colour Green -Indent
@@ -613,7 +1020,7 @@ if ($Undo) {
             Log "No physical network adapters found" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not change network adapter settings -- not critical" -Colour DarkGray -Indent
+        Log "Could not change network adapter settings, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -626,7 +1033,7 @@ if ($Undo) {
         powercfg /setactive $activePlan
         Log "Processor minimum state on AC: 100%" -Colour Green -Indent
     } catch {
-        Log "Could not change processor state -- not critical" -Colour DarkGray -Indent
+        Log "Could not change processor state, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -647,7 +1054,7 @@ if ($Undo) {
                     Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $false -ErrorAction Stop
                     Log "Dynamic Memory disabled for VM '$vmName'" -Colour Green -Indent
                 } else {
-                    Log "VM '$vmName' is running -- Dynamic Memory will be disabled on next restart" -Colour DarkYellow -Indent
+                    Log "VM '$vmName' is running, Dynamic Memory will be disabled on next restart" -Colour DarkYellow -Indent
                     $flagFile = Join-Path $ClaudeAppData "disable-dynamic-memory.flag"
                     if (Save-StateFile -Path $flagFile -Value $vmName -Label "dynamic memory flag") {
                         Log "Flag written: $flagFile" -Colour DarkGray -Indent
@@ -661,7 +1068,7 @@ if ($Undo) {
             Log "This is normal if Cowork hasn't been used yet" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not configure VM memory -- Hyper-V module may not be installed" -Colour DarkGray -Indent
+        Log "Could not configure VM memory, Hyper-V module may not be installed" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -678,7 +1085,7 @@ if ($Undo) {
                         $p.PriorityClass = 'AboveNormal'
                         $boosted++
                     }
-                } catch {}
+                } catch { $null = $_ }
             }
             if ($boosted -gt 0) {
                 Log "Boosted $boosted vmwp.exe process(es) to AboveNormal priority" -Colour Green -Indent
@@ -691,7 +1098,7 @@ if ($Undo) {
             Log "Health monitor will boost priority when VM starts" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not set process priority -- not critical" -Colour DarkGray -Indent
+        Log "Could not set process priority, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -704,10 +1111,10 @@ if ($Undo) {
         if ($verifyResult -match "RESTART") {
             Log "vmcompute failure recovery: restart after 30s/60s/120s (reset after 300s)" -Colour Green -Indent
         } else {
-            Log "vmcompute failure recovery set (could not verify -- non-critical)" -Colour DarkGray -Indent
+            Log "vmcompute failure recovery set (could not verify, non-critical)" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not configure vmcompute failure recovery -- not critical" -Colour DarkGray -Indent
+        Log "Could not configure vmcompute failure recovery, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -725,10 +1132,10 @@ if ($Undo) {
                 Log "CoworkVMService failure recovery set (could not verify)" -Colour DarkGray -Indent
             }
         } else {
-            Log "CoworkVMService not installed -- skipping" -Colour DarkGray -Indent
+            Log "CoworkVMService not installed, skipping" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not configure CoworkVMService recovery -- not critical" -Colour DarkGray -Indent
+        Log "Could not configure CoworkVMService recovery, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -773,7 +1180,7 @@ if ($Undo) {
             Log "ServicesPipeTimeout already set to ${current}ms" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not set ServicesPipeTimeout -- not critical" -Colour DarkGray -Indent
+        Log "Could not set ServicesPipeTimeout, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -806,18 +1213,18 @@ if ($Undo) {
                             Log "Could not create NAT rule: $($_.Exception.Message)" -Colour Yellow -Indent
                         }
                     } else {
-                        Log "No IPv4 address on Hyper-V adapter -- NAT not needed yet" -Colour DarkGray -Indent
+                        Log "No IPv4 address on Hyper-V adapter, NAT not needed yet" -Colour DarkGray -Indent
                     }
                 } else {
-                    Log "No Hyper-V virtual adapter found -- NAT not needed yet" -Colour DarkGray -Indent
+                    Log "No Hyper-V virtual adapter found, NAT not needed yet" -Colour DarkGray -Indent
                 }
             } else {
-                Log "No internal Hyper-V switch found -- NAT not needed yet" -Colour DarkGray -Indent
+                Log "No internal Hyper-V switch found, NAT not needed yet" -Colour DarkGray -Indent
             }
             Log "Health monitor will auto-repair NAT if it disappears" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Get-NetNat not available -- skipping NAT check" -Colour DarkGray -Indent
+        Log "Get-NetNat not available, skipping NAT check" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -828,9 +1235,12 @@ if ($Undo) {
         # Check if local firewall rules are being applied (Group Policy can block them)
         $fwProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
         $issues = @()
-        foreach ($profile in $fwProfiles) {
-            if ($profile.Enabled -and -not $profile.AllowLocalFirewallRules) {
-                $issues += $profile.Name
+        # $fwProfile, not $profile. $profile is a PowerShell automatic variable
+        # holding the path to the current profile script, and assigning to it
+        # inside a loop clobbers it for the rest of the session.
+        foreach ($fwProfile in $fwProfiles) {
+            if ($fwProfile.Enabled -and -not $fwProfile.AllowLocalFirewallRules) {
+                $issues += $fwProfile.Name
             }
         }
         if ($issues.Count -gt 0) {
@@ -860,7 +1270,7 @@ if ($Undo) {
             Log "No Hyper-V firewall rules found (may be managed by Group Policy)" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not check firewall policies -- not critical" -Colour DarkGray -Indent
+        Log "Could not check firewall policies, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -874,7 +1284,7 @@ if ($Undo) {
     $cloudPaths = @("OneDrive", "Google Drive", "Dropbox", "iCloud", "Box")
     foreach ($cp in $cloudPaths) {
         if ($env:APPDATA -match [regex]::Escape($cp)) {
-            $storageWarnings += "APPDATA is inside a '$cp' sync folder -- this causes mount failures"
+            $storageWarnings += "APPDATA is inside a '$cp' sync folder, this causes mount failures"
         }
     }
 
@@ -887,17 +1297,17 @@ if ($Undo) {
             if ($null -ne $diskNumber) {
                 $disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
                 if ($disk -and $disk.BusType -match "USB|Thunderbolt|1394") {
-                    $storageWarnings += "APPDATA is on an external $($disk.BusType) drive -- use a local SSD instead"
+                    $storageWarnings += "APPDATA is on an external $($disk.BusType) drive, use a local SSD instead"
                 }
             }
 
             # Check if it's a network drive
             $logDisk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($appDataDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue
             if ($logDisk -and $logDisk.DriveType -eq 4) {
-                $storageWarnings += "APPDATA is on a network drive -- VirtioFS requires local storage"
+                $storageWarnings += "APPDATA is on a network drive, VirtioFS requires local storage"
             }
         }
-    } catch {}
+    } catch { $null = $_ }
 
     # Check the VM cache path specifically for problematic locations
     if (Test-Path $vmCachePath) {
@@ -905,9 +1315,9 @@ if ($Undo) {
             $vmDrive = (Split-Path $vmCachePath -Qualifier) + "\"
             $vmDriveType = (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($vmDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue).DriveType
             if ($vmDriveType -eq 4) {
-                $storageWarnings += "VM cache is on a network drive -- this will cause failures"
+                $storageWarnings += "VM cache is on a network drive, this will cause failures"
             }
-        } catch {}
+        } catch { $null = $_ }
     }
 
     if ($storageWarnings.Count -gt 0) {
@@ -948,7 +1358,7 @@ if ($Undo) {
                         try {
                             & w32tm /resync /force 2>&1 | Out-Null
                             Log "Forced NTP resync" -Colour Green -Indent
-                        } catch {}
+                        } catch { $null = $_ }
                     } else {
                         Log "Clock drift: ${drift}s (within tolerance)" -Colour Green -Indent
                     }
@@ -956,13 +1366,13 @@ if ($Undo) {
                     Log "Could not measure clock drift (NTP server unreachable?)" -Colour DarkGray -Indent
                 }
             } catch {
-                Log "Could not check clock drift -- not critical" -Colour DarkGray -Indent
+                Log "Could not check clock drift, not critical" -Colour DarkGray -Indent
             }
         } else {
-            Log "W32Time service not found -- clock sync may not be configured" -Colour DarkGray -Indent
+            Log "W32Time service not found, clock sync may not be configured" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not check time sync -- not critical" -Colour DarkGray -Indent
+        Log "Could not check time sync, not critical" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -976,7 +1386,7 @@ if ($Undo) {
         foreach ($av in $avItems) {
             $avProducts += $av.displayName
         }
-    } catch {}
+    } catch { $null = $_ }
 
     # Also check for common AV processes
     $knownAvProcesses = @{
@@ -1043,7 +1453,7 @@ if ($Undo) {
                         Add-MpPreference -ExclusionProcess "vmcompute.exe" -ErrorAction SilentlyContinue
                         Add-MpPreference -ExclusionProcess "cowork-svc.exe" -ErrorAction SilentlyContinue
                         Log "  + Process exclusions: vmwp.exe, vmms.exe, vmcompute.exe, cowork-svc.exe" -Colour Green -Indent
-                    } catch {}
+                    } catch { $null = $_ }
                     # Verify process exclusions were applied (v4.8.0)
                     try {
                         $procExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
@@ -1061,12 +1471,12 @@ if ($Undo) {
                         } else {
                             Log "  All process exclusions verified" -Colour Green -Indent
                         }
-                    } catch {}
+                    } catch { $null = $_ }
                 } else {
                     Log "Defender exclusions already configured" -Colour Green -Indent
                 }
             } catch {
-                Log "Could not check Defender exclusions -- not critical" -Colour DarkGray -Indent
+                Log "Could not check Defender exclusions, not critical" -Colour DarkGray -Indent
             }
         } else {
             # Third-party AV -- can only advise
@@ -1096,7 +1506,7 @@ if ($Undo) {
     try {
         $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
     } catch {
-        Log "Could not query Windows optional features -- skipping WSL check" -Colour DarkGray -Indent
+        Log "Could not query Windows optional features, skipping WSL check" -Colour DarkGray -Indent
     }
     if ($wslFeature -and $wslFeature.State -eq 'Enabled') {
         $wsl2Warnings += "WSL feature is enabled"
@@ -1108,11 +1518,11 @@ if ($Undo) {
                 if ($distroOutput) {
                     $running = $distroOutput | Where-Object { $_ -match 'Running' -and $_ -match '\s2\s' }
                     if ($running) {
-                        $wsl2Warnings += "WSL2 distros are actively running -- may conflict with Claude's VM"
+                        $wsl2Warnings += "WSL2 distros are actively running, may conflict with Claude's VM"
                         $wsl2Warnings += "If Cowork has issues, try: wsl --shutdown"
                     }
                 }
-            } catch {}
+            } catch { $null = $_ }
         }
     }
 
@@ -1165,21 +1575,21 @@ if ($Undo) {
             Log "Removed old basic watchdog script" -Colour DarkGray -Indent
         }
     } catch {
-        Log "Could not locate health monitor script -- skipping" -Colour DarkGray -Indent
+        Log "Could not locate health monitor script, skipping" -Colour DarkGray -Indent
     }
 
     if ($watchScript) {
         try {
             try {
                 Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
-            } catch {}
+            } catch { $null = $_ }
 
             # Kill any running health monitor before replacing
             try {
                 Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
                     Where-Object { $_.CommandLine -match "Watch-ClaudeHealth" } |
                     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-            } catch {}
+            } catch { $null = $_ }
 
             $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
@@ -1213,7 +1623,7 @@ if ($Undo) {
                 -Description "Monitors Claude logs for VirtioFS mount failures and auto-runs the fix script. Polls every 30s." `
                 -Force | Out-Null
 
-            try { Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue } catch {}
+            try { Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue } catch { $null = $_ }
 
             Log "Health monitor installed (starts 120s after logon, polls every 30s)" -Colour Green -Indent
             Log "Task: Task Scheduler > $TaskPath$TaskName" -Colour DarkGray -Indent
@@ -1250,14 +1660,14 @@ if ($Undo) {
             }
         }
     } catch {
-        Log "Could not locate fix script -- skipping boot task" -Colour DarkGray -Indent
+        Log "Could not locate fix script, skipping boot task" -Colour DarkGray -Indent
     }
 
     if ($fixScript) {
         try {
             try {
                 Unregister-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue
-            } catch {}
+            } catch { $null = $_ }
 
             # Wrap in a delayed command: wait 45s after logon before running BootPrep.
             # Increased from 30s to avoid race with Claude auto-launch VM construction.
@@ -1332,7 +1742,7 @@ if (`$claude) {
             if (Test-Path $fixBatCandidate) { $fixBat = $fixBatCandidate }
         }
     } catch {
-        Log "Could not locate fix launcher -- skipping shortcuts" -Colour DarkGray -Indent
+        Log "Could not locate fix launcher, skipping shortcuts" -Colour DarkGray -Indent
     }
 
     $shell = $null
@@ -1340,7 +1750,7 @@ if (`$claude) {
         try {
             $shell = New-Object -ComObject WScript.Shell
         } catch {
-            Log "Windows Script Host is unavailable -- cannot create shortcuts" -Colour DarkYellow -Indent
+            Log "Windows Script Host is unavailable, cannot create shortcuts" -Colour DarkYellow -Indent
         }
     }
 
@@ -1389,7 +1799,7 @@ if (`$claude) {
         # Scheduled task registration requires admin -- skip gracefully if not elevated
         $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
         if (-not $isAdmin) {
-            Log "Skipped -- requires admin privileges (run as Administrator to enable)" -Colour DarkYellow -Indent
+            Log "Skipped, requires admin privileges (run as Administrator to enable)" -Colour DarkYellow -Indent
             throw "SKIP"
         }
         # MSIX apps block all direct .exe access from WindowsApps (ACLs, -Verb RunAs,
@@ -1407,7 +1817,7 @@ if (`$claude) {
         $elevTaskName = "LaunchClaudeAdmin"
 
         # Remove old task if present
-        try { Unregister-ScheduledTask -TaskName $elevTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        try { Unregister-ScheduledTask -TaskName $elevTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
 
         # PowerShell command that finds and launches Claude
         # Priority: 1) MSIX via Get-AppxPackage  2) Traditional .exe install paths  3) Running process
@@ -1476,9 +1886,9 @@ if ($exe) { Start-Process $exe } else { throw 'Claude Desktop not found. Is it i
         $launcherCmd = Join-Path $ClaudeAppData "Launch-Claude-Admin.cmd"
         $cmdContent = @"
 @echo off
-REM -- Claude Desktop (Admin) Launcher
-REM -- Auto-generated by Prevent-ClaudeIssues.ps1 v$Version
-REM -- Triggers the LaunchClaudeAdmin scheduled task (runs with full admin token).
+REM Claude Desktop (Admin) Launcher
+REM Auto-generated by Prevent-ClaudeIssues.ps1 v$ToolkitVersion
+REM Triggers the LaunchClaudeAdmin scheduled task (runs with full admin token).
 schtasks /run /tn "\Claude\LaunchClaudeAdmin" >nul 2>&1
 if errorlevel 1 (
     echo The LaunchClaudeAdmin scheduled task was not found.
@@ -1526,11 +1936,11 @@ if errorlevel 1 (
         $sc.IconLocation = $claudeIcon
         $sc.Save()
         Log "Admin shortcut created: $adminLnkPath" -Colour Green -Indent
-        Log "No UAC prompt -- task runs with full admin token automatically" -Colour DarkGray -Indent
+        Log "No UAC prompt, task runs with full admin token automatically" -Colour DarkGray -Indent
         Log "Survives Claude updates (detects MSIX, traditional install, or running process)" -Colour DarkGray -Indent
 
     } catch {
-        Log "Could not configure elevation -- not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
+        Log "Could not configure elevation, not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
     }
 
     # ----------------------------------------------------------------
@@ -1564,9 +1974,9 @@ if errorlevel 1 (
         if ($changed) {
             Log "A reboot is required for token policy changes to take effect" -Colour DarkYellow -Indent
         }
-        Log "EnableLUA remains 1 (UAC stays on -- Store apps keep working)" -Colour DarkGray -Indent
+        Log "EnableLUA remains 1 (UAC stays on, Store apps keep working)" -Colour DarkGray -Indent
     } catch {
-        Log "Could not configure token policy -- not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
+        Log "Could not configure token policy, not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
     }
 
     # ================================================================
@@ -1574,7 +1984,7 @@ if errorlevel 1 (
     # ================================================================
     Write-Host ""
     Write-Host "  +----------------------------------------------+" -ForegroundColor Green
-    Write-Host "  |           SETUP COMPLETE                      |" -ForegroundColor Green
+    Write-Host "  |           SETUP COMPLETE                     |" -ForegroundColor Green
     Write-Host "  +----------------------------------------------+" -ForegroundColor Green
     Write-Host ""
     Write-Host "  What was configured:" -ForegroundColor Cyan
@@ -1623,14 +2033,14 @@ if errorlevel 1 (
 } catch {
     Write-Host ""
     Write-Host "  +----------------------------------------------+" -ForegroundColor Red
-    Write-Host "  |           UNEXPECTED ERROR                    |" -ForegroundColor Red
+    Write-Host "  |           UNEXPECTED ERROR                   |" -ForegroundColor Red
     Write-Host "  +----------------------------------------------+" -ForegroundColor Red
     Write-Host ""
     Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "  Line: $($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Setup stopped early, so some steps did not run." -ForegroundColor DarkYellow
-    Write-Host "  Nothing was left half-applied -- rerun the script once the" -ForegroundColor DarkGray
+    Write-Host "  Nothing was left half-applied, rerun the script once the" -ForegroundColor DarkGray
     Write-Host "  cause above is resolved, or open an issue at" -ForegroundColor DarkGray
     Write-Host "  https://github.com/JesperLive/ClaudeFix/issues" -ForegroundColor DarkGray
 }
