@@ -2253,9 +2253,29 @@ Write-WatchLog "  Safety        : user-activity block, 180s grace period, consec
 # not match either real log format. Staleness could never fire, because it
 # measured a file last written in March. Naming dead monitors in the startup
 # banner is how they stayed unnoticed.
-Write-WatchLog "  Auto-fix on   : logs, service(x2), events(x2)+HCS, vmcompute-health, guest-connect(x3)"
+# Guest-connect is reported as live or dormant based on the actual source file,
+# not asserted. Test-GuestConnectionHealth rejects cowork-service.log when it is
+# more than 300s stale, and on current builds that file has not been written
+# since March, so the check returns immediately. Claiming it as an active
+# monitor would repeat exactly the mistake this banner used to make.
+$guestSrc = $null
+if ($ClaudeLogDir) { $guestSrc = Join-Path $ClaudeLogDir "cowork-service.log" }
+$guestLive = $false
+if ($guestSrc -and (Test-Path $guestSrc)) {
+    try {
+        $guestLive = (((Get-Date) - (Get-Item $guestSrc).LastWriteTime).TotalSeconds -le 300)
+    } catch { $null = $_ }
+}
+
+$autoFixList = "logs, service(x2), events(x2)+HCS, vmcompute-health"
+if ($guestLive) { $autoFixList += ", guest-connect(x3)" }
+
+Write-WatchLog "  Auto-fix on   : $autoFixList"
 Write-WatchLog "  Warn only     : NAT, storage, VM log staleness(x5), clock drift, hcs-state"
 Write-WatchLog "  Not monitored : Hyper-V heartbeat (no such thing for an HCS compute system)"
+if (-not $guestLive) {
+    Write-WatchLog "  Dormant       : guest-connect (cowork-service.log is stale or absent on this build)"
+}
 Write-WatchLog "================================================================"
 
 try {
