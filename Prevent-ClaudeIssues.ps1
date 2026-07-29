@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 6.0.2
+    Version : 6.0.3
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -537,7 +537,7 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.0.2"
+$ToolkitVersion   = "6.0.3"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"

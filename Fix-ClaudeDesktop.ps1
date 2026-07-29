@@ -63,7 +63,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.0.2
+    Version : 6.0.3
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -573,7 +573,7 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.0.2"
+$ToolkitVersion  = "6.0.3"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName
@@ -855,21 +855,43 @@ function Test-CoworkServicePrereq {
         Repaired  = $false
     }
 
-    # 1. Virtual Machine Platform -- the documented Cowork requirement.
+    # 1. Virtual Machine Platform.
     #
-    # The wording below is deliberate. It used to say "Cowork runs in a Hyper-V
-    # VM and cannot start without it", and a user on 2026-07-29 read that, ran
-    # Get-WindowsOptionalFeature -FeatureName *Hyper-V*, saw all seven Hyper-V
-    # features Enabled, and reported the script as wrong. That filter cannot
-    # match VirtualMachinePlatform: the name does not contain "Hyper-V". They
-    # are separate features and enabling Hyper-V does not enable this one.
-    # Anything user-facing here has to say that outright.
-    if ($script:IsAdmin) {
+    # Two lessons from the same user report, on the same day, in the same order
+    # they were learned.
+    #
+    # First the wording. It used to say "Cowork runs in a Hyper-V VM and cannot
+    # start without it", so the reporter ran Get-WindowsOptionalFeature with
+    # -FeatureName *Hyper-V*, saw all seven Hyper-V features Enabled, and said
+    # the script was wrong. That filter cannot match VirtualMachinePlatform,
+    # because the name contains no "Hyper-V". Anything user-facing here has to
+    # say that outright, which the text below now does.
+    #
+    # Then the check itself, which mattered far more.
+    #
+    # What Cowork actually needs is a working Host Compute Service stack. Virtual
+    # Machine Platform is one way to get one. Full Hyper-V is another, and on a
+    # machine that has it, VirtualMachinePlatform can read Disabled while
+    # vmcompute and hns are present and HCS works perfectly.
+    #
+    # That is not hypothetical. The 2026-07-29 reporter's machine reads Disabled
+    # here and runs Cowork: their cowork-service.log shows vmcompute.dll and
+    # computecore.dll loading, HCN enumerating two networks, and a compute
+    # system in State Running an hour before they ran this script.
+    #
+    # So check the thing that matters first. If the HCS services are there, this
+    # feature flag is not the story and must not be told as one.
+    $hcsPresent = $true
+    foreach ($n in @('vmcompute', 'hns')) {
+        if (-not (Get-Service -Name $n -ErrorAction SilentlyContinue)) { $hcsPresent = $false }
+    }
+
+    if ($script:IsAdmin -and -not $hcsPresent) {
         try {
             $vmp = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
             if ($vmp -and $vmp.State -ne "Enabled") {
                 $r.Blocked = $true
-                $r.Reason  = "The Virtual Machine Platform feature is $($vmp.State). Cowork cannot start without it."
+                $r.Reason  = "The Virtual Machine Platform feature is $($vmp.State), and the Host Compute Service stack is not registered either."
                 $r.Fixes  += "This is NOT the same as Hyper-V. Enabling Hyper-V does not enable it, and"
                 $r.Fixes  += "a *Hyper-V* search will not list it, because the name has no 'Hyper-V' in it."
                 $r.Fixes  += "Check it with: Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform"
@@ -978,16 +1000,34 @@ function Restart-CoworkService {
     # happened. Reporting success keeps a dry run quiet, which is the point.
     if (-not $PSCmdlet.ShouldProcess($ServiceName, "Restart")) { return $true }
 
+    # The prereq check runs for its ONE side effect, re-enabling a start type of
+    # Disabled. Its findings are advisory and are not consulted until a start
+    # has actually been attempted and failed.
+    #
+    # It used to hold a veto: Blocked meant return $false without ever calling
+    # Start. A user transcript on 2026-07-29 showed what that costs. Their
+    # machine reported Virtual Machine Platform as Disabled, so the check
+    # blocked, and the script printed "Service failed to start" for a start it
+    # never tried, then repeated it every five seconds.
+    #
+    # Their own service log settles it. Between 11:12:16, when this script
+    # stopped the service, and 11:29:18, when Claude Desktop started it again,
+    # cowork-service.log contains nothing at all. Not one failed start. And the
+    # 11:29 start took 293ms and worked: vmcompute.dll and computecore.dll
+    # loaded, HCN enumerated two networks, the named pipe came up. The VM had
+    # been Running on that machine at 10:02 the same morning.
+    #
+    # A check that can be wrong must never be able to prevent the attempt that
+    # would prove it wrong. Attempting a start on a machine that genuinely
+    # cannot run one costs a few seconds and an error message. Refusing to
+    # attempt one on a machine that can costs the user their working install.
     $script:ServicePrereq = Test-CoworkServicePrereq
     if ($script:ServicePrereq.Repaired) {
         Log "Service start type was Disabled, re-enabled (Automatic)" -Colour Green -Indent
     }
     if ($script:ServicePrereq.Blocked) {
-        Log "[!] $($script:ServicePrereq.Reason)" -Colour Red -Indent
-        foreach ($f in $script:ServicePrereq.Fixes) {
-            Log "  -> $f" -Colour Yellow -Indent
-        }
-        return $false
+        Log "Prerequisite check flagged: $($script:ServicePrereq.Reason)" -Colour DarkYellow -Indent
+        Log "Trying to start anyway; the service is the authority on this, not the check." -Colour DarkGray -Indent
     }
 
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -1048,10 +1088,14 @@ function Restart-CoworkService {
     }
 
     # Start
+    $startAttempted = $false
+    $startError     = $null
     if ($script:IsAdmin) {
+        $startAttempted = $true
         try {
             Start-Service -Name $ServiceName -ErrorAction Stop
         } catch {
+            $startError = $_.Exception.Message
             try {
                 Start-Process "sc.exe" -ArgumentList "start $ServiceName" -NoNewWindow -Wait
             } catch { $null = $_ }
@@ -1066,7 +1110,35 @@ function Restart-CoworkService {
         Start-Sleep -Seconds 2
         $elapsed += 2
         $svcNow = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if ($svcNow -and $svcNow.Status -eq "Running") { return $true }
+        if ($svcNow -and $svcNow.Status -eq "Running") {
+            # It started. Whatever the prereq check thought, it was wrong or it
+            # was irrelevant, so drop the finding rather than leaving a red
+            # herring in $script:ServicePrereq for the summary to print.
+            if ($script:ServicePrereq -and $script:ServicePrereq.Blocked) {
+                Log "Started despite the prerequisite warning; the warning was wrong." -Colour Green -Indent
+                $script:ServicePrereq.Blocked = $false
+            }
+            return $true
+        }
+    }
+
+    # It did not come up. NOW the prereq findings are worth reading out, because
+    # there is a real failure for them to explain. This ordering is the whole
+    # point: diagnose a failure, never predict one.
+    if ($startAttempted) {
+        if ($startError) {
+            Log "[!] Start failed: $startError" -Colour Red -Indent
+        } else {
+            Log "[!] The service did not reach Running within ${StartPollMax}s" -Colour Red -Indent
+        }
+        if ($script:ServicePrereq -and $script:ServicePrereq.Blocked) {
+            Log "Most likely cause: $($script:ServicePrereq.Reason)" -Colour Yellow -Indent
+            foreach ($f in $script:ServicePrereq.Fixes) {
+                Log "  -> $f" -Colour Yellow -Indent
+            }
+        }
+    } else {
+        Log "[i] Not admin, so the service was never asked to start" -Colour DarkGray -Indent
     }
     return $false
 }
@@ -2071,11 +2143,35 @@ if ($script:SelectedMode -eq "Diagnostic") {
         $bundleDir = Join-Path $LogDir "support_$stamp"
         New-Item -ItemType Directory -Path $bundleDir -Force -ErrorAction Stop | Out-Null
 
-        $wanted = @(
-            'system-info.txt', 'supported-features-info.json', 'gpu-info.json',
-            'main.log', 'cowork-service.log', 'coworkd.log',
-            'cowork_vm_node.log', 'cowork_host_loop_debug.log'
-        )
+        # Enumerated, not listed. The first version of this hardcoded eight
+        # filenames read off the machine it was written on, and the very first
+        # real export it was compared against had coworkd-user.log and
+        # vm-info.json instead, neither of them on the list. vm-info.json was
+        # the single most useful file in that export: it carries the VM bundle
+        # size, whether it finished downloading, and isGuestConnected.
+        #
+        # Log filenames vary by app build. Take everything and cap it, rather
+        # than guessing which names this build uses. Same authoring-time-guess
+        # bug that Get-ClaudeEnvironment exists to end, reintroduced by hand.
+        $wanted = @()
+        if ($srcLogsProbe = $script:ClaudeEnv.LogDir) {
+            try {
+                $wanted = @(Get-ChildItem $srcLogsProbe -File -ErrorAction Stop |
+                            Where-Object { $_.Extension -in @('.log', '.json', '.txt') } |
+                            Sort-Object Length |
+                            Select-Object -ExpandProperty Name)
+            } catch { $null = $_ }
+        }
+        if ($wanted.Count -eq 0) {
+            # Fall back to the known names so an unreadable folder still
+            # produces something rather than an empty bundle.
+            $wanted = @(
+                'system-info.txt', 'supported-features-info.json', 'gpu-info.json',
+                'vm-info.json', 'mcp-info.json',
+                'main.log', 'cowork-service.log', 'coworkd.log', 'coworkd-user.log',
+                'cowork_vm_node.log', 'cowork_host_loop_debug.log'
+            )
+        }
         # Whole-file copies came to 19.6 MB on the machine this was built on,
         # nearly all of it main.log and cowork_vm_node.log. Discord caps
         # attachments at 5 MB, so the bundle is built to a 4 MB budget and the
@@ -2089,7 +2185,10 @@ if ($script:SelectedMode -eq "Diagnostic") {
         # keeps its most recent bytes.
         $bundleBudget = 4MB
         $reserve      = 256KB   # service-events.txt and windows-features.txt
-        $smallFiles   = @('system-info.txt', 'supported-features-info.json', 'gpu-info.json')
+        # Classified by size, not by name. The name list was wrong on the first
+        # real machine it met, and there is no reason to guess when the size is
+        # right there. Anything under 128 KB is cheap enough to take whole.
+        $smallCutoff  = 128KB
 
         $copied   = @()
         $missing  = @()
@@ -2109,21 +2208,47 @@ if ($script:SelectedMode -eq "Diagnostic") {
         }
 
         # Pass 2: work out the share for the large logs.
+        #
+        # Enumerating the folder turned up 40 files on the machine this was
+        # written on, 32 of them per-MCP-server logs. Splitting the budget
+        # evenly gave each one 114 KB, which meant cowork-service.log, the file
+        # that actually explains a Cowork failure, got the same slice as the log
+        # for some unrelated MCP server. So rank them.
+        #
+        # The pattern is deliberately broad rather than a list of names. It
+        # catches log names this build uses that no one here has seen, which is
+        # the entire reason the folder is enumerated instead of listed.
+        $priorityPattern = '(?i)cowork|^vm-|^main\.|system-info|supported-features|gpu-info'
+        $smallNames = @($present.Keys | Where-Object { $present[$_] -le $smallCutoff })
+        $bigNames   = @($present.Keys | Where-Object { $present[$_] -gt $smallCutoff })
+        $bigTop     = @($bigNames | Where-Object { $_ -match $priorityPattern })
+        $bigRest    = @($bigNames | Where-Object { $_ -notmatch $priorityPattern })
+
         $smallBytes = 0
-        foreach ($s in $smallFiles) { if ($present.ContainsKey($s)) { $smallBytes += $present[$s] } }
-        $bigNames = @($present.Keys | Where-Object { $smallFiles -notcontains $_ })
-        $share    = [long]0
-        if ($bigNames.Count -gt 0) {
-            $share = [long](($bundleBudget - $reserve - $smallBytes) / $bigNames.Count)
-            if ($share -lt 64KB) { $share = [long]64KB }
+        foreach ($s in $smallNames) { $smallBytes += $present[$s] }
+        $logBudget = $bundleBudget - $reserve - $smallBytes
+        if ($logBudget -lt 0) { $logBudget = [long]0 }
+
+        # Four fifths to the files that answer the question, one fifth to
+        # everything else, so the long tail is represented without drowning it.
+        $shareTop  = [long]0
+        $shareRest = [long]0
+        if ($bigTop.Count -gt 0)  { $shareTop  = [long](($logBudget * 0.8) / $bigTop.Count) }
+        if ($bigRest.Count -gt 0) { $shareRest = [long](($logBudget * 0.2) / $bigRest.Count) }
+        if ($bigTop.Count -eq 0 -and $bigRest.Count -gt 0) {
+            $shareRest = [long]($logBudget / $bigRest.Count)
         }
+        if ($bigTop.Count -gt 0 -and $shareTop -lt 64KB)   { $shareTop  = [long]64KB }
+        if ($bigRest.Count -gt 0 -and $shareRest -lt 16KB) { $shareRest = [long]16KB }
 
         # Pass 3: copy, tailing anything over its share.
         foreach ($w in $present.Keys) {
             $p    = Join-Path $srcLogs $w
             $dest = Join-Path $bundleDir $w
             $len  = $present[$w]
-            $cap  = if ($smallFiles -contains $w) { [long]$len } else { $share }
+            $cap  = if ($len -le $smallCutoff) { [long]$len }
+                    elseif ($w -match $priorityPattern) { $shareTop }
+                    else { $shareRest }
             try {
                 if ($len -le $cap) {
                     Copy-Item $p $dest -Force -ErrorAction Stop
@@ -2153,16 +2278,16 @@ if ($script:SelectedMode -eq "Diagnostic") {
         }
         Log "  Copied  : $($copied.Count) of $($wanted.Count) log files" -Colour Green
         if ($trimmed.Count -gt 0) {
-            Log "  Trimmed : $($trimmed.Count) large log(s) to $([math]::Round($share/1KB)) KB each" -Colour DarkGray
+            Log "  Trimmed : $($trimmed.Count) large log(s), $([math]::Round($shareTop/1KB)) KB for Cowork logs, $([math]::Round($shareRest/1KB)) KB for the rest" -Colour DarkGray
         }
         if ($missing.Count -gt 0) {
-            # Absence is evidence. No cowork_vm_node.log means the VM has never
-            # come up on this machine, which is worth saying out loud rather
-            # than leaving as a quiet gap in the bundle.
-            Log "  Absent  : $($missing -join ', ')" -Colour DarkGray
-            if ($missing -contains 'cowork_vm_node.log') {
-                Log "  Note    : no VM log at all means the Cowork VM has never started here" -Colour Yellow
-            }
+            Log "  Skipped : $($missing -join ', ')" -Colour DarkGray
+        }
+        # Absence is evidence, and now that the folder is enumerated rather than
+        # guessed at, an absent VM log means it really is not there rather than
+        # meaning this build spells it differently.
+        if (-not ($present.Keys -contains 'cowork_vm_node.log')) {
+            Log "  Note    : no VM log in the folder, so the Cowork VM may never have started here" -Colour Yellow
         }
 
         # The Service Control Manager entries for the three services that have
@@ -3548,13 +3673,23 @@ if ($SkipLaunch) {
         Log "Skipping Hyper-V VM checks (vmcompute was just restarted)" -Colour DarkGray -Indent
     }
 
-    # Do not wait at all for a workspace that cannot come up. Step 7 has already
-    # printed what is wrong and what to run, and none of it changes while this
-    # script is running, so the only thing waiting produces is the same message
-    # on repeat.
-    $prereqStillBlocked = ($null -ne $script:ServicePrereq -and $script:ServicePrereq.Blocked)
+    # Skip the wait only when the service is BOTH flagged AND demonstrably not
+    # running. v6.0.2 skipped on the flag alone, which was the same mistake as
+    # the veto it was written to fix: it trusted a prediction over the machine.
+    # On the reporter's box the service came up in 293ms the moment anything
+    # actually asked it to, so a flag-only skip would have abandoned a workspace
+    # that was about to work.
+    #
+    # Restart-CoworkService clears the flag when a start succeeds, so by the time
+    # this runs, Blocked surviving alongside a stopped service means both the
+    # prediction and the attempt agreed. That is worth acting on. Either one
+    # alone is not.
+    $svcAtWaitStart = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $prereqStillBlocked = ($null -ne $script:ServicePrereq -and
+                           $script:ServicePrereq.Blocked -and
+                           (-not $svcAtWaitStart -or $svcAtWaitStart.Status -ne "Running"))
     if ($prereqStillBlocked) {
-        Log "Not waiting for the workspace: the blocker above has to be cleared first." -Colour Red -Indent
+        Log "Not waiting for the workspace: the service is down and the cause needs fixing first." -Colour Red -Indent
         Log "Claude Desktop itself will run; Cowork will not until that is fixed." -Colour Yellow -Indent
     }
 

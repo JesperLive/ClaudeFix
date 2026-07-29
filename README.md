@@ -518,7 +518,7 @@ README.md                   This file
 LICENSE                     MIT licence
 ```
 
-Current toolkit version: 6.0.2 (one version across all three scripts).
+Current toolkit version: 6.0.3 (one version across all three scripts).
 
 ---
 

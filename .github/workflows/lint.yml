@@ -54,6 +54,10 @@ jobs:
         shell: powershell
         run: .\.ci\Test-Elevation.ps1
 
+      - name: A start is always attempted
+        shell: powershell
+        run: .\.ci\Test-AlwaysTriesStart.ps1
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: |

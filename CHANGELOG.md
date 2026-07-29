@@ -8,11 +8,71 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.0.3] - 2026-07-29
+
+The same user sent their logs, and they showed 6.0.2 had fixed the wrong thing.
+
+6.0.2 stopped the script repeating an unfixable message. It did not question
+whether the message was true. It was not.
+
+### Fixed
+
+- The prerequisite check could veto a start attempt, and did. `Restart-CoworkService`
+  called `Test-CoworkServicePrereq`, and on a Blocked result returned false
+  without ever calling `Start-Service`. "Service failed to start" was printed
+  for a start that never happened.
+
+  The reporter's own `cowork-service.log` settles it. Between 11:12:16, when the
+  script stopped the service, and 11:29:18, when Claude Desktop started it
+  again, the file contains nothing at all. Not one failed start. The 11:29 start
+  took 293 ms and worked.
+
+  Prerequisites are now advisory. The service is always asked to start, and the
+  findings are read out only if it refuses. A check that can be wrong must never
+  prevent the attempt that would prove it wrong.
+
+- Virtual Machine Platform is no longer treated as fatal on its own. What Cowork
+  needs is a working Host Compute Service stack. That feature is one way to get
+  one; full Hyper-V is another. On the reporter's machine `VirtualMachinePlatform`
+  reads Disabled while `vmcompute.dll` and `computecore.dll` load, HCN
+  enumerates two networks, and a compute system was in state Running an hour
+  before they ran the script. The feature is only cited now when the HCS
+  services are genuinely absent.
+
+- 6.0.2 skipped the workspace wait whenever the prerequisite flag was set. That
+  was the same error in a new place, and on a machine like the reporter's it
+  would have abandoned a workspace that was about to come up. The wait is now
+  skipped only when the flag survives an actual failed start.
+
+### Changed
+
+- The support bundle enumerates the log folder instead of copying eight
+  hardcoded filenames. The list was written from one machine; the first real
+  export it met had `coworkd-user.log` and `vm-info.json`, neither of them on
+  it, and `vm-info.json` was the most useful file in the export. It carries the
+  VM bundle size, whether the download finished, and `isGuestConnected`.
+
+  Files are ranked rather than treated equally, because enumeration turned up 40
+  files here and 32 were per-server MCP logs. Cowork and VM logs take four
+  fifths of the budget, everything else shares the rest.
+
+### Added
+
+- A CI gate that stubs the prerequisite check to report a blocker and asserts a
+  start is attempted anyway, in all three shapes: check wrong and service fine,
+  check clean, and service genuinely dead. Verified by restoring the veto and
+  watching five assertions fail.
+
 ## [6.0.2] - 2026-07-29
 
-From a user report. The repair script correctly found that Virtual Machine
-Platform was disabled, said so, and then spent the rest of the run acting as
-though it had not.
+> Corrected by 6.0.3. This entry says the script "correctly" found Virtual
+> Machine Platform disabled. It did read the feature state correctly, but
+> treating that as fatal was wrong, and 6.0.2 did not question it. Read this
+> entry with 6.0.3 above.
+
+From a user report. The repair script found that Virtual Machine Platform was
+disabled, said so, and then spent the rest of the run acting as though it had
+not.
 
 ### Fixed
 
