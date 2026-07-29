@@ -8,6 +8,47 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.0.4] - 2026-07-29
+
+### Added
+
+- `Prevent-ClaudeIssues` writes a GPU-free launcher: `Launch-Claude-NoGPU.cmd`
+  in the Claude folder, plus a "Claude (no GPU)" desktop shortcut.
+
+  Current builds have a fatal GPU-process crash, upstream
+  [#80444](https://github.com/anthropics/claude-code/issues/80444), exit code
+  101457950 (0x060C201E). A page loaded in the in-app Browser preview runs a
+  WebGL capability probe, the GPU process dies, and the whole app goes with it.
+  Seen in a user's logs: browser preview created at 10:02:22, 57 probe warnings
+  at 10:02:27, GPU gone at 10:02:28.
+
+  Running with `--disable-gpu` avoids it, but an MSIX app launched normally
+  never receives a command line, so the flag has nowhere to go. The launcher
+  uses `Invoke-CommandInDesktopPackage`, which starts the executable inside the
+  package identity, so the flag arrives and the install stays intact. On a
+  traditional install it just passes the flag on the command line.
+
+  It also closes any running instance first. Claude is single-instance, so
+  launching a second copy over a running one only focuses the existing window
+  and the flag is silently ignored. That is the step most hand-written versions
+  of this miss.
+
+  Opt-in. The normal shortcut is untouched and still uses the GPU. `-Undo`
+  removes the launcher and the shortcut.
+
+- A CI gate that builds the generated launcher for both install shapes and
+  parses it. Script-writing-script code is never executed at build time, so a
+  dropped escape would have shipped and only surfaced when a user
+  double-clicked. It also fails on a hardcoded package family, and on step
+  numbering that disagrees with the declared total.
+
+### Changed
+
+- The admin shortcut's icon lookup reads `Get-ClaudeEnvironment` instead of
+  re-running `Get-AppxPackage` and then walking three hardcoded install paths.
+  It predated the discovery layer and was missed when the rest of the script
+  adopted it.
+
 ## [6.0.3] - 2026-07-29
 
 The same user sent their logs, and they showed 6.0.2 had fixed the wrong thing.

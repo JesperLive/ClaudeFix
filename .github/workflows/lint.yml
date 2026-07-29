@@ -58,6 +58,10 @@ jobs:
         shell: powershell
         run: .\.ci\Test-AlwaysTriesStart.ps1
 
+      - name: Generated launchers parse
+        shell: powershell
+        run: .\.ci\Test-GeneratedLaunchers.ps1
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: |

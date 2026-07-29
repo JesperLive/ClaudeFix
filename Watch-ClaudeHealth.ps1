@@ -48,7 +48,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 6.0.3
+    Version : 6.0.4
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -514,7 +514,7 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -----------------------------------------------------------
-$ToolkitVersion = "6.0.3"
+$ToolkitVersion = "6.0.4"
 $ServiceName    = $script:ClaudeEnv.ServiceName
 $ProcessName    = $script:ClaudeEnv.ProcessName
 $ClaudeAppData  = $script:ClaudeEnv.AppDataDir

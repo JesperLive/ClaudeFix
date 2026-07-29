@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 6.0.3
+    Version : 6.0.4
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -537,7 +537,7 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.0.3"
+$ToolkitVersion   = "6.0.4"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
@@ -830,14 +830,23 @@ if ($Undo) {
             Remove-Item $adminLnk -Force -ErrorAction SilentlyContinue
             Log "Removed: $adminLnk" -Colour Green -Indent
         }
-        # Remove launcher scripts
+        # Remove launcher scripts. The NoGPU pair is written by step 27 and has
+        # to come out here too, otherwise Undo leaves a shortcut on the desktop
+        # pointing at a script this tool no longer maintains.
         $launcherCmd = Join-Path $ClaudeAppData "Launch-Claude-Admin.cmd"
         $launcherPs1 = Join-Path $ClaudeAppData "Launch-Claude-Admin.ps1"
-        foreach ($lf in @($launcherCmd, $launcherPs1)) {
+        $noGpuCmd    = Join-Path $ClaudeAppData "Launch-Claude-NoGPU.cmd"
+        $noGpuPs1    = Join-Path $ClaudeAppData "Launch-Claude-NoGPU.ps1"
+        foreach ($lf in @($launcherCmd, $launcherPs1, $noGpuCmd, $noGpuPs1)) {
             if (Test-Path $lf) {
                 Remove-Item $lf -Force -ErrorAction SilentlyContinue
                 Log "Removed launcher: $lf" -Colour Green -Indent
             }
+        }
+        $noGpuLnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "Claude (no GPU).lnk"
+        if (Test-Path $noGpuLnk) {
+            Remove-Item $noGpuLnk -Force -ErrorAction SilentlyContinue
+            Log "Removed: $noGpuLnk" -Colour Green -Indent
         }
     } catch {
         Log "Could not fully remove elevation config, not critical" -Colour DarkGray -Indent
@@ -884,8 +893,7 @@ if ($Undo) {
     # ================================================================
     # SETUP MODE
     # ================================================================
-    $steps = 26
-
+    $steps = 27
     # Claude Desktop may not be installed yet, so its AppData folder may not
     # exist. Create it up front -- several steps below write state files there.
     if (-not (Initialize-ClaudeAppData)) {
@@ -2006,23 +2014,16 @@ if errorlevel 1 (
         $sc.TargetPath = $launcherCmd
         $sc.WorkingDirectory = $ClaudeAppData
         $sc.Description = "Claude Desktop (Elevated via scheduled task)"
-        # Try to use Claude's own icon (falls back to generic if path is stale after update)
+        # Claude's own icon, from discovery.
+        #
+        # This block used to re-run Get-AppxPackage and then walk three
+        # hardcoded traditional install paths, all of which Get-ClaudeEnvironment
+        # already resolves at startup, including cases these three guesses miss.
+        # It predates the discovery layer and was left behind when the rest of
+        # the script adopted it.
         $claudeIcon = $null
-        $appxPkg = Get-AppxPackage -Name "*Claude*" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($appxPkg) {
-            $candidateExe = Join-Path $appxPkg.InstallLocation "app\Claude.exe"
-            if (Test-Path $candidateExe) { $claudeIcon = "$candidateExe,0" }
-        }
-        if (-not $claudeIcon) {
-            # Check traditional install paths
-            $exeCandidates = @(
-                (Join-Path $env:LOCALAPPDATA 'Programs\claude-desktop\Claude.exe'),
-                (Join-Path $env:LOCALAPPDATA 'Claude Desktop\Claude.exe'),
-                (Join-Path ${env:ProgramFiles} 'Claude Desktop\Claude.exe')
-            )
-            foreach ($c in $exeCandidates) {
-                if (Test-Path $c) { $claudeIcon = "$c,0"; break }
-            }
+        if ($script:ClaudeEnv.ClaudeExe -and (Test-Path $script:ClaudeEnv.ClaudeExe)) {
+            $claudeIcon = "$($script:ClaudeEnv.ClaudeExe),0"
         }
         if (-not $claudeIcon) { $claudeIcon = "%SystemRoot%\System32\shell32.dll,77" }
         $sc.IconLocation = $claudeIcon
@@ -2069,6 +2070,133 @@ if errorlevel 1 (
         Log "EnableLUA remains 1 (UAC stays on, Store apps keep working)" -Colour DarkGray -Indent
     } catch {
         Log "Could not configure token policy, not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
+    }
+
+    # ----------------------------------------------------------------
+    # 27. GPU-free launcher
+    # ----------------------------------------------------------------
+    # There is a fatal GPU-process crash on current builds, upstream issue
+    # 80444, exit code 101457950 (0x060C201E). A page loaded in the in-app
+    # Browser preview runs a WebGL capability probe, the GPU process dies, and
+    # the whole app dies with it. Confirmed in a user's logs on 2026-07-29:
+    # browser preview created at 10:02:22, 57 INVALID_ENUM probe warnings at
+    # 10:02:27, GPU gone at 10:02:28.
+    #
+    # Running with --disable-gpu avoids it. The obstacle is that an MSIX app
+    # launched normally gets no command line, so the flag has nowhere to go.
+    # Invoke-CommandInDesktopPackage starts the executable INSIDE the package
+    # identity, which is what makes this work without breaking the install.
+    #
+    # This writes the launcher rather than changing anything. It is opt-in: the
+    # user runs it when they need it, and the normal shortcut is untouched.
+    Step 27 $steps "Creating GPU-free launcher..."
+    try {
+        $noGpuPs1 = Join-Path $ClaudeAppData "Launch-Claude-NoGPU.ps1"
+        $noGpuCmd = Join-Path $ClaudeAppData "Launch-Claude-NoGPU.cmd"
+
+        # Everything identifying the install comes from discovery. Hardcoding
+        # Claude_pzs8sxrjxfjjc would work on the machine this was written on and
+        # nowhere else, which is the mistake this whole layer exists to prevent.
+        $pfn      = $script:ClaudeEnv.PackageFamilyName
+        $appId    = $script:ClaudeEnv.ApplicationId
+        $exePath  = $script:ClaudeEnv.ClaudeExe
+        $isMsix   = $script:ClaudeEnv.IsMsix
+
+        if (-not $isMsix -and -not $exePath) {
+            Log "Claude not found, skipping launcher" -Colour DarkGray -Indent
+        } else {
+            # Two shapes. An MSIX install needs the package-identity launch. A
+            # traditional install is an ordinary exe and takes the flag straight
+            # on the command line, no ceremony required.
+            if ($isMsix -and $pfn -and $appId) {
+                $launchBody = @"
+Invoke-CommandInDesktopPackage ``
+    -PackageFamilyName '$pfn' ``
+    -AppId '$appId' ``
+    -Command 'app\Claude.exe' ``
+    -Args '--disable-gpu'
+"@
+                $howNote = "MSIX install, launching inside package identity ($pfn)"
+            } else {
+                $launchBody = "Start-Process -FilePath '$exePath' -ArgumentList '--disable-gpu'"
+                $howNote = "Traditional install, flag passed directly"
+            }
+
+            $ps1Content = @"
+# Launch-Claude-NoGPU.ps1
+# Auto-generated by Prevent-ClaudeIssues.ps1 v$ToolkitVersion
+#
+# Starts Claude Desktop with hardware GPU acceleration turned off, to avoid the
+# fatal GPU-process crash triggered by the in-app Browser preview.
+# Upstream issue: https://github.com/anthropics/claude-code/issues/80444
+#
+# $howNote
+#
+# Run this INSTEAD of the normal Claude shortcut when you need the Browser pane.
+# The regular shortcut is unchanged and still uses the GPU.
+
+`$ErrorActionPreference = 'Stop'
+
+# Claude is single-instance. Launching a second copy while one is running just
+# focuses the existing window, and the flag is silently ignored. So the running
+# instance has to go first, or this does nothing at all.
+`$running = @(Get-Process claude -ErrorAction SilentlyContinue)
+if (`$running.Count -gt 0) {
+    Write-Host "  Closing `$(`$running.Count) running Claude process(es)..." -ForegroundColor DarkGray
+    `$running | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+}
+
+Write-Host "  Starting Claude with --disable-gpu..." -ForegroundColor Cyan
+$launchBody
+
+Start-Sleep -Seconds 3
+if (@(Get-Process claude -ErrorAction SilentlyContinue).Count -gt 0) {
+    Write-Host "  Claude is running without hardware GPU acceleration." -ForegroundColor Green
+    Write-Host "  The UI may feel slightly slower. That is the trade." -ForegroundColor DarkGray
+} else {
+    Write-Host "  [!] Claude did not start. Launch it normally and report this." -ForegroundColor Red
+    Read-Host "  Press Enter to close"
+}
+"@
+            Set-Content -Path $noGpuPs1 -Value $ps1Content -Encoding ASCII -Force
+
+            $cmdContent = @"
+@echo off
+REM Claude Desktop (no GPU) launcher
+REM Auto-generated by Prevent-ClaudeIssues.ps1 v$ToolkitVersion
+REM Avoids the fatal GPU-process crash from the in-app Browser preview.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launch-Claude-NoGPU.ps1"
+"@
+            Set-Content -Path $noGpuCmd -Value $cmdContent -Encoding ASCII -Force
+
+            Log "Launcher created: $noGpuCmd" -Colour Green -Indent
+            Log $howNote -Colour DarkGray -Indent
+
+            # Desktop shortcut, same treatment as the admin launcher.
+            try {
+                $desktopDir = [Environment]::GetFolderPath("Desktop")
+                $noGpuLnk   = Join-Path $desktopDir "Claude (no GPU).lnk"
+                $wshell = New-Object -ComObject WScript.Shell
+                $lnk = $wshell.CreateShortcut($noGpuLnk)
+                $lnk.TargetPath       = $noGpuCmd
+                $lnk.WorkingDirectory = $ClaudeAppData
+                $lnk.Description      = "Claude Desktop with hardware GPU acceleration disabled"
+                if ($exePath -and (Test-Path $exePath)) {
+                    $lnk.IconLocation = "$exePath,0"
+                } else {
+                    $lnk.IconLocation = "%SystemRoot%\System32\shell32.dll,77"
+                }
+                $lnk.Save()
+                Log "Shortcut created: $noGpuLnk" -Colour Green -Indent
+            } catch {
+                Log "Could not create the shortcut, the .cmd still works" -Colour DarkGray -Indent
+            }
+
+            Log "Use it only if you hit the crash; the normal shortcut is unchanged" -Colour DarkGray -Indent
+        }
+    } catch {
+        Log "Could not create the GPU-free launcher, not critical: $($_.Exception.Message)" -Colour DarkGray -Indent
     }
 
     # ================================================================
