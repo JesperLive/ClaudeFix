@@ -2218,7 +2218,12 @@ if ($script:SelectedMode -eq "Diagnostic") {
         # The pattern is deliberately broad rather than a list of names. It
         # catches log names this build uses that no one here has seen, which is
         # the entire reason the folder is enumerated instead of listed.
-        $priorityPattern = '(?i)cowork|^vm-|^main\.|system-info|supported-features|gpu-info'
+        # unknown-window.log earns its place here. The GPU-process crash that
+        # kills the whole app (exit code 101457950 = 0x060C201E, upstream issue
+        # 80444) leaves its entire signature in that file and nothing but a
+        # single "GPU process gone" line in main.log. A bundle that trimmed it
+        # to the long-tail share would drop the only evidence of the cause.
+        $priorityPattern = '(?i)cowork|^vm-|^main\.|^unknown-window|system-info|supported-features|gpu-info'
         $smallNames = @($present.Keys | Where-Object { $present[$_] -le $smallCutoff })
         $bigNames   = @($present.Keys | Where-Object { $present[$_] -gt $smallCutoff })
         $bigTop     = @($bigNames | Where-Object { $_ -match $priorityPattern })
