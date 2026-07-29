@@ -127,11 +127,23 @@ $script:KilledGuids = @()
 $two = Close-StaleHcsVms -Action kill
 Assert-Case "handles two instances" ($two -eq 2 -and @($script:KilledGuids).Count -eq 2) "got $two"
 
+# hcsdiag answered, nothing to kill. The flag has to say so, because step 5
+# prints "none found via hcsdiag" off the back of it.
+$script:HcsListToReturn = "some-other-vm`n    VM, Running, AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE, some-other-vm"
+$null = Close-StaleHcsVms -Action kill
+Assert-Case "LastHcsListOk true when hcsdiag answered" ($script:LastHcsListOk -eq $true) "got $($script:LastHcsListOk)"
+
 # hcsdiag unavailable.
 $script:HcsListToReturn = $null
 $script:KilledGuids = @()
 $dead = Close-StaleHcsVms -Action kill
 Assert-Case "survives hcsdiag returning nothing" ($dead -eq 0) "got $dead"
+
+# Both cases return 0, so the count alone cannot tell them apart. That is why
+# step 5 printed a clean hcsdiag result on a run whose step 0 had already said
+# hcsdiag was unavailable.
+Assert-Case "LastHcsListOk false when hcsdiag did not answer" `
+    ($script:LastHcsListOk -eq $false) "got $($script:LastHcsListOk)"
 
 # ---------------------------------------------------------------------
 Write-Host ""

@@ -8,6 +8,44 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.0.2] - 2026-07-29
+
+From a user report. The repair script correctly found that Virtual Machine
+Platform was disabled, said so, and then spent the rest of the run acting as
+though it had not.
+
+### Fixed
+
+- After diagnosing a blocker the user has to clear, the script kept going. It
+  launched Claude, entered the workspace wait, found the service dead, restarted
+  it, hit the same wall, and repeated the identical four-line remediation every
+  five seconds until the user pressed Ctrl+C. The wait loop was discarding the
+  return value of the restart, which is exactly the flag that says this cannot
+  work. It now skips the wait entirely when the blocker is known, and caps
+  restarts at three otherwise.
+- The Virtual Machine Platform message said "Cowork runs in a Hyper-V VM". The
+  reporter read that, searched their features for `*Hyper-V*`, saw all seven
+  Hyper-V features enabled, and concluded the script was wrong. That search
+  cannot match `VirtualMachinePlatform`, because the name contains no "Hyper-V".
+  The message now says so outright and gives the exact command to check.
+- Step 5 printed "No orphan compute systems via hcsdiag" on a run whose step 0
+  had already reported hcsdiag unavailable. A count of zero meant both "hcsdiag
+  said none" and "hcsdiag never answered", and the caller could not tell them
+  apart. It can now.
+
+### Added
+
+- Diagnostic mode writes a support bundle: the Claude log folder, the Service
+  Control Manager entries for the three services that have to be alive, and the
+  Windows feature states listed by exact name. Built to a 4 MB budget shared
+  across the files, then zipped, so it fits an attachment limit. Absences are
+  reported rather than left as gaps, because no `cowork_vm_node.log` at all
+  means the VM has never started on that machine.
+
+  The event log matters here. When a service refuses to start there is almost
+  nothing in Claude's own logs, because nothing ran to write them, and Windows
+  is the only thing that recorded what happened.
+
 ## [6.0.1] - 2026-07-28
 
 Follow-up to 6.0.0. Four defects, three of them in code 6.0.0 changed, plus the

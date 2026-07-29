@@ -63,7 +63,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.0.1
+    Version : 6.0.2
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -573,7 +573,7 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.0.1"
+$ToolkitVersion  = "6.0.2"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName
@@ -856,13 +856,24 @@ function Test-CoworkServicePrereq {
     }
 
     # 1. Virtual Machine Platform -- the documented Cowork requirement.
+    #
+    # The wording below is deliberate. It used to say "Cowork runs in a Hyper-V
+    # VM and cannot start without it", and a user on 2026-07-29 read that, ran
+    # Get-WindowsOptionalFeature -FeatureName *Hyper-V*, saw all seven Hyper-V
+    # features Enabled, and reported the script as wrong. That filter cannot
+    # match VirtualMachinePlatform: the name does not contain "Hyper-V". They
+    # are separate features and enabling Hyper-V does not enable this one.
+    # Anything user-facing here has to say that outright.
     if ($script:IsAdmin) {
         try {
             $vmp = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
             if ($vmp -and $vmp.State -ne "Enabled") {
                 $r.Blocked = $true
-                $r.Reason  = "The Virtual Machine Platform feature is $($vmp.State). Cowork runs in a Hyper-V VM and cannot start without it."
-                $r.Fixes  += "Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All"
+                $r.Reason  = "The Virtual Machine Platform feature is $($vmp.State). Cowork cannot start without it."
+                $r.Fixes  += "This is NOT the same as Hyper-V. Enabling Hyper-V does not enable it, and"
+                $r.Fixes  += "a *Hyper-V* search will not list it, because the name has no 'Hyper-V' in it."
+                $r.Fixes  += "Check it with: Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform"
+                $r.Fixes  += "Enable it with: Enable-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -All"
                 $r.Fixes  += "Then RESTART the machine (use Restart, not shut down; Fast Startup can leave the services uninitialised)"
                 return $r
             }
@@ -1501,8 +1512,15 @@ function Close-StaleHcsVms {
         [string]$Action = "kill"
     )
     $killed = 0
+    # Records whether hcsdiag actually answered. A return of 0 means "nothing to
+    # kill", but that is true both when hcsdiag reported an empty list and when
+    # hcsdiag could not be reached at all, and callers were printing "none found
+    # via hcsdiag" for both. Step 0 already told the truth here; step 5 did not.
+    $script:LastHcsListOk = $false
     try {
         $hcsList = Invoke-HcsDiag -Arguments "list"
+        if (-not $hcsList) { return 0 }
+        $script:LastHcsListOk = $true
         $entries = Get-CoworkHcsGuids -ListOutput ([string]$hcsList)
         if ($entries.Count -eq 0) { return 0 }
 
@@ -2028,8 +2046,200 @@ if ($script:SelectedMode -eq "Diagnostic") {
         }
     } catch { $null = $_ }
 
+    # -- Support bundle ------------------------------------------------
+    #
+    # A user reporting a Cowork failure gets asked for logs, and the honest
+    # answer is that Claude's own logs are close to empty when the service
+    # never started: there was nothing running to write them. What actually
+    # records the failure is the Windows Service Control Manager channel, and
+    # nobody thinks to look there.
+    #
+    # So collect it. Anthropic's own troubleshooting note points at
+    # Help > Troubleshooting > Show Logs, which regenerates three snapshot
+    # files at the moment it is clicked; this gathers the same folder plus the
+    # event log, without the user having to know any of that.
+    #
+    # Copies, never parses. supported-features-info.json is documented as
+    # showing which check failed, but on the builds seen here it holds
+    # codenamed feature flags and nothing about virtualization, so branching on
+    # it would be inventing a contract that does not exist.
+    Write-Host ""
+    Log "Collecting a support bundle..." -Colour Cyan
+    $bundleDir = $null
+    try {
+        $stamp     = Get-Date -Format "yyyyMMdd_HHmmss"
+        $bundleDir = Join-Path $LogDir "support_$stamp"
+        New-Item -ItemType Directory -Path $bundleDir -Force -ErrorAction Stop | Out-Null
+
+        $wanted = @(
+            'system-info.txt', 'supported-features-info.json', 'gpu-info.json',
+            'main.log', 'cowork-service.log', 'coworkd.log',
+            'cowork_vm_node.log', 'cowork_host_loop_debug.log'
+        )
+        # Whole-file copies came to 19.6 MB on the machine this was built on,
+        # nearly all of it main.log and cowork_vm_node.log. Discord caps
+        # attachments at 5 MB, so the bundle is built to a 4 MB budget and the
+        # folder is zipped afterwards. The zip is what a person sends.
+        #
+        # A per-file cap does not achieve this: five logs at 2 MB each is 10 MB
+        # no matter how modest each one looks. The budget is shared instead.
+        # Small metadata files are copied whole, since together they are a few
+        # KB, and whatever is left is split evenly between the large logs that
+        # actually exist. A startup failure is at the END of a log, so each one
+        # keeps its most recent bytes.
+        $bundleBudget = 4MB
+        $reserve      = 256KB   # service-events.txt and windows-features.txt
+        $smallFiles   = @('system-info.txt', 'supported-features-info.json', 'gpu-info.json')
+
+        $copied   = @()
+        $missing  = @()
+        $trimmed  = @()
+        $srcLogs  = $script:ClaudeEnv.LogDir
+
+        # Pass 1: find what is actually there, and how big.
+        $present = @{}
+        foreach ($w in $wanted) {
+            $p = if ($srcLogs) { Join-Path $srcLogs $w } else { $null }
+            if ($p -and (Test-Path $p)) {
+                try { $present[$w] = (Get-Item $p -ErrorAction Stop).Length }
+                catch { $missing += $w }
+            } else {
+                $missing += $w
+            }
+        }
+
+        # Pass 2: work out the share for the large logs.
+        $smallBytes = 0
+        foreach ($s in $smallFiles) { if ($present.ContainsKey($s)) { $smallBytes += $present[$s] } }
+        $bigNames = @($present.Keys | Where-Object { $smallFiles -notcontains $_ })
+        $share    = [long]0
+        if ($bigNames.Count -gt 0) {
+            $share = [long](($bundleBudget - $reserve - $smallBytes) / $bigNames.Count)
+            if ($share -lt 64KB) { $share = [long]64KB }
+        }
+
+        # Pass 3: copy, tailing anything over its share.
+        foreach ($w in $present.Keys) {
+            $p    = Join-Path $srcLogs $w
+            $dest = Join-Path $bundleDir $w
+            $len  = $present[$w]
+            $cap  = if ($smallFiles -contains $w) { [long]$len } else { $share }
+            try {
+                if ($len -le $cap) {
+                    Copy-Item $p $dest -Force -ErrorAction Stop
+                } else {
+                    # Byte-level tail. Opened with ReadWrite sharing because
+                    # Claude holds these open while it runs, and a plain read
+                    # lock fails against a live log.
+                    $fs = [System.IO.File]::Open($p, [System.IO.FileMode]::Open,
+                                                 [System.IO.FileAccess]::Read,
+                                                 [System.IO.FileShare]::ReadWrite)
+                    try {
+                        $null = $fs.Seek(-$cap, [System.IO.SeekOrigin]::End)
+                        $buf  = New-Object byte[] $cap
+                        $read = $fs.Read($buf, 0, $cap)
+                        $out  = [System.IO.File]::Create($dest)
+                        try {
+                            $hdr = [System.Text.Encoding]::ASCII.GetBytes(
+                                "=== TRUNCATED: last $([math]::Round($cap/1KB)) KB of a $([math]::Round($len/1MB,1)) MB file ===`r`n")
+                            $out.Write($hdr, 0, $hdr.Length)
+                            $out.Write($buf, 0, $read)
+                        } finally { $out.Dispose() }
+                    } finally { $fs.Dispose() }
+                    $trimmed += $w
+                }
+                $copied += $w
+            } catch { $missing += $w }
+        }
+        Log "  Copied  : $($copied.Count) of $($wanted.Count) log files" -Colour Green
+        if ($trimmed.Count -gt 0) {
+            Log "  Trimmed : $($trimmed.Count) large log(s) to $([math]::Round($share/1KB)) KB each" -Colour DarkGray
+        }
+        if ($missing.Count -gt 0) {
+            # Absence is evidence. No cowork_vm_node.log means the VM has never
+            # come up on this machine, which is worth saying out loud rather
+            # than leaving as a quiet gap in the bundle.
+            Log "  Absent  : $($missing -join ', ')" -Colour DarkGray
+            if ($missing -contains 'cowork_vm_node.log') {
+                Log "  Note    : no VM log at all means the Cowork VM has never started here" -Colour Yellow
+            }
+        }
+
+        # The Service Control Manager entries for the three services that have
+        # to be alive. This is where a service that refuses to start is
+        # actually recorded.
+        try {
+            $svcNames = @($ServiceName, 'vmcompute', 'hns') | Where-Object { $_ }
+            $pattern  = ($svcNames | ForEach-Object { [regex]::Escape($_) }) -join '|'
+            $evts = @(Get-WinEvent -FilterHashtable @{
+                          LogName      = 'System'
+                          ProviderName = 'Service Control Manager'
+                          StartTime    = (Get-Date).AddDays(-7)
+                      } -MaxEvents 500 -ErrorAction Stop |
+                      Where-Object { $_.Message -match $pattern })
+            if ($evts.Count -gt 0) {
+                $evts | Select-Object TimeCreated, Id, LevelDisplayName, Message |
+                    Format-List | Out-File (Join-Path $bundleDir 'service-events.txt') -Encoding ascii
+            } else {
+                "No Service Control Manager events for $($svcNames -join ', ') in the last 7 days." |
+                    Out-File (Join-Path $bundleDir 'service-events.txt') -Encoding ascii
+            }
+            Log "  Events  : $($evts.Count) service event(s) in the last 7 days" -Colour Green
+        } catch {
+            Log "  Events  : could not read the System log ($($_.Exception.Message))" -Colour DarkGray
+        }
+
+        # Feature states, by exact name. A *Hyper-V* search does not match
+        # VirtualMachinePlatform, which is how a machine with every Hyper-V
+        # feature enabled can still be missing the one Cowork needs.
+        try {
+            $featLines = @()
+            foreach ($fn in @('VirtualMachinePlatform', 'Microsoft-Hyper-V-All',
+                              'Microsoft-Hyper-V', 'HypervisorPlatform')) {
+                $st = 'unknown (needs admin)'
+                if ($script:IsAdmin) {
+                    try {
+                        $f = Get-WindowsOptionalFeature -Online -FeatureName $fn -ErrorAction Stop
+                        $st = if ($f) { "$($f.State)" } else { 'not present on this edition' }
+                    } catch { $st = "query failed: $($_.Exception.Message)" }
+                }
+                $featLines += ("{0,-26} {1}" -f $fn, $st)
+            }
+            $featLines | Out-File (Join-Path $bundleDir 'windows-features.txt') -Encoding ascii
+            Log "  Features: recorded by exact name" -Colour Green
+        } catch { $null = $_ }
+
+        # Zip it. One attachment beats ten, and logs compress about ten to one,
+        # so the folder was already inside the 4 MB budget and the archive lands
+        # far below it. The folder stays behind for anyone who would rather read
+        # it in place.
+        try {
+            $zipPath = "$bundleDir.zip"
+            Compress-Archive -Path (Join-Path $bundleDir '*') -DestinationPath $zipPath `
+                             -CompressionLevel Optimal -Force -ErrorAction Stop
+            $zipLen = (Get-Item $zipPath -ErrorAction Stop).Length
+            Log "  Archive : $([math]::Round($zipLen/1KB)) KB" -Colour Green
+            $script:SupportZip = $zipPath
+        } catch {
+            Log "  Archive : could not zip ($($_.Exception.Message)); send the folder instead" -Colour DarkGray
+            $script:SupportZip = $null
+        }
+    } catch {
+        Log "  Could not build the bundle: $($_.Exception.Message)" -Colour Yellow
+        $bundleDir = $null
+    }
+
     Write-Host ""
     Log "Diagnostic complete, no changes were made" -Colour Green
+    if ($bundleDir) {
+        if ($script:SupportZip) {
+            Log "Support bundle: $script:SupportZip" -Colour Cyan
+            Log "Attach that one file to a bug report. It is under the 4 MB limit." -Colour DarkGray
+        } else {
+            Log "Support bundle: $bundleDir" -Colour Cyan
+            Log "Attach that folder to a bug report; it has the logs and the event entries." -Colour DarkGray
+        }
+    }
     Save-Log
 
     if (-not $Quiet) {
@@ -2543,8 +2753,15 @@ try {
             if ($killedCount -gt 0) {
                 Log "Killed $killedCount orphan compute system(s)" -Colour Green -Indent
                 $orphanKilled = $true
-            } else {
+            } elseif ($script:LastHcsListOk) {
                 Log "No orphan compute systems via hcsdiag" -Colour DarkGray -Indent
+            } else {
+                # Step 0 already says this properly when hcsdiag is missing or
+                # hangs. This branch used to print "No orphan compute systems
+                # via hcsdiag" regardless, so a run that opened with "hcsdiag
+                # unavailable" then claimed a clean hcsdiag result five steps
+                # later. Seen in a user transcript on 2026-07-29.
+                Log "hcsdiag did not answer, so this check was not run" -Colour DarkGray -Indent
             }
         } catch {
             Log "hcsdiag query failed: $($_.Exception.Message)" -Colour DarkGray -Indent
@@ -3321,6 +3538,8 @@ if ($SkipLaunch) {
     $vmElapsed      = 0
     $lastStatus = ""
     $hvChecked  = $false
+    $svcRestartAttempts = 0
+    $svcRestartLimit    = 3
     $script:NoProgressEscalated = $false
 
     # Skip Hyper-V cmdlet checks if vmcompute was just restarted (may hang on unstable service)
@@ -3329,7 +3548,18 @@ if ($SkipLaunch) {
         Log "Skipping Hyper-V VM checks (vmcompute was just restarted)" -Colour DarkGray -Indent
     }
 
-    while ($vmSw.Elapsed.TotalSeconds -lt $vmDeadline -and
+    # Do not wait at all for a workspace that cannot come up. Step 7 has already
+    # printed what is wrong and what to run, and none of it changes while this
+    # script is running, so the only thing waiting produces is the same message
+    # on repeat.
+    $prereqStillBlocked = ($null -ne $script:ServicePrereq -and $script:ServicePrereq.Blocked)
+    if ($prereqStillBlocked) {
+        Log "Not waiting for the workspace: the blocker above has to be cleared first." -Colour Red -Indent
+        Log "Claude Desktop itself will run; Cowork will not until that is fixed." -Colour Yellow -Indent
+    }
+
+    while (-not $prereqStillBlocked -and
+           $vmSw.Elapsed.TotalSeconds -lt $vmDeadline -and
            $vmSw.Elapsed.TotalSeconds -lt $vmHardCap) {
         Start-Sleep -Seconds 5
         $vmElapsed = [int]$vmSw.Elapsed.TotalSeconds
@@ -3350,11 +3580,33 @@ if ($SkipLaunch) {
         }
         $lastCacheBytes = $curCacheBytes
 
-        # Service health check
+        # Service health check.
+        #
+        # The restart result used to be piped to Out-Null. Restart-CoworkService
+        # returns $false when Test-CoworkServicePrereq finds a blocker the user
+        # has to clear, such as Virtual Machine Platform being disabled, and
+        # throwing that away meant the loop retried something that could not
+        # work. A user on 2026-07-29 watched the same four-line remediation
+        # print every five seconds until they pressed Ctrl+C.
+        #
+        # Two bounds now. A blocked prereq stops immediately, because nothing
+        # about it will change while the script runs. Anything else gets three
+        # restarts, because a service dying repeatedly for an unknown reason is
+        # not going to be fixed by a fourth.
         $svcNow = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if (-not $svcNow -or $svcNow.Status -ne "Running") {
-            Log "Service died, restarting..." -Colour DarkYellow -Indent
-            Restart-CoworkService | Out-Null
+            $svcRestartAttempts++
+            if ($svcRestartAttempts -gt $svcRestartLimit) {
+                Log "Service has died $svcRestartAttempts times; giving up on the wait" -Colour Red -Indent
+                break
+            }
+            Log "Service died, restarting ($svcRestartAttempts of $svcRestartLimit)..." -Colour DarkYellow -Indent
+            $restartOk = Restart-CoworkService
+            if (-not $restartOk -and
+                $null -ne $script:ServicePrereq -and $script:ServicePrereq.Blocked) {
+                Log "This needs to be fixed on the machine first; not retrying." -Colour Red -Indent
+                break
+            }
             continue
         }
 

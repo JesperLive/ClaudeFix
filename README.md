@@ -1,4 +1,4 @@
-# Claude Desktop / Cowork VM Fix for Windows
+﻿# Claude Desktop / Cowork VM Fix for Windows
 
 > **Maintenance status (2026-07-27):** Hotfix-only / dormant. No active development; bug reports for breakage on current Claude Desktop builds will be triaged and patched as one-off fixes, but no new features or proactive Claude-build tracking. If a Claude Desktop update breaks the toolkit and no fix lands within 7 days of report, file an issue and use the manual recovery steps in the Troubleshooting section.
 
@@ -518,7 +518,7 @@ README.md                   This file
 LICENSE                     MIT licence
 ```
 
-Current toolkit version: 6.0.1 (one version across all three scripts).
+Current toolkit version: 6.0.2 (one version across all three scripts).
 
 ---
 
