@@ -8,6 +8,47 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.1.0] - 2026-08-28
+
+### Added
+
+- `Watch-ClaudeHealth` relaunches Claude Desktop after a stealth update, and
+  only then.
+
+  Claude applies background updates by quitting itself once idle and handing
+  off to the Electron updater. On the MSIX path `quitAndInstall()` calls the
+  AppX deployment API with `ForceApplicationShutdownOption`, and registering a
+  package does not start the app afterwards. Measured on 2026-08-28: quit at
+  19:44:07, package registered successfully at 19:44:39, nothing came back, and
+  the app stayed down until it was started by hand at 19:47:43. Not a crash --
+  no 1000, no 1002, no WER `APPCRASH`, no dump.
+
+  The app writes a marker file, `stealth-relaunch` in its userData folder, on
+  the way out, recording window position and navigation history, and restores
+  from it if the next launch happens within five minutes. That marker is the
+  discriminator this monitor was missing: it exists if and only if the app went
+  down through the stealth path. A deliberate quit writes nothing, so an app the
+  user closed on purpose still stays closed, which is what the previous
+  behaviour was protecting and what the log line "a crash and a deliberate quit
+  look the same from here" was about.
+
+  The marker is never deleted here. The app consumes it on next launch, and
+  deleting it would throw away the window and tab restore that makes the whole
+  thing invisible to the user. On the default 30-second poll the relaunch lands
+  well inside the five-minute honour window.
+
+  Bounded on both sides. `-MaxStealthMarkerAgeMinutes` (default 10) refuses to
+  resurrect the app from a marker old enough to mean the machine was off or the
+  user chose to stay closed. The marker's `ts` is recorded, and persisted, before
+  the launch is attempted rather than after, so a launch that throws cannot turn
+  into a relaunch attempt every thirty seconds forever.
+
+  `-NoStealthRelaunch` turns the whole thing off. No new scheduled task:
+  `\Claude\ClaudeCoworkWatchdog` already runs this script on a logon trigger.
+
+- `LastStealthMarkerTs` in `watch-state.json`. State files written by earlier
+  versions do not have the field and load without it.
+
 ## [6.0.4] - 2026-07-29
 
 ### Added

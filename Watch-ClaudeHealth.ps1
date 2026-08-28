@@ -38,17 +38,41 @@
     Designed to run as a hidden scheduled task (installed by Prevent-ClaudeIssues.ps1)
     but can also be started manually for foreground monitoring.
 
+    STEALTH-UPDATE RELAUNCH (v6.1.0+):
+    Claude Desktop applies background updates by quitting itself once idle and
+    handing off to the Electron updater. On the MSIX path that handoff calls the
+    AppX deployment API, which registers the new package but does not start the
+    app afterwards, so the app stays down until a human starts it. Before
+    quitting it writes a marker file recording window position and navigation
+    history, and it restores from that marker if the next launch happens within
+    five minutes. This monitor reads that marker and performs the launch the
+    update path never does. The marker exists if and only if the app went down
+    through the stealth path: a deliberate user quit writes nothing, so an app
+    the user closed on purpose still stays closed.
+
 .PARAMETER PollInterval
     Seconds between health checks (default: 30).
 
 .PARAMETER Cooldown
     Minutes to wait between auto-fix runs (default: 5).
 
+.PARAMETER NoStealthRelaunch
+    Disable the stealth-update relaunch described above. The feature is ON by
+    default; this switch turns it off. Nothing else changes: a missing marker
+    is still reported and still not acted on.
+
+.PARAMETER MaxStealthMarkerAgeMinutes
+    Refuse to relaunch from a stealth marker older than this (default: 10).
+    Deliberately wider than the app's own five-minute restore window, so a poll
+    that lands just after that window still brings the app back, just without
+    the window and tab restore. A marker much older than that means the machine
+    was off or the user chose to stay closed, and neither is ours to overrule.
+
 .PARAMETER Quiet
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 6.0.4
+    Version : 6.1.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -57,6 +81,8 @@
 param(
     [int]$PollInterval = 30,
     [int]$Cooldown = 5,
+    [switch]$NoStealthRelaunch,
+    [int]$MaxStealthMarkerAgeMinutes = 10,
     [switch]$Quiet
 )
 
@@ -514,7 +540,7 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -----------------------------------------------------------
-$ToolkitVersion = "6.0.4"
+$ToolkitVersion = "6.1.0"
 $ServiceName    = $script:ClaudeEnv.ServiceName
 $ProcessName    = $script:ClaudeEnv.ProcessName
 $ClaudeAppData  = $script:ClaudeEnv.AppDataDir
@@ -529,6 +555,29 @@ if (-not $ClaudeAppData -or -not $ClaudeLogDir) {
     exit 1
 }
 $WatchLogDir    = Join-Path $ClaudeAppData "watch-logs"
+
+# -- Stealth-update marker -----------------------------------------------
+# The app writes this file immediately before it quits itself to install a
+# background update, and consumes it on the next launch to put the window and
+# the tab history back. Derived, never hardcoded: the package family name is
+# whatever discovery found, not the Claude_pzs8sxrjxfjjc seen on one machine.
+#
+# The path is app.getPath('userData'), which for a packaged MSIX app redirects
+# into the package's own LocalCache rather than to %APPDATA%\Claude. That
+# redirection is why this cannot be built from $ClaudeAppData.
+#
+# Only the MSIX location is probed, deliberately. The defect this feature works
+# around is specific to the MSIX update path, where quitAndInstall hands off to
+# the AppX deployment API and a package registration does not start the app
+# afterwards. The NSIS path relaunches on its own, so watching for a marker
+# there would only add a second launch to a restart that already worked.
+$StealthMarkerName = "stealth-relaunch"
+$script:StealthMarkerPath = $null
+if ($env:LOCALAPPDATA -and $script:ClaudeEnv.PackageFamilyName) {
+    $script:StealthMarkerPath = Join-Path $env:LOCALAPPDATA (
+        "Packages\{0}\LocalCache\Roaming\Claude\{1}" -f `
+            $script:ClaudeEnv.PackageFamilyName, $StealthMarkerName)
+}
 
 # -- Legacy error signatures ---------------------------------------------
 # SECONDARY set, kept for continuity. None of these eleven strings occurs
@@ -767,6 +816,19 @@ $script:GuestFailCount       = 0     # Consecutive guest connection failures
 $script:LastHcsStateLogTime  = [datetime]::MinValue
 $script:LastShutdownFailLogTime = [datetime]::MinValue
 $script:FixHistory           = New-Object System.Collections.ArrayList
+# Epoch ms of the last stealth marker this monitor made a decision about, 0 for
+# none. Persisted, because the whole point of it is to survive the restart that
+# a failed launch attempt could otherwise turn into a 30-second relaunch loop.
+$script:LastStealthMarkerTs  = [long]0
+# Last line the stealth path wrote about a marker it could not use. In memory
+# only, and declared here rather than on first use because reading an unset
+# variable is an error under Set-StrictMode -Version Latest.
+$script:LastStealthNotice    = $null
+# Separate from the line above on purpose. Discovery runs once at startup, so
+# "no AUMID" cannot change for the life of this process, and it is reported
+# after a marker that read perfectly well -- which is exactly when the
+# text-keyed suppression above has just been cleared.
+$script:StealthNoAumidLogged = $false
 $script:StatePath            = Join-Path $WatchLogDir "watch-state.json"
 # Seeded from the current state so the first poll does not report a transition
 # that did not happen.
@@ -801,6 +863,16 @@ function Import-WatchState {
                         [System.Globalization.CultureInfo]::InvariantCulture)
                 }
                 if ($st.FixCount) { $script:FixCount = [int]$st.FixCount }
+                # Probed through PSObject.Properties, not read directly. Every
+                # state file written before v6.1.0 lacks this field, and under
+                # Set-StrictMode -Version Latest a bare $st.LastStealthMarkerTs
+                # on such a file throws PropertyNotFound. That throw would be
+                # swallowed by the catch below, silently abandoning the fix
+                # history restore that follows it.
+                if ($st.PSObject.Properties['LastStealthMarkerTs']) {
+                    try { $script:LastStealthMarkerTs = [long]$st.LastStealthMarkerTs }
+                    catch { $script:LastStealthMarkerTs = [long]0 }
+                }
                 foreach ($h in @($st.FixHistory)) {
                     if (-not $h) { continue }
                     $null = $script:FixHistory.Add([datetime]::Parse($h,
@@ -835,9 +907,10 @@ function Save-WatchState {
         foreach ($r in $recent) { $null = $script:FixHistory.Add($r) }
 
         $payload = [ordered]@{
-            LastFixTime = $script:LastFixTime.ToString('o')
-            FixCount    = $script:FixCount
-            FixHistory  = @($recent | ForEach-Object { $_.ToString('o') })
+            LastFixTime         = $script:LastFixTime.ToString('o')
+            FixCount            = $script:FixCount
+            FixHistory          = @($recent | ForEach-Object { $_.ToString('o') })
+            LastStealthMarkerTs = $script:LastStealthMarkerTs
         }
         [System.IO.File]::WriteAllText($script:StatePath,
             ($payload | ConvertTo-Json -Depth 3),
@@ -849,6 +922,234 @@ function Save-WatchState {
 # before starts at that file's current size. The eager loop that used to live
 # here keyed on path alone, which no longer matches the (path, creation time)
 # key the detector uses, and it would have had to be kept in sync by hand.
+
+# -- Stealth-update relaunch ---------------------------------------------
+
+function Write-StealthNotice {
+    <#
+    .SYNOPSIS
+        Writes a line about an unusable marker, but only when it is not the
+        line that was written last.
+    .DESCRIPTION
+        Everything on this path is asked once per poll for as long as Claude
+        stays down, so an unreadable marker sitting on disk beside a closed app
+        would write the same sentence 2,880 times a day. That is not a louder
+        signal, it is a buried one: the watch log is also where the VirtioFS
+        and HCS evidence lives.
+
+        The message text is the key, so a DIFFERENT problem still gets its own
+        line immediately. The record is cleared whenever the marker reads
+        cleanly or goes away, so the same fault on a later marker is reported
+        again rather than silently swallowed for the life of the daemon.
+    #>
+    param([string]$Message)
+
+    if ($Message -eq $script:LastStealthNotice) { return }
+    $script:LastStealthNotice = $Message
+    Write-WatchLog $Message
+}
+
+function Get-StealthRelaunchMarker {
+    <#
+    .SYNOPSIS
+        Reads the app's stealth-update marker. Returns $null when there is
+        nothing to act on.
+    .DESCRIPTION
+        The marker is the only signal on this machine that distinguishes an
+        update quit from a user quit. Both leave the same absence of a process,
+        and only one of them should be undone.
+
+        Written by the app at quit time, JSON:
+
+            ts                epoch milliseconds
+            windowVisible     bool
+            windowMinimized   bool
+            zOrderAnchorHwnd  optional
+            navEntries        optional array
+            navIndex          optional int
+
+        Only ts is read here. The rest is the app's business: it consumes the
+        file on next launch and restores the window and tab history from it.
+
+        This function NEVER deletes the marker. Deleting it would leave the app
+        with nothing to restore from, which throws away the entire point of
+        launching it inside the honour window.
+
+        Returns $null for absent, unreadable or unparseable. An unparseable
+        marker is logged, because a marker that exists and cannot be read is
+        the one case where the app went down through the stealth path and this
+        monitor still will not act.
+    .PARAMETER Path
+        Marker file to read. Defaults to the discovered package path;
+        overridable so the logic can be exercised without touching the real one.
+    #>
+    param([string]$Path = $script:StealthMarkerPath)
+
+    # No path and no file are the ordinary cases, not faults. Both also clear
+    # the repeat-suppression record: a marker that is gone cannot still be the
+    # one whose complaint is being held down.
+    if (-not $Path) { $script:LastStealthNotice = $null; return $null }
+    if (-not (Test-Path -LiteralPath $Path)) { $script:LastStealthNotice = $null; return $null }
+
+    $raw = $null
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    } catch {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path could not be read: $($_.Exception.Message)"
+        return $null
+    }
+    if (-not $raw) {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path is empty"
+        return $null
+    }
+
+    $obj = $null
+    try {
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path is not valid JSON: $($_.Exception.Message)"
+        return $null
+    }
+    if (-not $obj) {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path parsed to nothing"
+        return $null
+    }
+
+    # PSObject.Properties rather than $obj.ts. Under Set-StrictMode -Version
+    # Latest a missing property throws, and "the app changed its payload" is
+    # exactly the case this branch exists to report rather than crash on.
+    $tsProp = $null
+    try { $tsProp = $obj.PSObject.Properties['ts'] } catch { $tsProp = $null }
+    if (-not $tsProp) {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path has no 'ts' field"
+        return $null
+    }
+
+    $tsRaw = [long]0
+    try { $tsRaw = [long]$tsProp.Value } catch {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path has a non-numeric 'ts': $($tsProp.Value)"
+        return $null
+    }
+
+    # Epoch arithmetic done by hand rather than through
+    # DateTimeOffset::FromUnixTimeMilliseconds, which throws on out-of-range
+    # input. Here a nonsense ts should be reported, not raised.
+    $epochUtc = [datetime]::new(1970, 1, 1, 0, 0, 0, [System.DateTimeKind]::Utc)
+    $writtenUtc = $null
+    try { $writtenUtc = $epochUtc.AddMilliseconds([double]$tsRaw) } catch {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path has an out-of-range 'ts': $tsRaw"
+        return $null
+    }
+
+    # A ts in seconds instead of milliseconds lands in 1970 and would otherwise
+    # read as a very stale marker, which is the same verdict for the wrong
+    # reason. Say so instead.
+    if ($writtenUtc.Year -lt 2000) {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path has an implausible 'ts' ($tsRaw resolves to $($writtenUtc.ToString('u')))"
+        return $null
+    }
+
+    $ageSeconds = ((Get-Date).ToUniversalTime() - $writtenUtc).TotalSeconds
+
+    # It read cleanly, so nothing is being held down any more.
+    $script:LastStealthNotice = $null
+
+    return [pscustomobject]@{
+        Path       = $Path
+        TsRaw      = $tsRaw
+        Written    = $writtenUtc.ToLocalTime()
+        AgeMinutes = ($ageSeconds / 60.0)
+        AgeSeconds = $ageSeconds
+    }
+}
+
+function Invoke-StealthRelaunch {
+    <#
+    .SYNOPSIS
+        Starts Claude again if, and only if, it went down through the
+        stealth-update path. Returns $true when a launch was attempted.
+    .DESCRIPTION
+        Called on every poll on which Claude is not running, not only on the
+        moment it disappears. A monitor that restarts, or that starts at logon
+        after the update already happened, sees no transition at all, and the
+        act-once guard makes re-evaluating each poll free.
+
+        Four ways this declines, in order:
+
+          - the operator passed -NoStealthRelaunch
+          - there is no marker, so this was a crash or a deliberate quit, and
+            neither is ours to undo
+          - the marker is older than -MaxStealthMarkerAgeMinutes, so the
+            machine was off or the user chose to stay closed
+          - the marker's ts is one already decided about
+
+        The ts is recorded BEFORE the launch, not after. If Start-Process
+        throws, the record is already down and the next poll will not retry the
+        same marker thirty seconds later, forever. A genuine second update
+        writes a new marker with a new ts and is acted on normally.
+
+        The stale branch records the ts too. It is still "do nothing" as far as
+        the app is concerned; the record is only there so a stale marker sitting
+        on disk beside a closed app does not write the same line to the watch
+        log 2,880 times a day.
+    #>
+    param()
+
+    if ($NoStealthRelaunch) { return $false }
+
+    $marker = Get-StealthRelaunchMarker
+    if (-not $marker) { return $false }
+
+    if ($marker.TsRaw -eq $script:LastStealthMarkerTs) { return $false }
+
+    if ($marker.AgeMinutes -gt $MaxStealthMarkerAgeMinutes) {
+        Write-WatchLog ("Stale stealth marker, not resurrecting: written {0}, {1:N1} min old, limit {2} min." -f `
+            $marker.Written.ToString('yyyy-MM-dd HH:mm:ss'), $marker.AgeMinutes, $MaxStealthMarkerAgeMinutes)
+        $script:LastStealthMarkerTs = $marker.TsRaw
+        Save-WatchState
+        return $false
+    }
+
+    # Checked BEFORE the ts is recorded, not after. Nothing was decided here:
+    # discovery runs once at startup, so a monitor restarted after whatever hid
+    # the package should get to try again on a marker that is still fresh.
+    #
+    # Said once per process rather than through Write-StealthNotice, because
+    # the marker itself read cleanly, and a clean read is precisely what clears
+    # that suppression. A fresh marker is re-read every poll for ten minutes,
+    # so without a flag of its own this would be twenty identical lines.
+    if (-not $script:ClaudeEnv.Aumid) {
+        if (-not $script:StealthNoAumidLogged) {
+            $script:StealthNoAumidLogged = $true
+            Write-WatchLog "Stealth marker is fresh but no AUMID was discovered, so there is nothing to launch."
+        }
+        return $false
+    }
+
+    # Record first, launch second. See the description.
+    $script:LastStealthMarkerTs = $marker.TsRaw
+    Save-WatchState
+
+    # shell:AppsFolder activation, which is what Fix-ClaudeDesktop uses for the
+    # same job. Launching app\Claude.exe out of WindowsApps directly produces a
+    # loose instance with a duplicate taskbar icon, and the elevated
+    # \Claude\LaunchClaudeAdmin task does exactly that on purpose, to keep its
+    # admin token. Neither cost is worth paying for a restart the user is meant
+    # not to notice, and coming back elevated is not the state the app was in.
+    #
+    # Both values below are format arguments. Interpolating the AUMID into the
+    # format string instead would be the same defect Write-WatchLog documents:
+    # any brace in an interpolated value is parsed as a placeholder and throws.
+    Write-WatchLog ("Stealth-update relaunch: marker {0:N0}s old, starting {1}" -f `
+        $marker.AgeSeconds, $script:ClaudeEnv.Aumid)
+    try {
+        Start-Process $script:ClaudeEnv.Aumid -ErrorAction Stop
+        Write-WatchLog "Stealth-update relaunch: launch requested."
+    } catch {
+        Write-WatchLog "Stealth-update relaunch FAILED: $($_.Exception.Message)"
+    }
+    return $true
+}
 
 # -- Detection functions -------------------------------------------------
 
@@ -2290,6 +2591,20 @@ Write-WatchLog "  Cooldown      : ${Cooldown} min"
 Write-WatchLog "  Fix script    : $fixScript"
 Write-WatchLog "  Log directory : $ClaudeLogDir"
 Write-WatchLog "  VM log        : $($script:ClaudeEnv.VmLogFile)"
+# Reports what this feature can actually do on THIS machine, in the same spirit
+# as the monitor list below: a banner that advertises a capability the run does
+# not have is how dead monitors went unnoticed for months.
+$stealthNote = "off (-NoStealthRelaunch)"
+if (-not $NoStealthRelaunch) {
+    if (-not $script:StealthMarkerPath) {
+        $stealthNote = "unavailable: no MSIX package family discovered, so there is no marker to watch"
+    } elseif (-not $script:ClaudeEnv.Aumid) {
+        $stealthNote = "inert: marker path known but no AUMID discovered, so there would be nothing to start"
+    } else {
+        $stealthNote = "on, marker max age ${MaxStealthMarkerAgeMinutes} min, $($script:StealthMarkerPath)"
+    }
+}
+Write-WatchLog "  Relaunch      : $stealthNote"
 Write-WatchLog "  Safety        : user-activity block, 180s grace period, consecutive-check gates, cowork-session awareness"
 # Lists only monitors that can actually fire.
 #
@@ -2331,7 +2646,7 @@ try {
 
             $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
 
-            # Record Claude disappearing. Reported, never acted on.
+            # Record Claude disappearing. Acted on only for a stealth update.
             #
             # Every check below sits inside "if ($claudeRunning)", so when
             # Claude is gone this monitor previously did nothing at all: no
@@ -2339,10 +2654,12 @@ try {
             # shape, an app that died and stayed dead for over an hour with
             # zero log activity to point at afterwards.
             #
-            # This monitor cannot tell a crash from someone quitting, and
+            # A crash and a deliberate quit still look the same from here, and
             # relaunching an app the user closed on purpose would be worse than
-            # useless, so it does not try. What it can do is leave a timestamp,
-            # which is the thing that was missing.
+            # useless, so neither is acted on. A stealth update is the one case
+            # that does not look the same: the app writes a marker file on its
+            # way out, and nothing else does. Where that marker is present the
+            # sentence below would be false, so it is not printed.
             #
             # Whether the service is still up is recorded alongside it: Close
             # mode stops the service, so a live service with no Claude leans
@@ -2351,11 +2668,27 @@ try {
                 if (-not $claudeRunning) {
                     $svcNow = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
                     $svcState = if ($svcNow) { "$($svcNow.Status)" } else { "absent" }
-                    Write-WatchLog "Claude is no longer running (service: $svcState). Not acting: a crash and a deliberate quit look the same from here."
+                    if ($NoStealthRelaunch) {
+                        Write-WatchLog "Claude is no longer running (service: $svcState). Not acting: stealth relaunch is off (-NoStealthRelaunch)."
+                    } elseif (Get-StealthRelaunchMarker) {
+                        Write-WatchLog "Claude is no longer running (service: $svcState). A stealth-update marker is present, so this was an update quit, not a user quit."
+                    } else {
+                        Write-WatchLog "Claude is no longer running (service: $svcState). Not acting: a crash and a deliberate quit look the same from here."
+                    }
                 } else {
                     Write-WatchLog "Claude is running again"
                 }
                 $script:ClaudeWasRunning = $claudeRunning
+            }
+
+            # Evaluated every poll, not only on the transition above. A monitor
+            # that restarts, or that starts at logon after the update already
+            # happened, never sees a transition: ClaudeWasRunning is seeded from
+            # the current state, so an app that is already down looks unchanged.
+            # Invoke-StealthRelaunch is idempotent per marker, so re-asking
+            # costs one Test-Path on the polls where there is nothing to do.
+            if (-not $claudeRunning) {
+                $null = Invoke-StealthRelaunch
             }
 
             if ($claudeRunning) {
