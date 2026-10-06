@@ -2,7 +2,7 @@
 r"""commit_trailer_check.py -- fail a commit range that carries an AI co-author trailer.
 
 Created: 2026-10-06
-Updated: 2026-10-06 (prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
+Updated: 2026-10-06 (a "(cherry picked from commit" line continues the final trailer block, as git's own trailer parser counts it, so a model trailer that git cherry-pick -x carries over is read; earlier the same day prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
 
 Usage, as every repo's .github/workflows/commit-trailer.yml runs it:
 
@@ -156,6 +156,24 @@ ATTRIBUTION_KEY_SUFFIXES = ("-by", "-with")
 # attribution is to a machine.
 ATTRIBUTION_KEYS = ("author", "co-author", "coauthor", "cc")
 
+# A LINE GIT WRITES INTO THE TRAILER BLOCK WITH NO KEY, measured 2026-10-06 on
+# git 2.55.0.windows.3 rather than read off the documentation. `git cherry-pick
+# -x` appends "(cherry picked from commit <sha>)" straight under a message's
+# trailer block, and `-x -s` appends a Signed-off-by under that. git's own trailer
+# parser counts the line as part of the block -- it is one of git's
+# "git-generated" prefixes -- and `git interpret-trailers --parse` still returns
+# a Co-Authored-By above it. A block parse that stopped at the first line not
+# shaped "Key: value" read such a message's block as empty, or as the sign-off
+# alone, so a cherry-picked model Co-Authored-By passed at exit 0, and the
+# commit-msg hook does not run on a cherry-pick at all. The line now continues the
+# block and is never itself an attribution, having no key. A commit with no
+# trailer block gets the line after a blank line instead, so nothing above it is
+# read. Scored the same day over the full history of the 14 owned repos, 3475
+# commits: no message carries the line, and the 86 AI attribution lines and 93
+# signal-bearing block lines read identically under both rules, so this closes the
+# hole and moves no verdict.
+CHERRY_PICK_PREFIX = "(cherry picked from commit "
+
 
 def is_attribution(line):
     """True when `line`'s trailer KEY attributes authorship to somebody."""
@@ -170,7 +188,8 @@ def final_block(message):
     trailer-shaped. Returns [] when the last non-blank line is not itself
     trailer-shaped -- which is the case for every ordinary commit message, and
     the reason a body that merely MENTIONS Claude or CLAUDE.md is out of range
-    without any exception list.
+    without any exception list. A line git's cherry-pick -x writes, which starts
+    with CHERRY_PICK_PREFIX, continues the block as git's own parser lets it.
 
     Trailing blank lines are dropped first, because `git log --format=%B` ends
     every body with one and a naive "last line" read would see it and return
@@ -183,7 +202,7 @@ def final_block(message):
     for line in reversed(lines):
         if not line.strip():
             break
-        if not KEY_RE.match(line):
+        if not KEY_RE.match(line) and not line.startswith(CHERRY_PICK_PREFIX):
             break
         block.append(line)
     block.reverse()
