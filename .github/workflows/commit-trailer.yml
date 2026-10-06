@@ -1,0 +1,92 @@
+# Commit trailer gate: fail when a pushed or proposed commit carries an AI co-author trailer.
+#
+# Created: 2026-10-06
+# Updated: 2026-10-06 (prompt 10 of the 2026-09-28 tools queue: new, the same bytes in every repo that pushes to GitHub except GRIP-Tools, which runs audit-commit-trailer itself, and GRIP-Advisor, which has no commit)
+#
+# THE SOURCE OF THESE BYTES is tools/hooks/commit-trailer.yml in GRIP-Tools. Every copy at
+# .github/workflows/commit-trailer.yml must equal it, and audit-commit-trailer-ci fails when one does
+# not. The checker this runs is held the same way: .github/scripts/commit_trailer_check.py, whose
+# source is tools/hooks/commit_trailer_check.py, the file audit-commit-trailer reads its pattern from.
+# Edit a source and re-copy it; never edit a copy.
+#
+# THE INCIDENT. lazygrip 85032aa was authored 2026-09-30 14:20:41 -0500 with a model Co-Authored-By
+# line. GitHub committed it with a web-flow signature and no pull request, so it was made on GitHub
+# itself and no commit-msg hook in any clone saw its message. Its two check runs passed because
+# lazygrip's ci.yml reads no commit message, and it surfaced four days later only because a Cowork
+# session ran audit-pre-handoff. Until this file, one repo of thirteen read a message in CI.
+#
+# WHY ONLY THE RANGE AN EVENT BRINGS, never the whole history. lazygrip main carries four commits
+# with the trailer, 8365b70, 1b0c214, fa527c8 and 85032aa, all slowdog-dev's, and they are history
+# this decision does not rewrite; ems and hub carry the 2026-09-16 population below their baseline
+# SHAs. A whole-history read would hold those mains red for good over commits nobody is going to
+# change. Reading only what a push or a pull request brings keeps main green over that history
+# while the next trailer commit, pushed or proposed, turns this job red.
+#
+# THE RANGE. A push hands its before and after SHAs, read as before..after. A push that creates a
+# branch carries an all-zero before SHA, and the range is every commit reachable from the pushed SHA
+# and from no other branch of the remote. A pull request hands its base and head SHAs, read as
+# base..head. A push that deletes a branch brings no commit, so the job does not run for one. A FORCED
+# push whose old tip is on no branch any more, a rebase pushed with --force-with-lease as Dependabot
+# does whenever main moves, is read by the new-branch rule, because the event says it was forced; read
+# strictly, the 2026-10-06 review measured every such push red at exit 2. An unforced push whose
+# before SHA the clone lacks still exits 2. Two new branches created by one push hide each other's
+# commits from that rule; those commits are read when they reach an existing branch or a pull request.
+#
+# FETCH DEPTH 0, because a range read needs the history under it. actions/checkout@v7 defaults
+# fetch-depth to 1, measured in the runner's own cached copy of the action, where the input reads
+# default: 1, and a depth-1 clone can resolve neither a before SHA nor another branch's commits.
+#
+# THE RUNNER is picked by repository, so the bytes stay identical, and each choice is measured:
+#   GRIP-EMS         [self-hosted, linux, x64], what its deploy-guide, lint and release jobs use.
+#   GRIP-Hub         no workflow of its own, so ems's runner. Measured 2026-10-06: no runner is
+#                    registered to GRIP-Hub, and a runner on a personal account is registered per
+#                    repository, so this job waits in the queue until one is.
+#   ClaudeFix        windows-latest, what its lint.yml uses.
+#   everything else  ubuntu-latest, what grip-api, lazygrip, chromeserver, core, export, gr and forge
+#                    use. gse-companion-disclosure and Wow-Addon have no workflow and take it too,
+#                    not ems's runner: both are PUBLIC and neither has a runner registered (measured
+#                    2026-10-06), and a self-hosted runner on a public repository runs a fork's pull
+#                    request on that machine.
+# python3 is tried before python because a Windows python3 can be the Microsoft Store alias, which
+# exits non-zero without running anything (measured on the developer box 2026-10-06).
+
+name: Commit trailer gate
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  trailer:
+    name: No AI co-author trailer in the range
+    if: ${{ !github.event.deleted }}
+    runs-on: ${{ contains(fromJSON('["JesperLive/GRIP-EMS", "JesperLive/GRIP-Hub"]'), github.repository) && fromJSON('["self-hosted", "linux", "x64"]') || github.repository == 'JesperLive/ClaudeFix' && 'windows-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out the history the range needs
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fail on an AI co-author trailer in the pushed or proposed range
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+          PUSH_FORCED: ${{ github.event.forced }}
+          PUSH_REF: ${{ github.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PY=python3
+          "$PY" -c "" >/dev/null 2>&1 || PY=python
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            "$PY" .github/scripts/commit_trailer_check.py --repo . --base "$PR_BASE" --head "$PR_HEAD"
+          else
+            "$PY" .github/scripts/commit_trailer_check.py --repo . --base "$PUSH_BEFORE" --head "$PUSH_AFTER" --ref "$PUSH_REF" --forced "$PUSH_FORCED"
+          fi
