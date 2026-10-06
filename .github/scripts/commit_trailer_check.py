@@ -2,7 +2,7 @@
 r"""commit_trailer_check.py -- fail a commit range that carries an AI co-author trailer.
 
 Created: 2026-10-06
-Updated: 2026-10-06 (a "(cherry picked from commit" line continues the final trailer block, as git's own trailer parser counts it, so a model trailer that git cherry-pick -x carries over is read; earlier the same day prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
+Updated: 2026-10-06 (the commit-msg hook's gpt- signal and plural co-author keys join AI_VENDORS and ATTRIBUTION_KEYS, so the hook can judge with this pattern without losing either; earlier the same day a "(cherry picked from commit" line continues the final trailer block, as git's own trailer parser counts it, so a model trailer that git cherry-pick -x carries over is read; earlier the same day prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
 
 Usage, as every repo's .github/workflows/commit-trailer.yml runs it:
 
@@ -87,7 +87,14 @@ AI_MEASURED = ("anthropic", "claude")
 # than a heuristic, which is the whole reason this subject is gateable at all:
 # an intent-matching rule over commit prose would be arguing with English, while
 # a substring over a trailer VALUE is a fact about bytes.
-AI_VENDORS = ("openai", "chatgpt", "copilot", "gemini", "codex", "devin", "aider")
+#
+# "gpt-" JOINED ON 2026-10-06, from the commit-msg hook. hooks/commit-msg had
+# refused a `\bgpt-` value since 2026-09-18 while this list let one through, and
+# aligning the hook with this pattern must not drop a literal it already
+# enforced. A GPT model name with no vendor word, "GPT-5 <bot@...>", was the shape
+# only the hook caught. Scored that day over the full history of the 14 owned
+# repos, 3487 commits: it adds no finding.
+AI_VENDORS = ("openai", "chatgpt", "copilot", "gemini", "codex", "devin", "aider", "gpt-")
 
 # A trailer key: a letter, then letters, digits or hyphens, then a colon, then a
 # non-empty value. The optional [ \t]* before \S is what admits the real shape --
@@ -154,7 +161,12 @@ ATTRIBUTION_KEY_SUFFIXES = ("-by", "-with")
 # naming a human being is a legitimate co-author and passes: the key decides
 # whether the line is an attribution at all, and the VALUE decides whether the
 # attribution is to a machine.
-ATTRIBUTION_KEYS = ("author", "co-author", "coauthor", "cc")
+#
+# THE PLURAL KEYS JOINED ON 2026-10-06 for the reason "gpt-" did: the commit-msg
+# hook's `co-?authors?` had refused Co-Authors and Coauthors since 2026-09-18,
+# and alignment must not drop them. Scored over the same 3487 commits, they add
+# no finding.
+ATTRIBUTION_KEYS = ("author", "co-author", "coauthor", "cc", "co-authors", "coauthors")
 
 # A LINE GIT WRITES INTO THE TRAILER BLOCK WITH NO KEY, measured 2026-10-06 on
 # git 2.55.0.windows.3 rather than read off the documentation. `git cherry-pick
