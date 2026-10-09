@@ -63,7 +63,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.1.0
+    Version : 6.1.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -573,7 +573,7 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.1.0"
+$ToolkitVersion  = "6.1.1"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName

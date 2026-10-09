@@ -8,6 +8,35 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.1.1] - 2026-10-09
+
+### Fixed
+
+- The "Claude (Admin)" launcher no longer flashes a console window.
+
+  The `LaunchClaudeAdmin` scheduled task executed `PowerShell.exe` directly.
+  Under its Interactive principal, Task Scheduler hands a console-subsystem
+  program a brand-new visible console window, and `-WindowStyle Hidden` cannot
+  prevent it: PowerShell only hides its console after conhost has already drawn
+  it. Measured 2026-10-09, the task's window took the foreground for ~45 ms on
+  every launch, and the desktop shortcut's `.cmd` added a second cmd window of
+  its own (~1 s in the foreground) before `schtasks` even ran. Either is enough
+  to drop a fullscreen game to the desktop.
+
+  The task now runs `wscript.exe` -- a GUI-subsystem host, so it opens no
+  console of its own -- pointing at a generated `Launch-Claude-Admin.vbs`, which
+  starts PowerShell with its console hidden at creation time via
+  `WScript.Shell.Run(cmd, 0, ...)` (vbHide). The desktop shortcut now points at
+  `wscript.exe` running `Launch-Claude-Admin-Trigger.vbs`, which fires the task
+  the same hidden way. Claude still launches with the full, unfiltered admin
+  token: `wscript` runs at the task's `RunLevel Highest` and PowerShell inherits
+  it, so the elevation path, the Claude-discovery payload and the no-UAC-prompt
+  behaviour are all unchanged -- only the window is gone. Verified with a window
+  monitor across both launch steps: zero windows.
+
+  `Undo` removes the two new `.vbs` files, and setup deletes the superseded
+  `Launch-Claude-Admin.cmd` left by an earlier install.
+
 ## [6.1.0] - 2026-08-28
 
 ### Added
