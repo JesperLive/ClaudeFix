@@ -2,7 +2,7 @@
 r"""commit_trailer_check.py -- fail a commit range that carries an AI co-author trailer.
 
 Created: 2026-10-06
-Updated: 2026-10-10 (prompt 13 of the 2026-10-07 queue: a commit's trailers are git's own, read with git log -z and %(trailers:unfold,only) in the call that reads the range, and a message that is not yet a commit is read by git interpret-trailers --parse --unfold --no-divider, so the nine shapes git reads as a model trailer that this file passed are findings, a 0x1E byte no longer truncates a record, a key is judged with the whitespace before its colon removed, and a value opening with a non-breaking space is still judged; a forced push to the default branch whose old tip no clone holds exits 2 naming the push, and a new branch reads its head minus origin/<--default-branch> only); 2026-10-06 (the commit-msg hook's gpt- signal and plural co-author keys join AI_VENDORS and ATTRIBUTION_KEYS, so the hook can judge with this pattern without losing either; earlier the same day a "(cherry picked from commit" line continues the final trailer block, as git's own trailer parser counts it, so a model trailer that git cherry-pick -x carries over is read; earlier the same day prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
+Updated: 2026-10-10 (follow-up 13b of the 2026-10-07 queue, by Jesper's two decisions of that day: a commit's findings are git's trailers judged as before together with two rules over every line of its whole message, read as %B in the same git log -z call behind a NUL of its own, so a model attribution line is refused wherever it stands, mid-body, alone in a one-paragraph message, commented out, quoted, below a scissors line or above a "---" line, its key a token after whitespace and the markers # > + - * come off; and a line where an attribution phrase, generated, created, written, built, made, authored, co-authored, coauthored or assisted then with or by, is followed within three words by a vendor name as a whole word that is no file name or path, the footer shape of a code assistant, is refused too; ai_attribution_lines and the commit-msg hook apply the same three; parse_log hands each commit's message as a fourth field and refuses a payload whose chunks do not pair; earlier the same day prompt 13 of the 2026-10-07 queue: a commit's trailers are git's own, read with git log -z and %(trailers:unfold,only) in the call that reads the range, and a message that is not yet a commit is read by git interpret-trailers --parse --unfold --no-divider, so the nine shapes git reads as a model trailer that this file passed are findings, a 0x1E byte no longer truncates a record, a key is judged with the whitespace before its colon removed, and a value opening with a non-breaking space is still judged; a forced push to the default branch whose old tip no clone holds exits 2 naming the push, and a new branch reads its head minus origin/<--default-branch> only); 2026-10-06 (the commit-msg hook's gpt- signal and plural co-author keys join AI_VENDORS and ATTRIBUTION_KEYS, so the hook can judge with this pattern without losing either; earlier the same day a "(cherry picked from commit" line continues the final trailer block, as git's own trailer parser counts it, so a model trailer that git cherry-pick -x carries over is read; earlier the same day prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
 
 Usage, as every repo's .github/workflows/commit-trailer.yml runs it:
 
@@ -77,10 +77,23 @@ trailers now come from git log's %(trailers:unfold,only) in the call that reads
 the range, and a message that is not a commit yet from git interpret-trailers,
 so the commit-msg hook, this checker and audit-commit-trailer read a trailer
 the way git does and cannot disagree with it or with each other.
+
+THE WHOLE MESSAGE IS JUDGED TOO since later the same day, by Jesper's two
+decisions of 2026-10-10. git's trailers are what git reads as one, and measured
+that day (Cowork, git 2.55.0.windows.3) git reads no trailer in five shapes
+that still carry a model attribution: the line alone in a one-paragraph
+message, below a scissors line kept by -F, above a "---" line, in the middle of
+the body, and commented out with "#". Every line of a message is now judged as
+well, by the attribution-line rule and by the sentence rule (see
+attribution_line and sentence_finding), beside git's trailers, by every reader.
+Re-scored over the full history of the 16 owned repos, 3546 commits: git's
+trailers find 86 commits, the attribution-line rule the same 86 and the
+sentence rule none, so neither adds a historical finding.
 """
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 
@@ -186,6 +199,24 @@ ATTRIBUTION_KEY_SUFFIXES = ("-by", "-with")
 # no finding.
 ATTRIBUTION_KEYS = ("author", "co-author", "coauthor", "cc", "co-authors", "coauthors")
 
+# THE ATTRIBUTION PHRASE, by Jesper's decision of 2026-10-10: a sentence that
+# names a model as the maker of a change, the shape of a code assistant's own
+# footer, is refused as the trailer is. A phrase is one of these words, then one
+# of the two prepositions, whole words, any case; sentence_finding says what has
+# to follow it. hooks/commit-msg mirrors both lists, held equal by k3.
+ATTRIBUTION_PHRASE_WORDS = (
+    "generated",
+    "created",
+    "written",
+    "built",
+    "made",
+    "authored",
+    "co-authored",
+    "coauthored",
+    "assisted",
+)
+ATTRIBUTION_PHRASE_PREPOSITIONS = ("with", "by")
+
 # A LINE GIT WRITES INTO THE TRAILER BLOCK WITH NO KEY, measured 2026-10-06 on
 # git 2.55.0.windows.3: `git cherry-pick -x` appends "(cherry picked from commit
 # <sha>)" straight under a message's trailer block, and git's own trailer parser
@@ -259,6 +290,167 @@ def trailer_findings(trailers):
 
 
 # ------------------------------------------------------------------
+# THE WHOLE-MESSAGE RULES, since 2026-10-10. Both read one line of a message
+# wherever it stands, and message_findings applies them to every line beside
+# git's trailers. Whitespace here is a space or a tab, and a letter or a word
+# character is ASCII, because hooks/commit-msg applies the same rules in awk and
+# the k2 corpus holds the two equal.
+# ------------------------------------------------------------------
+
+# THE MARKERS A LINE MAY OPEN WITH and still be read as a trailer line: a
+# comment, a quote, a diff line or a list item. Measured 2026-10-10 by Cowork,
+# git reads no trailer in a commented-out model line, and the stripped line is
+# what the key is read from, so "# Co-Authored-By: ..." and "    > Co-Authored-By:
+# ..." are judged as the bare line is.
+LINE_MARKERS = "#>+-*"
+_LEAD_RE = re.compile(r"^[ \t" + re.escape(LINE_MARKERS) + r"]*")
+
+# THE KEY MUST BE A TOKEN, the shape git gives a trailer key. Without it, a
+# prose line holding a colon reads as a key: "the hook refuses a Co-Authored-By:
+# <model> line" keys as "the hook refuses a co-authored-by", which ends in -by.
+# With it only a trailer-shaped line is judged, wherever it stands. Re-scored
+# 2026-10-10 over the full history of the 16 owned repos, 3546 commits, this
+# rule finds the same 86 commits git's trailers find, none added.
+TRAILER_KEY_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*$")
+
+
+def attribution_line(line):
+    """(line, value, hits) when `line` is a model attribution line wherever it stands, else None.
+
+    THE ATTRIBUTION-LINE RULE. Leading whitespace and any run of LINE_MARKERS
+    come off; the key is the text before the first colon with the whitespace
+    around it removed, and it must be a token (TRAILER_KEY_TOKEN_RE). The line
+    is a finding when that key is an attribution, by is_attribution's rule, and
+    the text after the colon carries a signal, by signals(). It catches the five
+    shapes git reads no trailer in, measured 2026-10-10: the line alone in a
+    one-paragraph message, below a scissors line kept by -F, above a "---" line,
+    mid-body, and commented out.
+    """
+    text = _LEAD_RE.sub("", line.rstrip("\r"), count=1)
+    key, sep, _rest = text.partition(":")
+    if not sep or not TRAILER_KEY_TOKEN_RE.match(key.strip(" \t")):
+        return None
+    if not is_attribution(text):
+        return None
+    value = trailer_value(text)
+    hits = signals(value)
+    return (line.strip(), value, hits) if hits else None
+
+
+# THE PHRASE, as a pattern: a word of ATTRIBUTION_PHRASE_WORDS, a run of spaces
+# or tabs, a preposition, whole words in ASCII, any case.
+_PHRASE_RE = re.compile(
+    r"\b(?:%s)[ \t]+(?:%s)\b"
+    % (
+        "|".join(re.escape(w) for w in ATTRIBUTION_PHRASE_WORDS),
+        "|".join(re.escape(p) for p in ATTRIBUTION_PHRASE_PREPOSITIONS),
+    ),
+    re.IGNORECASE | re.ASCII,
+)
+
+# HOW NEAR THE NAME MUST STAND, in words after the phrase.
+SENTENCE_WINDOW = 3
+
+# WHAT COMES OFF A WORD'S FRONT before it is read as a name: an opening bracket
+# or quote, so "[Claude Code](https://...)" reads its first word as the name.
+# The curly quotes are built with chr() so no escape in this file is decoded.
+SENTENCE_OPENERS = "([{<\"'`" + chr(0x201C) + chr(0x2018)
+
+# A FILE NAME: a "." followed by a letter. "CLAUDE.md" is one; "ChatGPT." ends a
+# sentence.
+_FILE_NAME_RE = re.compile(r"\.[A-Za-z]")
+
+
+def _vendor_word(word):
+    """The signal literal `word` names as a whole word, or None.
+
+    WHY THE NAME MUST BE NEAR AND A WHOLE WORD. The signal literals are
+    substrings, every GRIP repo holds a CLAUDE.md and one is named ClaudeFix, so
+    under a same-line substring match "Section generated by the script into
+    CLAUDE.md" and "Built with the ClaudeFix toolchain" would read as
+    attributions (Cowork, 2026-10-10). So the word must START with a literal that
+    no letter follows -- "Claude", "Claude's", "GPT-5" and "ChatGPT" read,
+    "ClaudeFix" does not -- and it must be no file name or path: no "/" or "\\",
+    and no "." followed by a letter. A literal that already ends in a non-letter,
+    "gpt-", is a whole word whatever follows it, so "gpt-oss" reads too.
+    """
+    word = word.lstrip(SENTENCE_OPENERS)
+    if "/" in word or "\\" in word or _FILE_NAME_RE.search(word):
+        return None
+    low = word.lower()
+    for sig in (*AI_MEASURED, *AI_VENDORS):
+        if not low.startswith(sig):
+            continue
+        after = low[len(sig) : len(sig) + 1]
+        if sig[-1].isalpha() and after and "a" <= after <= "z":
+            continue
+        return sig
+    return None
+
+
+def sentence_finding(line):
+    """(line, value, hits) when `line` attributes a change to a model in a sentence, else None.
+
+    THE SENTENCE RULE, by Jesper's decision of 2026-10-10. Every line, with or
+    without a colon: a code assistant's canonical footer links its product name
+    to a URL, and the colon in that URL means the rule cannot be limited to
+    lines with none. The line is a finding when one of the
+    SENTENCE_WINDOW words after an attribution phrase is a vendor name, by
+    _vendor_word. `value` is the text after the first such phrase, lowercased.
+    Scored over the full history of the 16 owned repos, 3546 commits, a looser
+    form of it, any signal later on the same line, found none, so this adds no
+    historical finding.
+    """
+    text = line.rstrip("\r")
+    value = None
+    hits = []
+    for m in _PHRASE_RE.finditer(text):
+        rest = text[m.end() :]
+        words = [w for w in re.split(r"[ \t]+", rest) if w][:SENTENCE_WINDOW]
+        for word in words:
+            sig = _vendor_word(word)
+            if sig is None:
+                continue
+            if value is None:
+                value = rest.strip().lower()
+            if sig not in hits:
+                hits.append(sig)
+    return (line.strip(), value, hits) if hits else None
+
+
+def _finding_key(line):
+    """(key, value) of a finding's line, its markers off: two findings of one line share it."""
+    text = _LEAD_RE.sub("", line, count=1)
+    return trailer_key(text), trailer_value(text)
+
+
+def message_findings(trailers, message):
+    """[(line, value, hits)] for one message: git's trailers judged, then every line of the message.
+
+    THE WHOLE JUDGEMENT OF ONE MESSAGE, which every reader calls: run() and
+    audit-commit-trailer for a commit, with git's trailers and its %B from
+    read_range's one git log call, and ai_attribution_lines for a message that
+    is not a commit yet. Each line of `message` is judged by attribution_line,
+    then by sentence_finding when that finds nothing. A line found twice is
+    reported once: a line whose key matches a finding already made, and whose
+    value that finding's value begins with, is the same line -- git's trailer
+    for it, unfolded, or the line itself again.
+    """
+    found = list(trailer_findings(trailers))
+    keys = [_finding_key(f[0]) for f in found]
+    for raw in (message or "").split("\n"):
+        hit = attribution_line(raw) or sentence_finding(raw)
+        if hit is None:
+            continue
+        key, value = _finding_key(hit[0])
+        if any(k == key and v.startswith(value) for k, v in keys):
+            continue
+        found.append(hit)
+        keys.append((key, value))
+    return found
+
+
+# ------------------------------------------------------------------
 # GIT. Everything below runs git and nothing above does.
 # ------------------------------------------------------------------
 
@@ -270,7 +462,15 @@ def trailer_findings(trailers):
 # the body found it, the CLI over the range did not). git commit refuses a NUL
 # in a message ("a NUL byte in commit log message not allowed", measured
 # 2026-10-10), so a NUL cannot end a record early.
-LOG_ARGS = ("-z", "--format=%H%n%s%n%(trailers:unfold,only)")
+#
+# THE WHOLE MESSAGE RIDES IN THE SAME CALL since later the same day: %x00%B
+# puts each commit's raw message behind a NUL of its own, so every commit is two
+# chunks, its header then its message, and -z ends the pair with another NUL.
+# Measured 2026-10-10 on git 2.55.0.windows.3: three commits gave seven chunks,
+# the last one empty, and a commit with an empty message gave an empty message
+# chunk in its place. One call, not two, so the trailers and the message judged
+# for a commit are read from the same list of commits.
+LOG_ARGS = ("-z", "--format=%H%n%s%n%(trailers:unfold,only)%x00%B")
 RECORD_SEPARATOR = "\x00"
 
 # THE PARSER FOR A MESSAGE THAT IS NOT A COMMIT YET, the commit-msg hook's and
@@ -299,22 +499,31 @@ class RangeError(Exception):
 
 
 def parse_log(payload):
-    """Split git log output in the LOG_ARGS shape into (sha, subject, trailers) triples.
+    """Split git log output in the LOG_ARGS shape into (sha, subject, trailers, message) tuples. Raises RangeError.
 
     `trailers` is git's list of the commit's trailer lines, empty when it has
-    none. A record is cut on RECORD_SEPARATOR alone, never on a newline, so a
-    subject or a trailer value holding any other byte stays whole.
+    none, and `message` its whole raw message, %B. A chunk is cut on
+    RECORD_SEPARATOR alone, never on a newline, so a subject, a trailer value or
+    a message holding any other byte stays whole. The chunks pair, a header and
+    then a message, after the one empty chunk -z leaves at the end; a payload
+    whose chunks do not pair was not read as LOG_ARGS asks, and is RangeError
+    rather than a commit judged on half its text.
     """
+    chunks = payload.split(RECORD_SEPARATOR)
+    if chunks and not chunks[-1].strip():
+        chunks.pop()
+    if len(chunks) % 2:
+        raise RangeError(
+            "git log handed %d chunk(s), which do not pair as a header and a message per commit" % len(chunks)
+        )
     commits = []
-    for record in payload.split(RECORD_SEPARATOR):
-        record = record.lstrip("\n")
-        if not record.strip():
-            continue
-        sha, sep, rest = record.partition("\n")
-        if not sep:
-            continue
+    for i in range(0, len(chunks), 2):
+        header, message = chunks[i], chunks[i + 1]
+        sha, sep, rest = header.lstrip("\n").partition("\n")
+        if not sep or not sha.strip():
+            raise RangeError("git log handed a commit header with no SHA line: %r" % header[:80])
         subject, _sep, trailers = rest.partition("\n")
-        commits.append((sha.strip(), subject, [ln for ln in trailers.split("\n") if ln.strip()]))
+        commits.append((sha.strip(), subject, [ln for ln in trailers.split("\n") if ln.strip()], message))
     return commits
 
 
@@ -344,13 +553,14 @@ def message_trailers(message):
 
 
 def ai_attribution_lines(message):
-    """[(line, value, hits)] for each trailer of `message` that attributes authorship to a machine.
+    """[(line, value, hits)] for each line of `message` that attributes authorship to a machine.
 
-    For a message that is not a commit yet; a commit's trailers come from
-    read_range. A message whose list is empty carries no AI co-author trailer
-    by this file's definition.
+    For a message that is not a commit yet; a commit's trailers and message come
+    from read_range. git's trailers for it and every line of it are judged by
+    message_findings, as the commit-msg hook judges the message file: every
+    line, comment lines and the scissors line and all below it included.
     """
-    return trailer_findings(message_trailers(message))
+    return message_findings(message_trailers(message), message)
 
 
 def _git(repo, *argv):
@@ -500,10 +710,11 @@ def _branch_revisions(repo, head_full, ref, remote, default_branch, why):
 
 
 def read_range(repo, base, head, ref="", remote="origin", forced=False, default_branch=""):
-    """([(sha, subject, trailers)], description) for every commit in the range, or RangeError.
+    """([(sha, subject, trailers, message)], description) for every commit in the range, or RangeError.
 
-    THE TRAILERS COME FROM THE SAME git log CALL that lists the range, so each
-    commit is judged by git's own reading of its message; see LOG_ARGS.
+    THE TRAILERS AND THE MESSAGE COME FROM THE SAME git log CALL that lists the
+    range, so each commit is judged by git's own reading of its message and by
+    the whole-message rules over the same message; see LOG_ARGS.
     """
     revisions, desc = range_revisions(repo, base, head, ref, remote, forced, default_branch)
     rc, payload, err = _git(repo, "log", *LOG_ARGS, *revisions)
@@ -573,8 +784,8 @@ def run(argv=None):
             args.default_branch.strip(),
         )
         findings = []
-        for sha, _subject, trailers in commits:
-            hits = trailer_findings(trailers)
+        for sha, _subject, trailers, message in commits:
+            hits = message_findings(trailers, message)
             if hits:
                 findings.append((sha, _author(repo, sha), hits))
     except RangeError as exc:
