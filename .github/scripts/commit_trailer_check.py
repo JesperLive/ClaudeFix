@@ -2,11 +2,11 @@
 r"""commit_trailer_check.py -- fail a commit range that carries an AI co-author trailer.
 
 Created: 2026-10-06
-Updated: 2026-10-06 (the commit-msg hook's gpt- signal and plural co-author keys join AI_VENDORS and ATTRIBUTION_KEYS, so the hook can judge with this pattern without losing either; earlier the same day a "(cherry picked from commit" line continues the final trailer block, as git's own trailer parser counts it, so a model trailer that git cherry-pick -x carries over is read; earlier the same day prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
+Updated: 2026-10-10 (prompt 13 of the 2026-10-07 queue: a commit's trailers are git's own, read with git log -z and %(trailers:unfold,only) in the call that reads the range, and a message that is not yet a commit is read by git interpret-trailers --parse --unfold --no-divider, so the nine shapes git reads as a model trailer that this file passed are findings, a 0x1E byte no longer truncates a record, a key is judged with the whitespace before its colon removed, and a value opening with a non-breaking space is still judged; a forced push to the default branch whose old tip no clone holds exits 2 naming the push, and a new branch reads its head minus origin/<--default-branch> only); 2026-10-06 (the commit-msg hook's gpt- signal and plural co-author keys join AI_VENDORS and ATTRIBUTION_KEYS, so the hook can judge with this pattern without losing either; earlier the same day a "(cherry picked from commit" line continues the final trailer block, as git's own trailer parser counts it, so a model trailer that git cherry-pick -x carries over is read; earlier the same day prompt 10 of the 2026-09-28 tools queue: new; the trailer pattern moved here verbatim from cowork_util.py's audit-commit-trailer section, so that gate and every repo's CI judge a message with one copy of it)
 
 Usage, as every repo's .github/workflows/commit-trailer.yml runs it:
 
-    python3 .github/scripts/commit_trailer_check.py --repo . --base <before> --head <after> --ref <ref> --forced <true|false>
+    python3 .github/scripts/commit_trailer_check.py --repo . --base <before> --head <after> --ref <ref> --forced <true|false> --default-branch <branch>
     python3 .github/scripts/commit_trailer_check.py --repo . --base <base sha> --head <head sha>
 
 Exit 0 = no commit in the range carries one, with the commit count printed
@@ -24,9 +24,10 @@ surfaced on 2026-10-04 only because a Cowork session ran audit-pre-handoff. The
 one CI step that read a commit message was GRIP-Tools' own; the other twelve
 repos that push to GitHub read none. This file is what their CI now runs.
 
-ONE FILE, TWO READERS. The source lives at tools/hooks/commit_trailer_check.py
+ONE FILE, THREE READERS. The source lives at tools/hooks/commit_trailer_check.py
 in GRIP-Tools. cowork_util.py loads it from there and audit-commit-trailer judges
-every commit through its functions, so the gate that reads the whole workspace
+every commit through its functions, hooks/commit-msg judges with its lists held
+equal by tests/audit_subcommands/test_commit_msg_hook.py, so the gate that reads the whole workspace
 after the fact and the CI step that reads one pushed range cannot disagree about
 what a trailer is. Every other repo carries a byte copy at
 .github/scripts/commit_trailer_check.py, and audit-commit-trailer-ci fails when a
@@ -44,24 +45,42 @@ the pattern out from under the gate.
 THE RANGES, each a measured fact rather than a guess:
   * a push hands its before and after SHAs, and the range is before..after;
   * a push that CREATES a branch carries an all-zero before SHA, and the range
-    is every commit reachable from the pushed SHA and from no other branch of
-    the remote. The runner's clone holds the pushed branch's own remote ref and
-    may hold the remote's HEAD symref, so both are left out of "other";
+    is every commit reachable from the pushed SHA and not from the remote's
+    default branch, origin/<--default-branch>. Until 2026-10-10 it was "and
+    from no other branch of the remote", and two branches created by one push
+    (git push origin x:refs/heads/a x:refs/heads/b) each saw the other as an
+    existing branch holding x, so both ranges were empty and both printed
+    "PASS (nothing asserted)". A push that creates the default branch itself,
+    a repository's first push, reads the whole branch;
   * a FORCED push whose before SHA no clone holds -- a rebase pushed with
     --force-with-lease, as Dependabot does to its own branches -- takes the
     new-branch rule, because GitHub marks the push forced (--forced true); the
-    2026-10-06 review measured every such push failing at exit 2 without it;
+    2026-10-06 review measured every such push failing at exit 2 without it.
+    A forced push of the DEFAULT branch whose old tip no clone holds exits 2
+    naming the push instead: the new-branch rule would read all of that
+    branch's history, which on lazygrip is its four known hits and on a fresh
+    ems or hub runner the history before 2026-09-16;
   * a pull request hands its base and head SHAs, and the range is base..head.
 A range needs the history under it, so the workflow checks out with
 fetch-depth 0; actions/checkout@v7 defaults to 1, measured in the runner's cached
-copy of the action, and a depth-1 clone cannot resolve a before SHA at all. The
-new-branch rule cannot see a second branch created by the same push; see
-_branch_revisions for that limit and where those commits are read instead.
+copy of the action, and a depth-1 clone cannot resolve a before SHA at all.
+
+THE TRAILERS ARE GIT'S OWN since 2026-10-10. Until then this file read a
+message's final block with its own line rule, and measured that day against
+git 2.55.0.windows.3 it passed nine shapes git reads as a model trailer: a
+comment line, an indented continuation or the vendor word on a continuation
+below the model line, a space before the colon, an empty "Fixes:" below it, a
+non-breaking space after the colon, a Signed-off-by followed by a prose line
+(git's 25 percent rule), a scissors line kept by -F, and a 0x1E byte anywhere in
+the message, which truncated the record before the body was read. A commit's
+trailers now come from git log's %(trailers:unfold,only) in the call that reads
+the range, and a message that is not a commit yet from git interpret-trailers,
+so the commit-msg hook, this checker and audit-commit-trailer read a trailer
+the way git does and cannot disagree with it or with each other.
 """
 
 import argparse
 import os
-import re
 import subprocess
 import sys
 
@@ -96,14 +115,13 @@ AI_MEASURED = ("anthropic", "claude")
 # repos, 3487 commits: it adds no finding.
 AI_VENDORS = ("openai", "chatgpt", "copilot", "gemini", "codex", "devin", "aider", "gpt-")
 
-# A trailer key: a letter, then letters, digits or hyphens, then a colon, then a
-# non-empty value. The optional [ \t]* before \S is what admits the real shape --
-# `Co-Authored-By: Name <addr>` puts a space after the colon, and a pattern that
-# demanded a non-space IMMEDIATELY after it would match none of the 82 commits
-# this gate exists for. What the \S still buys is that a bare `Fixes:` with
-# nothing after it is not a trailer, so it terminates the block rather than
-# extending it.
-KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t]*\S")
+# WHICH LINES ARE TRAILERS IS GIT'S ANSWER, NOT THIS FILE'S, since 2026-10-10.
+# Until then a KEY_RE here, ^[A-Za-z][A-Za-z0-9-]*:[ \t]*\S, decided which lines
+# extended the final block, and three of the nine shapes git reads as a model
+# trailer failed it outright: "Co-Authored-By : ..." has a space before the
+# colon, a bare "Fixes:" below the model line has no value, and a non-breaking
+# space after the colon is whitespace to Python's \S, so the block ended there.
+# See read_range and message_trailers for where the trailers come from now.
 
 # THE FINDING IS AN ATTRIBUTION TRAILER, AND THIS NARROWING IS MEASURED RATHER
 # THAN GUESSED. The final-block parse alone is not sufficient, and the live tree
@@ -169,56 +187,30 @@ ATTRIBUTION_KEY_SUFFIXES = ("-by", "-with")
 ATTRIBUTION_KEYS = ("author", "co-author", "coauthor", "cc", "co-authors", "coauthors")
 
 # A LINE GIT WRITES INTO THE TRAILER BLOCK WITH NO KEY, measured 2026-10-06 on
-# git 2.55.0.windows.3 rather than read off the documentation. `git cherry-pick
-# -x` appends "(cherry picked from commit <sha>)" straight under a message's
-# trailer block, and `-x -s` appends a Signed-off-by under that. git's own trailer
-# parser counts the line as part of the block -- it is one of git's
-# "git-generated" prefixes -- and `git interpret-trailers --parse` still returns
-# a Co-Authored-By above it. A block parse that stopped at the first line not
-# shaped "Key: value" read such a message's block as empty, or as the sign-off
-# alone, so a cherry-picked model Co-Authored-By passed at exit 0, and the
-# commit-msg hook does not run on a cherry-pick at all. The line now continues the
-# block and is never itself an attribution, having no key. A commit with no
-# trailer block gets the line after a blank line instead, so nothing above it is
-# read. Scored the same day over the full history of the 14 owned repos, 3475
-# commits: no message carries the line, and the 86 AI attribution lines and 93
-# signal-bearing block lines read identically under both rules, so this closes the
-# hole and moves no verdict.
-CHERRY_PICK_PREFIX = "(cherry picked from commit "
+# git 2.55.0.windows.3: `git cherry-pick -x` appends "(cherry picked from commit
+# <sha>)" straight under a message's trailer block, and git's own trailer parser
+# counts it as part of the block, so a Co-Authored-By above it is still a
+# trailer. This file carried its own continuation rule for that line until
+# 2026-10-10; git's parser carries it now, and tests t14 and t15 still hold it.
+
+
+def trailer_key(line):
+    """The KEY of a trailer line, lowercased, with the whitespace before its colon removed.
+
+    git prints every trailer it parses as "Key: value", the key already
+    trimmed, measured 2026-10-10 on git 2.55.0.windows.3 for "Co-Authored-By :"
+    and "Co-Authored-By<TAB>:" alike. The key is still trimmed here, so the
+    judgement of a trailer line does not lean on that formatting: a caller
+    handing a raw "Co-Authored-By : <model>" line gets the same answer git's
+    normalised one gets.
+    """
+    return line.partition(":")[0].strip().lower()
 
 
 def is_attribution(line):
     """True when `line`'s trailer KEY attributes authorship to somebody."""
-    key = line.partition(":")[0].strip().lower()
+    key = trailer_key(line)
     return key.endswith(ATTRIBUTION_KEY_SUFFIXES) or key in ATTRIBUTION_KEYS
-
-
-def final_block(message):
-    r"""The message's FINAL TRAILER BLOCK: the last contiguous run of trailer lines.
-
-    Terminated upward by the first blank line or the first line that is not
-    trailer-shaped. Returns [] when the last non-blank line is not itself
-    trailer-shaped -- which is the case for every ordinary commit message, and
-    the reason a body that merely MENTIONS Claude or CLAUDE.md is out of range
-    without any exception list. A line git's cherry-pick -x writes, which starts
-    with CHERRY_PICK_PREFIX, continues the block as git's own parser lets it.
-
-    Trailing blank lines are dropped first, because `git log --format=%B` ends
-    every body with one and a naive "last line" read would see it and return
-    empty for every commit in the repository.
-    """
-    lines = (message or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    while lines and not lines[-1].strip():
-        lines.pop()
-    block = []
-    for line in reversed(lines):
-        if not line.strip():
-            break
-        if not KEY_RE.match(line) and not line.startswith(CHERRY_PICK_PREFIX):
-            break
-        block.append(line)
-    block.reverse()
-    return block
 
 
 def trailer_value(line):
@@ -237,16 +229,26 @@ def signals(value_lower):
     return [s for s in (*AI_MEASURED, *AI_VENDORS) if s in value_lower]
 
 
-def ai_attribution_lines(message):
-    """[(line, value, hits)] for each final-block attribution line whose value carries a signal.
+def trailer_findings(trailers):
+    """[(line, value, hits)] for each trailer in `trailers` that attributes authorship to a machine.
 
-    THE WHOLE JUDGEMENT OF ONE MESSAGE, in one function both readers call:
-    audit-commit-trailer applies its declared exceptions to what this returns,
-    and the CI check fails on anything it returns. A message whose list is
-    empty carries no AI co-author trailer by this file's definition.
+    THE WHOLE JUDGEMENT OF ONE MESSAGE, in one function every reader calls.
+    `trailers` is git's own list for that message, one "Key: value" line per
+    trailer, unfolded: parse_log hands it over for a commit and message_trailers
+    for a message that is not a commit yet. A trailer is a finding when its key
+    is an attribution and its value carries a signal. audit-commit-trailer
+    applies its declared exceptions to what this returns, and the CI check fails
+    on anything it returns.
+
+    A VALUE OPENING WITH A NON-BREAKING SPACE IS JUDGED like any other. git keeps
+    the U+00A0 in the value it returns, measured 2026-10-10, and the value is
+    read as a substring, so nothing about the character after the colon decides
+    whether the line is a trailer; that is git's answer, already given.
     """
     found = []
-    for line in final_block(message):
+    for line in trailers:
+        if ":" not in line:
+            continue
         if not is_attribution(line):
             continue
         value = trailer_value(line)
@@ -256,35 +258,99 @@ def ai_attribution_lines(message):
     return found
 
 
-def parse_log(payload):
-    """Split `%H%x1f%B%x1e` output into (sha, body) pairs.
-
-    THIS EXACT SHAPE WAS PROVEN AGAINST ALL 11 REPOS ON 2026-09-16. The record
-    separator is what makes a multi-line body unambiguous -- a body can contain
-    blank lines, indented text and its own colons, so no line-oriented split
-    survives contact with a real commit message.
-    """
-    commits = []
-    for record in payload.split("\x1e"):
-        record = record.lstrip("\n")
-        if not record.strip():
-            continue
-        sha, sep, body = record.partition("\x1f")
-        if not sep:
-            continue
-        commits.append((sha.strip(), body))
-    return commits
-
-
 # ------------------------------------------------------------------
-# THE RANGE. Everything below reads git and nothing above does.
+# GIT. Everything below runs git and nothing above does.
 # ------------------------------------------------------------------
 
-LOG_FORMAT = "--format=%H%x1f%B%x1e"
+# ONE git log CALL READS THE RANGE AND ITS TRAILERS, keyed by commit: the SHA,
+# the subject, then git's own trailer list, unfolded, one per line. -z ends each
+# record with a NUL. Until 2026-10-10 the records ended in 0x1E through
+# %x1e, and a 0x1E byte anywhere in a message ended its record early, so a model
+# trailer below it was never read (measured that day: ai_attribution_lines over
+# the body found it, the CLI over the range did not). git commit refuses a NUL
+# in a message ("a NUL byte in commit log message not allowed", measured
+# 2026-10-10), so a NUL cannot end a record early.
+LOG_ARGS = ("-z", "--format=%H%n%s%n%(trailers:unfold,only)")
+RECORD_SEPARATOR = "\x00"
+
+# THE PARSER FOR A MESSAGE THAT IS NOT A COMMIT YET, the commit-msg hook's and
+# ai_attribution_lines', run over the message with no repository needed.
+# MEASURED 2026-10-10 on git 2.55.0.windows.3, a message file at a time:
+#   * a comment line (core.commentChar, "#" by default) is skipped and does not
+#     end the trailer block, so a model line with a comment below it is a
+#     trailer, and a commented-out trailer is not one;
+#   * the scissors line "# ------------------------ >8 ------------------------"
+#     ends the message: nothing below it is read, a trailer below it included;
+#   * a 0x1E byte is an ordinary byte, kept in the value it sits in;
+#   * a "---" line ends the message too unless --no-divider is passed, and git
+#     log reads a commit's trailers with no divider: a model trailer above a
+#     "---" line came back from interpret-trailers without --no-divider and from
+#     neither git log nor interpret-trailers with it. --no-divider is what keeps
+#     the hook and the checker one parser;
+#   * a message of one paragraph has no trailer, since its first paragraph is
+#     the subject, and git log reads the commit made from it the same way.
+# Over 24 shapes, git log's %(trailers:unfold,only) of each commit and this
+# call's output for its message were the same lines.
+INTERPRET_TRAILERS = ("interpret-trailers", "--parse", "--unfold", "--no-divider")
 
 
 class RangeError(Exception):
     """The range could not be read. main() turns it into exit 2, never 0."""
+
+
+def parse_log(payload):
+    """Split git log output in the LOG_ARGS shape into (sha, subject, trailers) triples.
+
+    `trailers` is git's list of the commit's trailer lines, empty when it has
+    none. A record is cut on RECORD_SEPARATOR alone, never on a newline, so a
+    subject or a trailer value holding any other byte stays whole.
+    """
+    commits = []
+    for record in payload.split(RECORD_SEPARATOR):
+        record = record.lstrip("\n")
+        if not record.strip():
+            continue
+        sha, sep, rest = record.partition("\n")
+        if not sep:
+            continue
+        subject, _sep, trailers = rest.partition("\n")
+        commits.append((sha.strip(), subject, [ln for ln in trailers.split("\n") if ln.strip()]))
+    return commits
+
+
+def message_trailers(message):
+    """git's trailer lines for `message`, a message that is not a commit yet. Raises RangeError.
+
+    See INTERPRET_TRAILERS for what git does with comment lines, a scissors
+    line, a 0x1E byte and a "---" line, each measured.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *INTERPRET_TRAILERS],
+            input=(message or "").encode("utf-8"),
+            capture_output=True,
+            timeout=60,
+        )
+    except FileNotFoundError as exc:
+        raise RangeError("git is not on PATH (%s)" % exc) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RangeError("git interpret-trailers timed out after 60s") from exc
+    if proc.returncode != 0:
+        raise RangeError(
+            "git interpret-trailers exited %d: %s" % (proc.returncode, proc.stderr.decode("utf-8", "replace").strip())
+        )
+    text = proc.stdout.decode("utf-8", "replace").replace("\r\n", "\n")
+    return [ln for ln in text.split("\n") if ln.strip()]
+
+
+def ai_attribution_lines(message):
+    """[(line, value, hits)] for each trailer of `message` that attributes authorship to a machine.
+
+    For a message that is not a commit yet; a commit's trailers come from
+    read_range. A message whose list is empty carries no AI co-author trailer
+    by this file's definition.
+    """
+    return trailer_findings(message_trailers(message))
 
 
 def _git(repo, *argv):
@@ -321,14 +387,32 @@ def _resolve(repo, sha, what):
     return out.strip()
 
 
-def range_revisions(repo, base, head, ref="", remote="origin", forced=False):
+def _branch_of(ref):
+    """The branch name a pushed ref names: refs/heads/x -> x, a bare x -> x, any other refs/ -> None."""
+    if ref.startswith("refs/heads/"):
+        return ref[len("refs/heads/") :]
+    if ref.startswith("refs/"):
+        return None
+    return ref or None
+
+
+def range_revisions(repo, base, head, ref="", remote="origin", forced=False, default_branch=""):
     """(git log revision arguments, one-line description) for the range, or RangeError.
 
     base..head when base is a commit. When base is all zeros the push created
     a branch, and the range is the new-branch rule's, _branch_revisions. A
     FORCED push whose base is a commit this clone does not hold -- the old tip
     of a rebase, reachable from nothing once the push lands -- takes the same
-    rule; an unforced one with an unknown base stays unreadable.
+    rule, unless it pushed the default branch; an unforced one with an unknown
+    base stays unreadable.
+
+    THE FORCED PUSH OF THE DEFAULT BRANCH IS UNREADABLE, since 2026-10-10. The
+    new-branch rule reads the pushed head minus the default branch, and here the
+    default branch IS the pushed head, so the rule read the branch's whole
+    history: lazygrip's four known hits, or on a fresh ems or hub runner the
+    history before 2026-09-16, which the workflow's own comment says is never
+    read. What the push removed and what it brought cannot be told apart without
+    the old tip, so the push is named and read by a person, at exit 2.
     """
     rc, _out, err = _git(repo, "rev-parse", "--git-dir")
     if rc != 0:
@@ -339,61 +423,90 @@ def range_revisions(repo, base, head, ref="", remote="origin", forced=False):
     if not base:
         raise RangeError("no base SHA was given -- pass the push's before SHA or the pull request's base SHA")
     if _is_zero(base):
-        return _branch_revisions(repo, head_full, ref, remote, "the base SHA is all zeros, which names a new branch")
+        return _branch_revisions(
+            repo, head_full, ref, remote, default_branch, "the base SHA is all zeros, which names a new branch"
+        )
     try:
         base_full = _resolve(repo, base, "base")
     except RangeError:
         if not forced:
             raise
+        if default_branch and _branch_of(ref) == default_branch:
+            raise RangeError(
+                "a FORCED push of the default branch %s replaced %s with %s, and no clone holds the old tip, so "
+                "what the push removed and what it brought cannot be told apart. Read as a new branch it would "
+                "be the branch's whole history, which this check never reads. Compare the old and the new tip "
+                "by hand, and re-run this job once the old tip is fetched or the push is reverted"
+                % (default_branch, base, head_full)
+            ) from None
         return _branch_revisions(
-            repo, head_full, ref, remote, "the push was forced and its old tip %s is on no branch of this clone" % base
+            repo,
+            head_full,
+            ref,
+            remote,
+            default_branch,
+            "the push was forced and its old tip %s is on no branch of this clone" % base,
         )
     return ["%s..%s" % (base_full, head_full)], "%s..%s" % (base_full, head_full)
 
 
-def _branch_revisions(repo, head_full, ref, remote, why):
-    """The new-branch rule: head minus every branch of `remote` but the pushed one and the HEAD symref.
+def _branch_revisions(repo, head_full, ref, remote, default_branch, why):
+    """The new-branch rule: the pushed head minus the remote's default branch, origin/<default_branch>.
 
-    Those two refs point at the pushed branch itself in the runner's clone, so
-    counting either as "another branch" would leave nothing to read. THE ONE
-    THING IT CANNOT SEE is another branch created by the same push: two new
-    branches pushed together at one commit hide each other's commits (found by
-    the 2026-10-06 review, reproduced with `git push origin x:refs/heads/a
-    x:refs/heads/b`). Those commits are still read the day they reach a branch
-    that existed, as a push's before..after or a pull request's base..head.
+    THE DEFAULT BRANCH ALONE, since 2026-10-10. The rule was "minus every other
+    branch of the remote", and two branches created by one push (`git push
+    origin x:refs/heads/a x:refs/heads/b`, reproduced by the 2026-10-06 review)
+    each saw the other as an existing branch holding x: both ranges were empty,
+    both runs printed "PASS (nothing asserted)", and on hub's queue the window for
+    a branch to appear in between is unbounded. Each new branch now reads its own
+    commits whatever else the push created. THE PRICE IS A RE-READ: a branch
+    stacked on another branch that is not merged yet reads that branch's commits
+    again, which costs a second look at commits already judged and never hides
+    one. A push that creates the default branch itself, a repository's first
+    push, reads the whole branch, since there is nothing older to subtract.
     """
     if not ref:
         raise RangeError(
-            "%s, and no --ref says which branch was pushed -- without it the branch's own remote ref "
-            "would count as another branch" % why
+            "%s, and no --ref says which branch was pushed -- without it a push of the default branch "
+            "cannot be told from a new branch" % why
         )
-    if ref.startswith("refs/heads/"):
-        branch = ref[len("refs/heads/") :]
-    elif ref.startswith("refs/"):
-        branch = None
-    else:
-        branch = ref
-    rc, out, err = _git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/" + remote)
-    if rc != 0:
-        raise RangeError("git for-each-ref failed reading the branches of %s: %s" % (remote, err.strip()))
-    own = {"refs/remotes/%s/HEAD" % remote}
-    if branch:
-        own.add("refs/remotes/%s/%s" % (remote, branch))
-    others = [r for r in out.split() if r not in own]
-    desc = "%s, read as a new branch (%s): commits reachable from %s and from none of the %d other branch(es) of %s" % (
+    if not default_branch:
+        raise RangeError(
+            "%s, and no --default-branch names the remote's default branch, the one a new branch is read "
+            "against -- the workflow passes github.event.repository.default_branch" % why
+        )
+    if _branch_of(ref) == default_branch:
+        whole = "%s, read as the default branch %s being created (%s): every commit reachable from %s" % (
+            ref,
+            default_branch,
+            why,
+            head_full,
+        )
+        return [head_full], whole
+    default_ref = "refs/remotes/%s/%s" % (remote, default_branch)
+    rc, out, _err = _git(repo, "rev-parse", "--verify", "--quiet", default_ref + "^{commit}")
+    if rc != 0 or not out.strip():
+        raise RangeError(
+            "%s, and %s, the default branch a new branch is read against, is not in this clone -- check out "
+            "with fetch-depth 0" % (why, default_ref)
+        )
+    desc = "%s, read as a new branch (%s): commits reachable from %s and not from %s" % (
         ref,
         why,
         head_full,
-        len(others),
-        remote,
+        default_ref,
     )
-    return [head_full, "--not", *others], desc
+    return [head_full, "--not", default_ref], desc
 
 
-def read_range(repo, base, head, ref="", remote="origin", forced=False):
-    """([(sha, body)], description) for every commit in the range, or RangeError."""
-    revisions, desc = range_revisions(repo, base, head, ref, remote, forced)
-    rc, payload, err = _git(repo, "log", LOG_FORMAT, *revisions)
+def read_range(repo, base, head, ref="", remote="origin", forced=False, default_branch=""):
+    """([(sha, subject, trailers)], description) for every commit in the range, or RangeError.
+
+    THE TRAILERS COME FROM THE SAME git log CALL that lists the range, so each
+    commit is judged by git's own reading of its message; see LOG_ARGS.
+    """
+    revisions, desc = range_revisions(repo, base, head, ref, remote, forced, default_branch)
+    rc, payload, err = _git(repo, "log", *LOG_ARGS, *revisions)
     if rc != 0:
         raise RangeError("git log failed over %s: %s" % (desc, err.strip()))
     return parse_log(payload), desc
@@ -413,8 +526,8 @@ def _parser():
     parser = argparse.ArgumentParser(
         prog="commit_trailer_check.py",
         description=(
-            "Fail when any commit in a range carries an AI co-author trailer in its final trailer "
-            "block. Exit 0 = none, 1 = at least one, 2 = the range could not be read."
+            "Fail when any commit in a range carries an AI co-author trailer, as git itself reads "
+            "the commit's trailers. Exit 0 = none, 1 = at least one, 2 = the range could not be read."
         ),
     )
     parser.add_argument("--repo", default=".", help="the clone to read (default: the current directory)")
@@ -429,9 +542,17 @@ def _parser():
         "--forced",
         default="",
         help="the push's forced flag as GitHub renders it, true or false; with true, a --base no clone "
-        "holds is read as a new branch instead of failing",
+        "holds is read as a new branch instead of failing, unless the push was of --default-branch",
     )
-    parser.add_argument("--remote", default="origin", help="the remote whose branches a new branch is measured against")
+    parser.add_argument(
+        "--default-branch",
+        default="",
+        help="the remote's default branch, github.event.repository.default_branch; a new branch reads its "
+        "head minus <remote>/<default-branch>. Required when --base is all zeros or a forced --base is unknown",
+    )
+    parser.add_argument(
+        "--remote", default="origin", help="the remote whose default branch a new branch is read against"
+    )
     return parser
 
 
@@ -442,10 +563,18 @@ def run(argv=None):
     out = ["commit-trailer-check: %s" % _ascii(os.path.abspath(repo))]
     try:
         forced = args.forced.strip().lower() == "true"
-        commits, desc = read_range(repo, args.base.strip(), args.head.strip(), args.ref.strip(), args.remote, forced)
+        commits, desc = read_range(
+            repo,
+            args.base.strip(),
+            args.head.strip(),
+            args.ref.strip(),
+            args.remote,
+            forced,
+            args.default_branch.strip(),
+        )
         findings = []
-        for sha, body in commits:
-            hits = ai_attribution_lines(body)
+        for sha, _subject, trailers in commits:
+            hits = trailer_findings(trailers)
             if hits:
                 findings.append((sha, _author(repo, sha), hits))
     except RangeError as exc:

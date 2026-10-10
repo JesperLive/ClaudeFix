@@ -1,7 +1,7 @@
 # Commit trailer gate: fail when a pushed or proposed commit carries an AI co-author trailer.
 #
 # Created: 2026-10-06
-# Updated: 2026-10-06 (prompt 10 of the 2026-09-28 tools queue: new, the same bytes in every repo that pushes to GitHub except GRIP-Tools, which runs audit-commit-trailer itself, and GRIP-Advisor, which has no commit)
+# Updated: 2026-10-10 (Cowork's verification of prompt 13: the GRIP-Hub runner note names chromeserver-hub, registered 2026-10-07, where it said the job waits in the queue until a runner is; earlier the same day prompt 13 of the 2026-10-07 queue: the step hands github.event.repository.default_branch to the checker as DEFAULT_BRANCH, so a forced push of the default branch whose old tip no clone holds exits 2 naming the push, and a new branch reads its head minus the default branch only, so two branches created by one push each read their own commits); 2026-10-06 (prompt 10 of the 2026-09-28 tools queue: new, the same bytes in every repo that pushes to GitHub except GRIP-Tools, which runs audit-commit-trailer itself, and GRIP-Advisor, which has no commit)
 #
 # THE SOURCE OF THESE BYTES is tools/hooks/commit-trailer.yml in GRIP-Tools. Every copy at
 # .github/workflows/commit-trailer.yml must equal it, and audit-commit-trailer-ci fails when one does
@@ -24,13 +24,21 @@
 #
 # THE RANGE. A push hands its before and after SHAs, read as before..after. A push that creates a
 # branch carries an all-zero before SHA, and the range is every commit reachable from the pushed SHA
-# and from no other branch of the remote. A pull request hands its base and head SHAs, read as
-# base..head. A push that deletes a branch brings no commit, so the job does not run for one. A FORCED
-# push whose old tip is on no branch any more, a rebase pushed with --force-with-lease as Dependabot
-# does whenever main moves, is read by the new-branch rule, because the event says it was forced; read
-# strictly, the 2026-10-06 review measured every such push red at exit 2. An unforced push whose
-# before SHA the clone lacks still exits 2. Two new branches created by one push hide each other's
-# commits from that rule; those commits are read when they reach an existing branch or a pull request.
+# and not from the default branch, DEFAULT_BRANCH below. A pull request hands its base and head SHAs,
+# read as base..head. A push that deletes a branch brings no commit, so the job does not run for one.
+# A FORCED push whose old tip is on no branch any more, a rebase pushed with --force-with-lease as
+# Dependabot does whenever main moves, is read by the new-branch rule, because the event says it was
+# forced; read strictly, the 2026-10-06 review measured every such push red at exit 2. A forced push
+# of the DEFAULT branch whose old tip no clone holds exits 2 naming the push: the new-branch rule
+# would read that branch's whole history, lazygrip's four known hits or ems's and hub's history from
+# before 2026-09-16, which the paragraph above says is never read. An unforced push whose before SHA
+# the clone lacks still exits 2.
+# THE DEFAULT BRANCH ALONE IS SUBTRACTED, since 2026-10-10. Read against every other branch, two
+# branches created by one push (git push origin x:refs/heads/a x:refs/heads/b) each saw the other
+# holding x, both ranges were empty and both runs printed "PASS (nothing asserted)". Each new branch
+# now reads its own commits. A branch stacked on another branch that is not merged yet reads that
+# branch's commits again, a second look at commits already judged, never a hidden one. A push that
+# creates the default branch itself, a repository's first push, reads the whole branch.
 #
 # FETCH DEPTH 0, because a range read needs the history under it. actions/checkout@v7 defaults
 # fetch-depth to 1, measured in the runner's own cached copy of the action, where the input reads
@@ -38,9 +46,11 @@
 #
 # THE RUNNER is picked by repository, so the bytes stay identical, and each choice is measured:
 #   GRIP-EMS         [self-hosted, linux, x64], what its deploy-guide, lint and release jobs use.
-#   GRIP-Hub         no workflow of its own, so ems's runner. Measured 2026-10-06: no runner is
-#                    registered to GRIP-Hub, and a runner on a personal account is registered per
-#                    repository, so this job waits in the queue until one is.
+#   GRIP-Hub         no workflow of its own, so ems's runner labels. A runner on a personal account
+#                    is registered per repository, and none was registered to GRIP-Hub when this file
+#                    landed (measured 2026-10-06), so its first four runs sat queued until Cowork
+#                    registered chromeserver-hub on chromeserver on 2026-10-07 with those labels; all
+#                    four then ran on it and passed.
 #   ClaudeFix        windows-latest, what its lint.yml uses.
 #   everything else  ubuntu-latest, what grip-api, lazygrip, chromeserver, core, export, gr and forge
 #                    use. gse-companion-disclosure and Wow-Addon have no workflow and take it too,
@@ -80,6 +90,7 @@ jobs:
           PUSH_AFTER: ${{ github.event.after }}
           PUSH_FORCED: ${{ github.event.forced }}
           PUSH_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
@@ -88,5 +99,5 @@ jobs:
           if [ "$EVENT_NAME" = "pull_request" ]; then
             "$PY" .github/scripts/commit_trailer_check.py --repo . --base "$PR_BASE" --head "$PR_HEAD"
           else
-            "$PY" .github/scripts/commit_trailer_check.py --repo . --base "$PUSH_BEFORE" --head "$PUSH_AFTER" --ref "$PUSH_REF" --forced "$PUSH_FORCED"
+            "$PY" .github/scripts/commit_trailer_check.py --repo . --base "$PUSH_BEFORE" --head "$PUSH_AFTER" --ref "$PUSH_REF" --forced "$PUSH_FORCED" --default-branch "$DEFAULT_BRANCH"
           fi
