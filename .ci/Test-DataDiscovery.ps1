@@ -17,9 +17,10 @@
     the Code-session guard, and Watch's Sync-ClaudeDataPaths following a move
     and refusing a fallback. Then the VM logs: their age, Watch's Cowork
     guard, and Fix's wait for a booted VM, each reading every VM log in its
-    own format. Watch's and Fix's functions are pulled out of their scripts
-    with the language parser, so the code under test is the shipped code, not
-    a copy.
+    own format. Last, which Defender exclusions Prevent counts as covering
+    the data root. Watch's, Fix's and Prevent's functions are pulled out of
+    their scripts with the language parser, so the code under test is the
+    shipped code, not a copy.
 
     Exits 0 when every case passes, 1 otherwise.
 #>
@@ -510,6 +511,121 @@ try {
         (Test-Path -LiteralPath $fixtureRoot)) {
         Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+# ---------------------------------------------------------------------
+# Prevent's Defender exclusion check, against the data root. The data root
+# sits beside the app's own %LOCALAPPDATA%\Claude, and the old prefix test
+# counted an exclusion for that folder as covering it. Measured 2026-11-21:
+# a machine with exactly that exclusion, so Prevent never excluded the data
+# root there.
+# ---------------------------------------------------------------------
+Write-Host ""
+Write-Host "--- Prevent: which Defender exclusions cover a path"
+$preventPath = Join-Path $Root 'Prevent-ClaudeIssues.ps1'
+$coversSrc = $null
+try { $coversSrc = Get-FunctionSource $preventPath 'Test-DefenderExclusionCovers' } catch { $null = $_ }
+Assert-Case "Test-DefenderExclusionCovers was found in Prevent" ($null -ne $coversSrc)
+$preventText = [System.IO.File]::ReadAllText($preventPath)
+Assert-Case "the needed-paths loop asks Test-DefenderExclusionCovers" `
+    ($preventText -match '(?s)foreach \(\$np in \$neededPaths\) \{\s*if \(-not \(Test-DefenderExclusionCovers -Path \$np -Exclusions \$exclusions\)\)')
+Assert-Case "the data root is the first needed path" `
+    ($preventText -match '(?s)\$neededPaths = @\(\s*\$ClaudeDataRoot,')
+$U  = 'C:\Users\u\AppData\Local'
+$dr = "$U\Claude-Data\claude_abc123"
+if ($coversSrc) {
+    . ([scriptblock]::Create($coversSrc))
+    $coverCases = @(
+        @{ Name = "the app's own %LOCALAPPDATA%\Claude does not cover the data root beside it"; Path = $dr; Ex = @("$U\Claude"); Want = $false }
+        @{ Name = "nor with a trailing backslash";                       Path = $dr; Ex = @("$U\Claude\");              Want = $false }
+        @{ Name = "Claude-Data covers it";                               Path = $dr; Ex = @("$U\Claude-Data");          Want = $true }
+        @{ Name = "%LOCALAPPDATA% covers it";                            Path = $dr; Ex = @($U);                        Want = $true }
+        @{ Name = "the data root itself covers it";                      Path = $dr; Ex = @($dr);                       Want = $true }
+        @{ Name = "with a trailing backslash too";                       Path = $dr; Ex = @("$dr\");                    Want = $true }
+        @{ Name = "case does not matter";                                Path = $dr; Ex = @($dr.ToLowerInvariant());    Want = $true }
+        @{ Name = "a drive root covers it";                              Path = $dr; Ex = @('C:\');                     Want = $true }
+        @{ Name = "a folder whose name only starts the same does not";   Path = $dr; Ex = @("$U\Claude-Data\claude_abc"); Want = $false }
+        @{ Name = "an empty entry covers nothing";                       Path = $dr; Ex = @('', '  ');                  Want = $false }
+        @{ Name = "the N/A placeholder covers nothing";                  Path = $dr; Ex = @('N/A: Must be an administrator to view exclusions'); Want = $false }
+        @{ Name = "no exclusions at all";                                Path = $dr; Ex = $null;                        Want = $false }
+        @{ Name = "the right entry is found among others";               Path = $dr; Ex = @("$U\Claude", 'D:\Games', "$U\Claude-Data"); Want = $true }
+        @{ Name = "a wildcard entry covers what it matches";             Path = 'C:\Program Files\WindowsApps\Claude_1.0.0.0_x64__x\app\claude.exe'
+           Ex = @('C:\Program Files\WindowsApps\Claude_*'); Want = $true }
+        @{ Name = "an environment variable in an entry is expanded";     Path = "$env:SystemRoot\System32\vmwp.exe"
+           Ex = @('%SystemRoot%\System32\vmwp.exe'); Want = $true }
+        @{ Name = "brackets in an entry are literal";                    Path = 'C:\Games [x]\data'; Ex = @('C:\Games [x]'); Want = $true }
+        @{ Name = "and are not a character class";                       Path = 'C:\Games x\data';   Ex = @('C:\Games [x]'); Want = $false }
+        @{ Name = "an empty path is never covered";                      Path = '';  Ex = @('C:\');                     Want = $false }
+    )
+    foreach ($cc in $coverCases) {
+        $got = Test-DefenderExclusionCovers -Path $cc.Path -Exclusions $cc.Ex
+        Assert-Case $cc.Name ($got -eq $cc.Want) "got $got"
+    }
+}
+
+# Then the step itself: its try block, lifted out of Prevent and run with
+# Get-MpPreference and Add-MpPreference faked, so nothing real is read or
+# changed.
+Write-Host ""
+Write-Host "--- Prevent: the Defender exclusion step"
+$preventAst = [System.Management.Automation.Language.Parser]::ParseFile($preventPath, [ref]$null, [ref]$null)
+$defTry = @($preventAst.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.TryStatementAst] -and
+    $n.Body.Extent.Text -match '\$neededPaths = @\(' }, $true) |
+    Sort-Object { $_.Extent.EndOffset - $_.Extent.StartOffset } | Select-Object -First 1)
+Assert-Case "the Defender exclusion step was found in Prevent" ($defTry.Count -eq 1)
+if ($defTry.Count -eq 1) {
+    $stepText = $defTry[0].Extent.Text
+    $hyperV = Join-Path $env:ProgramFiles 'Hyper-V'
+    $vmwp   = "$env:SystemRoot\System32\vmwp.exe"
+    $vmms   = "$env:SystemRoot\System32\vmms.exe"
+    $allProcs = @('vmwp.exe', 'vmms.exe', 'vmcompute.exe', 'CoworkVMService.exe')
+    $runStep = {
+        param([string[]]$Paths, [string[]]$Procs)
+        & {
+            $state = @{ Paths = [System.Collections.ArrayList]@($Paths); Procs = [System.Collections.ArrayList]@($Procs)
+                        AddedPaths = @(); AddedProcs = @(); Logged = @() }
+            function Get-MpPreference {
+                param($ErrorAction)
+                $null = $ErrorAction
+                [pscustomobject]@{ ExclusionPath = @($state.Paths); ExclusionProcess = @($state.Procs) }
+            }
+            function Add-MpPreference {
+                param([string[]]$ExclusionPath, [string[]]$ExclusionProcess, $ErrorAction)
+                $null = $ErrorAction
+                foreach ($x in @($ExclusionPath))    { if ($x) { $state.AddedPaths += $x; $null = $state.Paths.Add($x) } }
+                foreach ($x in @($ExclusionProcess)) { if ($x) { $state.AddedProcs += $x; $null = $state.Procs.Add($x) } }
+            }
+            function Log { param([string]$Message, [string]$Colour, [switch]$Indent) $null = $Colour, $Indent; $state.Logged += $Message }
+            $ClaudeDataRoot = $dr
+            $ServiceExe     = 'CoworkVMService'
+            . ([scriptblock]::Create($stepText))
+            [pscustomobject]@{ AddedPaths = ($state.AddedPaths -join ','); AddedProcs = ($state.AddedProcs -join ',')
+                               Logged = ($state.Logged -join ' | ') }
+        }
+    }
+
+    # This machine on 2026-11-21: the app's own folder excluded, the data
+    # root beside it not.
+    $r = & $runStep @("$U\Claude", $hyperV, $vmwp, $vmms) $allProcs
+    Assert-Case "with only %LOCALAPPDATA%\Claude excluded, the data root is added" ($r.AddedPaths -eq $dr) "added $($r.AddedPaths)"
+    Assert-Case "and nothing else" ($r.AddedProcs -eq '') "added processes $($r.AddedProcs)"
+
+    $r = & $runStep @("$U\Claude-Data", $hyperV, $vmwp, $vmms) $allProcs
+    Assert-Case "with everything excluded, nothing is added" ($r.AddedPaths -eq '' -and $r.AddedProcs -eq '') `
+        "added $($r.AddedPaths) / $($r.AddedProcs)"
+    Assert-Case "and it says so" ($r.Logged -match 'path exclusions already configured' -and
+                                  $r.Logged -match 'process exclusions already configured') "logged: $($r.Logged)"
+
+    $r = & $runStep @("$U\Claude-Data", $hyperV, $vmwp, $vmms) @('vmwp.exe')
+    Assert-Case "with every path excluded, missing process exclusions are still added" `
+        ($r.AddedPaths -eq '' -and $r.AddedProcs -eq 'vmms.exe,vmcompute.exe,CoworkVMService.exe') "added $($r.AddedPaths) / $($r.AddedProcs)"
+    Assert-Case "and verified" ($r.Logged -match 'All process exclusions verified') "logged: $($r.Logged)"
+
+    $r = & $runStep @() @()
+    Assert-Case "with no exclusions, all four paths and four processes are added" (
+        $r.AddedPaths -eq (@($dr, $hyperV, $vmwp, $vmms) -join ',') -and
+        $r.AddedProcs -eq ($allProcs -join ',')) "added $($r.AddedPaths) / $($r.AddedProcs)"
 }
 
 Write-Host ""

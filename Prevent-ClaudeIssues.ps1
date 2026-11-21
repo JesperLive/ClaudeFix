@@ -1021,6 +1021,37 @@ function Get-ActivePlanGuid {
     return $raw.Trim()
 }
 
+function Test-DefenderExclusionCovers {
+    <#
+    .SYNOPSIS
+        True when one of Defender's ExclusionPath entries covers Path: the
+        same path, a folder above it, or a wildcard entry that matches it.
+    .DESCRIPTION
+        Until 6.2.0 this was a bare prefix test, which ignores folder
+        boundaries. The data root %LOCALAPPDATA%\Claude-Data\claude_<id>
+        sits beside the app's own %LOCALAPPDATA%\Claude, so an exclusion for
+        that folder read as covering the data root and the data root was
+        never excluded. Measured 2026-11-21: a machine in exactly that state.
+        An empty entry used to cover every path.
+
+        A Defender entry may use * and ? and environment variables, so those
+        are honoured; [ and ] are taken literally, as they are in a path.
+        An entry starting "N/A" is the placeholder Get-MpPreference returns
+        to a caller that may not read the list, and covers nothing.
+    #>
+    param([string]$Path, [string[]]$Exclusions)
+    if (-not $Path) { return $false }
+    $p = $Path.TrimEnd('\')
+    foreach ($ex in @($Exclusions)) {
+        if (-not $ex -or $ex -like 'N/A*') { continue }
+        $e = [Environment]::ExpandEnvironmentVariables($ex.Trim()).TrimEnd('\')
+        if (-not $e) { continue }
+        $pattern = $e -replace '[\[\]`]', '`$0'
+        if (($p -like $pattern) -or ($p -like "$pattern\*")) { return $true }
+    }
+    return $false
+}
+
 # -- Header ----------------------------------------------------------
 Write-Host ""
 Write-Host "  +----------------------------------------------+" -ForegroundColor Cyan
@@ -1950,13 +1981,7 @@ if ($Undo) {
                 )
                 $missing = @()
                 foreach ($np in $neededPaths) {
-                    $found = $false
-                    if ($exclusions) {
-                        foreach ($ex in $exclusions) {
-                            if ($np -like "$ex*") { $found = $true; break }
-                        }
-                    }
-                    if (-not $found) { $missing += $np }
+                    if (-not (Test-DefenderExclusionCovers -Path $np -Exclusions $exclusions)) { $missing += $np }
                 }
                 if ($missing.Count -gt 0) {
                     Log "Adding Defender exclusions for Hyper-V/Claude paths:" -Colour Green -Indent
@@ -1968,34 +1993,33 @@ if ($Undo) {
                             Log "  ! Could not add: $mp" -Colour Yellow -Indent
                         }
                     }
-                    # Also add process exclusions
-                    $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "$ServiceExe.exe")
-                    try {
-                        foreach ($rp in $requiredProcs) {
+                } else {
+                    Log "Defender path exclusions already configured" -Colour Green -Indent
+                }
+                # The process exclusions are checked on every run. Until 6.2.0
+                # they were only looked at when a path was missing, so a machine
+                # whose paths were all excluded never got them.
+                $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "$ServiceExe.exe")
+                try {
+                    $procExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
+                    $missingProcs = @($requiredProcs | Where-Object { -not ($procExclusions -contains $_) })
+                    if ($missingProcs.Count -gt 0) {
+                        foreach ($rp in $missingProcs) {
                             Add-MpPreference -ExclusionProcess $rp -ErrorAction SilentlyContinue
                         }
-                        Log "  + Process exclusions: $($requiredProcs -join ', ')" -Colour Green -Indent
-                    } catch { $null = $_ }
-                    # Verify process exclusions were applied (v4.8.0)
-                    try {
+                        Log "  + Process exclusions: $($missingProcs -join ', ')" -Colour Green -Indent
+                        # Verify they were applied (v4.8.0)
                         $procExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
-                        $missingProcs = @()
-                        foreach ($rp in $requiredProcs) {
-                            if (-not ($procExclusions -contains $rp)) { $missingProcs += $rp }
-                        }
-                        if ($missingProcs.Count -gt 0) {
-                            Log "  ! Missing process exclusions: $($missingProcs -join ', ')" -Colour Yellow -Indent
-                            foreach ($mp in $missingProcs) {
-                                Add-MpPreference -ExclusionProcess $mp -ErrorAction SilentlyContinue
-                            }
-                            Log "  Retried adding missing exclusions" -Colour DarkGray -Indent
+                        $stillMissing = @($requiredProcs | Where-Object { -not ($procExclusions -contains $_) })
+                        if ($stillMissing.Count -gt 0) {
+                            Log "  ! Could not add process exclusions: $($stillMissing -join ', ')" -Colour Yellow -Indent
                         } else {
                             Log "  All process exclusions verified" -Colour Green -Indent
                         }
-                    } catch { $null = $_ }
-                } else {
-                    Log "Defender exclusions already configured" -Colour Green -Indent
-                }
+                    } else {
+                        Log "Defender process exclusions already configured" -Colour Green -Indent
+                    }
+                } catch { $null = $_ }
             } catch {
                 Log "Could not check Defender exclusions, not critical" -Colour DarkGray -Indent
             }

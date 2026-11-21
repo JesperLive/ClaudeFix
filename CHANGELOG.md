@@ -131,6 +131,15 @@ run the scripts straight from this folder, so pulling is deploying.
   Running Prevent adds an exclusion for `%LOCALAPPDATA%\Claude-Data\claude_<id>`
   on a 6.18355 machine; the old `%APPDATA%\Claude` exclusion is not removed.
 
+  An existing exclusion now counts only when it is the same path, a folder
+  above it, or a wildcard that matches it. The old test compared the start of
+  the string, so an exclusion for the app's own `%LOCALAPPDATA%\Claude`
+  counted for `%LOCALAPPDATA%\Claude-Data` beside it, and an empty entry
+  counted for everything. Measured 2026-11-21: a machine with that exclusion,
+  where the old test would never have added the data root. The process
+  exclusions are now checked on every run; they were only looked at when a
+  path exclusion was missing.
+
 - `claude-env.json` is schema version 2: it gains `DataRoot`, `LogDir`, how
   each was found, the VM-cache, bundle and session folders under the data
   root, and the candidates passed over. `Import-ClaudeEnvironment` refuses a
