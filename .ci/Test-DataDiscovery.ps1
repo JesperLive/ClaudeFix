@@ -11,8 +11,11 @@
     with a Code session running.
 
     Each case builds a tree under a fresh folder in %TEMP%, points LOCALAPPDATA,
-    APPDATA and USERPROFILE at it for this process only, sets write times, and runs the
-    shipped functions against it. Test-ClaudeCodeActive is pulled out of
+    APPDATA and USERPROFILE at it for this process only, sets write times, and
+    runs the shipped functions against it: the candidate list, the choice
+    Resolve-ClaudeDataPaths makes from it, Get-ClaudeEnvironment end to end,
+    the Code-session guard, and Watch's Sync-ClaudeDataPaths following a move
+    and refusing a fallback. Watch's functions are pulled out of
     Watch-ClaudeHealth.ps1 with the language parser, so the code under test is
     the shipped code, not a copy.
 
@@ -52,7 +55,15 @@ function Get-FunctionSource {
 }
 
 . (Join-Path $PSScriptRoot 'ClaudeEnv.region.ps1')
-. ([scriptblock]::Create((Get-FunctionSource (Join-Path $Root 'Watch-ClaudeHealth.ps1') 'Test-ClaudeCodeActive')))
+$watchPath = Join-Path $Root 'Watch-ClaudeHealth.ps1'
+foreach ($fn in @('Test-ClaudeCodeActive', 'Sync-ClaudeDataPaths', 'Get-StealthMarkerPath')) {
+    . ([scriptblock]::Create((Get-FunctionSource $watchPath $fn)))
+}
+
+function Test-StartsWith {
+    param([string[]]$Lines, [string]$Prefix)
+    return (@($Lines | Where-Object { $_ -and $_.StartsWith($Prefix, [System.StringComparison]::Ordinal) }).Count -eq 1)
+}
 
 # What Test-ClaudeCodeActive reads from its script.
 $script:WatchLogLines          = @()
@@ -139,6 +150,28 @@ try {
     $stale = @($c.LogDirs | Where-Object { $_.Path -eq (Join-Path $dataRoot 'logs') })
     Assert-Case "the data root's August logs folder is listed behind it" ($stale.Count -eq 1)
 
+    $p = Resolve-ClaudeDataPaths -PackageFamilyName 'Claude_testpub' -AppDataDir (Join-Path $R 'Claude')
+    Assert-Case "resolved data root is the Claude-Data root" ($p.DataRoot -eq $dataRoot -and $p.DataRootSource -ne 'fallback') "got $($p.DataRoot) ($($p.DataRootSource))"
+    Assert-Case "resolved log folder is %LOCALAPPDATA%\Claude\logs" ($p.LogDir -eq (Join-Path $L 'Claude\logs') -and $p.LogDirSource -ne 'fallback') "got $($p.LogDir) ($($p.LogDirSource))"
+    Assert-Case "the VM cache, bundles and session folders are under the data root" (
+        $p.VmCachePath -eq (Join-Path $dataRoot 'claude-code-vm') -and
+        $p.BundlePath -eq (Join-Path $dataRoot 'vm_bundles') -and
+        $p.SessionsDir -eq (Join-Path $dataRoot 'local-agent-mode-sessions') -and
+        $p.CodeSessionsDir -eq (Join-Path $dataRoot 'claude-code-sessions'))
+    Assert-Case "the notes name the data root chosen" (Test-StartsWith $p.Notes "Data root: $dataRoot (")
+    Assert-Case "the notes name the log folder chosen" (Test-StartsWith $p.Notes "Log folder: $(Join-Path $L 'Claude\logs') (")
+    Assert-Case "the notes name the August logs folder passed over" (Test-StartsWith $p.Notes "Log folder passed over: $(Join-Path $dataRoot 'logs') (")
+
+    # The whole discovery, as Watch and Fix call it. Read-only: it also asks
+    # the real machine about its package and services, which only fills
+    # fields this case does not look at.
+    $e = Get-ClaudeEnvironment -SkipCacheInventory
+    Assert-Case "Get-ClaudeEnvironment: schema version 2" ($e.SchemaVersion -eq 2)
+    Assert-Case "Get-ClaudeEnvironment: AppDataDir stays the toolkit's folder" ($e.AppDataDir -eq (Join-Path $R 'Claude')) "got $($e.AppDataDir)"
+    Assert-Case "Get-ClaudeEnvironment: DataRoot and LogDir come from discovery" (
+        $e.DataRoot -eq $dataRoot -and $e.LogDir -eq (Join-Path $L 'Claude\logs')) "got $($e.DataRoot) | $($e.LogDir)"
+    Assert-Case "Get-ClaudeEnvironment: the choice is in Warnings" (Test-StartsWith $e.Warnings "Log folder: $(Join-Path $L 'Claude\logs') (")
+
     Assert-Case "no recent session file and no recent app log: not active" (-not (Test-ClaudeCodeActive))
 
     New-FixtureFile (Join-Path $dataRoot 'claude-code-sessions\acct\org\local_live.json') 2
@@ -193,6 +226,12 @@ try {
         (@($c.DataRoots).Count -gt 0 -and $c.DataRoots[0].Path -eq (Join-Path $R 'Claude') -and $c.DataRoots[0].IsAppData)
     Assert-Case "%APPDATA%\Claude\logs is the log folder" `
         (@($c.LogDirs).Count -eq 1 -and $c.LogDirs[0].Path -eq (Join-Path $R 'Claude\logs'))
+    $p = Resolve-ClaudeDataPaths -PackageFamilyName 'Claude_testpub' -AppDataDir (Join-Path $R 'Claude')
+    Assert-Case "resolved: the pre-6.2.0 paths, found rather than assumed" (
+        $p.DataRoot -eq (Join-Path $R 'Claude') -and $p.DataRootSource -ne 'fallback' -and
+        $p.LogDir -eq (Join-Path $R 'Claude\logs') -and $p.LogDirSource -ne 'fallback')
+    $vm = @(Get-ClaudeVmLogCandidates -LogDir $p.LogDir)
+    Assert-Case "the VM log in it is found" ($vm.Count -eq 1 -and $vm[0].Name -eq 'cowork_vm_node.log')
     Assert-Case "old session file and old renderer log: not active" (-not (Test-ClaudeCodeActive))
     New-FixtureFile (Join-Path $R 'Claude\logs\unknown-window.log') 1
     Assert-Case "unknown-window.log written 1 min ago: active" (Test-ClaudeCodeActive)
@@ -226,12 +265,84 @@ try {
     $c = Get-ClaudeDataCandidates -PackageFamilyName 'Claude_testpub'
     Assert-Case "no data roots" (@($c.DataRoots).Count -eq 0)
     Assert-Case "no log folders" (@($c.LogDirs).Count -eq 0)
+    $p = Resolve-ClaudeDataPaths -PackageFamilyName 'Claude_testpub' -AppDataDir (Join-Path $env:APPDATA 'Claude')
+    Assert-Case "the data root falls back to %APPDATA%\Claude and says so" (
+        $p.DataRoot -eq (Join-Path $env:APPDATA 'Claude') -and $p.DataRootSource -eq 'fallback' -and
+        (Test-StartsWith $p.Notes 'No folder holding Preferences or Local State was found'))
+    Assert-Case "the log folder falls back to %APPDATA%\Claude\logs and says so" (
+        $p.LogDir -eq (Join-Path $env:APPDATA 'Claude\logs') -and $p.LogDirSource -eq 'fallback' -and
+        (Test-StartsWith $p.Notes 'No logs folder holding a *.log was found'))
+    Assert-Case "no VM log in a folder that does not exist" (@(Get-ClaudeVmLogCandidates -LogDir $p.LogDir).Count -eq 0)
     Assert-Case "not active" (-not (Test-ClaudeCodeActive))
     Assert-Case "says once that it found no session folder" `
         (@($script:WatchLogLines | Where-Object { $_ -match 'no claude-code-sessions folder' }).Count -eq 1)
     $null = Test-ClaudeCodeActive
     Assert-Case "and does not say it again" `
         (@($script:WatchLogLines | Where-Object { $_ -match 'no claude-code-sessions folder' }).Count -eq 1)
+
+    # -----------------------------------------------------------------
+    Write-Host ""
+    Write-Host "--- Watch follows the folders when the app moves them, never to a fallback"
+
+    Reset-Fixture 'moving'
+    $L = $env:LOCALAPPDATA
+    $R = $env:APPDATA
+    # A monitor started before the update, on the old layout.
+    New-FixtureFile (Join-Path $R 'Claude\Preferences') 30
+    New-FixtureFile (Join-Path $R 'Claude\logs\cowork_vm_node.log') 30
+    # What Sync-ClaudeDataPaths and Get-StealthMarkerPath read from Watch.
+    $ClaudeAppData     = Join-Path $R 'Claude'
+    $StealthMarkerName = 'stealth-relaunch'
+    $start = Resolve-ClaudeDataPaths -PackageFamilyName 'Claude_testpub' -AppDataDir $ClaudeAppData
+    $script:ClaudeEnv = [ordered]@{
+        PackageFamilyName = 'Claude_testpub'
+        VmLogFile         = (Join-Path $R 'Claude\logs\cowork_vm_node.log')
+        VmLogCandidates   = @()
+    }
+    foreach ($k in @('DataRoot', 'DataRootSource', 'LogDir', 'LogDirSource', 'VmCachePath', 'BundlePath',
+                     'SessionsDir', 'CodeSessionsDir', 'DataRootCandidates', 'LogDirCandidates')) {
+        $script:ClaudeEnv[$k] = $start.$k
+    }
+    $script:ClaudeLogDir      = $start.LogDir
+    $script:StealthMarkerPath = Get-StealthMarkerPath
+    $script:NextDataPathSync  = (Get-Date).AddMinutes(10)
+    Assert-Case "starts on %APPDATA%\Claude" (
+        $script:ClaudeEnv.DataRoot -eq $ClaudeAppData -and $script:ClaudeLogDir -eq (Join-Path $ClaudeAppData 'logs'))
+
+    # The app updates and moves everything.
+    $dataRoot = Join-Path $L 'Claude-Data\claude_testpub'
+    New-FixtureFile (Join-Path $dataRoot 'Preferences') 1
+    New-FixtureFile (Join-Path $L 'Claude\logs\main.log') 1
+    New-FixtureFile (Join-Path $L 'Claude\logs\cowork_vm_node.log') 1
+
+    Sync-ClaudeDataPaths
+    Assert-Case "between ten-minute marks it does not look" ($script:ClaudeEnv.DataRoot -eq $ClaudeAppData)
+
+    Sync-ClaudeDataPaths -Force
+    Assert-Case "forced, it follows the data root" ($script:ClaudeEnv.DataRoot -eq $dataRoot) "got $($script:ClaudeEnv.DataRoot)"
+    Assert-Case "and the VM cache with it" ($script:ClaudeEnv.VmCachePath -eq (Join-Path $dataRoot 'claude-code-vm'))
+    Assert-Case "it follows the log folder" ($script:ClaudeLogDir -eq (Join-Path $L 'Claude\logs')) "got $($script:ClaudeLogDir)"
+    Assert-Case "and picks the VM log in it" ($script:ClaudeEnv.VmLogFile -eq (Join-Path $L 'Claude\logs\cowork_vm_node.log')) "got $($script:ClaudeEnv.VmLogFile)"
+    Assert-Case "the stealth marker moves to the data root" ($script:StealthMarkerPath -eq (Join-Path $dataRoot 'stealth-relaunch')) "got $($script:StealthMarkerPath)"
+    Assert-Case "each move is logged once" (
+        (Test-StartsWith $script:WatchLogLines 'Claude data root moved: ') -and
+        (Test-StartsWith $script:WatchLogLines 'Claude log folder moved: ') -and
+        (Test-StartsWith $script:WatchLogLines 'VM log moved: '))
+    $before = @($script:WatchLogLines).Count
+    Sync-ClaudeDataPaths -Force
+    Assert-Case "nothing moved, nothing logged" (@($script:WatchLogLines).Count -eq $before)
+
+    # Every candidate vanishes for a poll, so discovery falls back to the
+    # folder the app abandoned.
+    Remove-Item -LiteralPath (Join-Path $L 'Claude-Data') -Recurse -Force
+    Remove-Item -LiteralPath (Join-Path $L 'Claude') -Recurse -Force
+    Remove-Item -LiteralPath (Join-Path $R 'Claude\Preferences') -Force
+    Remove-Item -LiteralPath (Join-Path $R 'Claude\logs') -Recurse -Force
+    $probe = Resolve-ClaudeDataPaths -PackageFamilyName 'Claude_testpub' -AppDataDir $ClaudeAppData
+    Assert-Case "(discovery now answers with fallbacks)" ($probe.DataRootSource -eq 'fallback' -and $probe.LogDirSource -eq 'fallback')
+    Sync-ClaudeDataPaths -Force
+    Assert-Case "a fallback answer is not followed" (
+        $script:ClaudeEnv.DataRoot -eq $dataRoot -and $script:ClaudeLogDir -eq (Join-Path $L 'Claude\logs'))
 } finally {
     $env:LOCALAPPDATA = $savedLocal
     $env:APPDATA      = $savedRoaming

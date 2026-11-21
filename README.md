@@ -148,7 +148,7 @@ The underlying HCS error (`failed to create compute system: HcsWaitForOperationR
 
 ### Guest Connection Timeout
 
-A third class of failure occurs after the VM boots but the guest operating system never establishes its connection back to the host. Claude Desktop polls `cowork-svc.exe` via a named pipe (`\\.\pipe\cowork-vm-service`) every ~1 second with `isGuestConnected` RPC calls. If the guest never reports as connected, the UI shows `"Request timed out: isGuestConnected"`. This can be caused by: the VM booting but vsock/networking failing to initialise, `cowork-svc.exe` being CPU-starved by its own Authenticode signature verification loop (each poll re-hashes the 204 MB `claude.exe` binary, consuming ~960ms per call), or HCS state corruption preventing guest-host communication. The service log at `%APPDATA%\Claude\logs\cowork-service.log` records each RPC call. See issue #31848 for the Authenticode CPU burn.
+A third class of failure occurs after the VM boots but the guest operating system never establishes its connection back to the host. Claude Desktop polls `cowork-svc.exe` via a named pipe (`\\.\pipe\cowork-vm-service`) every ~1 second with `isGuestConnected` RPC calls. If the guest never reports as connected, the UI shows `"Request timed out: isGuestConnected"`. This can be caused by: the VM booting but vsock/networking failing to initialise, `cowork-svc.exe` being CPU-starved by its own Authenticode signature verification loop (each poll re-hashes the 204 MB `claude.exe` binary, consuming ~960ms per call), or HCS state corruption preventing guest-host communication. The service log `cowork-service.log` in the app's log folder (see [Where the app keeps its files](#where-the-app-keeps-its-files)) records each RPC call. See issue #31848 for the Authenticode CPU burn.
 
 Note that on current builds this file has not been written since March. The toolkit checks its age before parsing it, so a stale copy is ignored rather than mined for answers about the last 60 seconds.
 
@@ -276,6 +276,30 @@ deep purge, and restoring it would put back whatever was wrong with it. That
 ### Diagnostics
 
 Each run writes a timestamped log to `%APPDATA%\Claude\fix-logs\`. The health monitor logs to `%APPDATA%\Claude\watch-logs\`. Recent CoworkVMService errors from the Windows Event Log are shown in the summary.
+
+### Where the app keeps its files
+
+The toolkit's own files stay in `%APPDATA%\Claude`: `fix-logs`, `watch-logs`,
+`watch-state.json` and the support bundles. The app's own files have moved
+between versions, so from 6.2.0 the toolkit looks for them instead of
+assuming a folder:
+
+| Version | App logs | App data (VM cache, bundles, sessions) |
+|---|---|---|
+| Before 6.18355 | `%APPDATA%\Claude\logs` | `%APPDATA%\Claude` |
+| 6.18355 (measured 2026-11-21) | `%LOCALAPPDATA%\Claude\logs` | `%LOCALAPPDATA%\Claude-Data\claude_<id>` |
+
+Every folder the app has used is a candidate: `Claude-Data\*`, `Claude-3p\*`
+and `Claude` under `%LOCALAPPDATA%` and `%APPDATA%`, the MSIX package's
+`LocalCache` copies of both, and `CLAUDE_USER_DATA_DIR` when it is set. The
+data root is the freshest candidate holding `Preferences` or `Local State`,
+and the log folder is the candidate whose newest log was written last. When
+nothing is found, both fall back to `%APPDATA%\Claude`, the pre-6.2.0
+behaviour. The choice and every candidate passed over are written to
+`Warnings` in `fix-logs\claude-env.json`, Fix prints both folders at the top
+of its log, and the health monitor prints them in its startup banner, looks
+again every ten minutes and whenever the app starts, and logs a line when
+either folder moves.
 
 **Support bundles.** `-Mode Diagnostic` changes nothing and, at the end, writes a zip you can attach to a bug report:
 
@@ -533,7 +557,7 @@ The VM booted but the guest OS did not connect back to the host. Run `Fix-Claude
 The fix script auto-cleans logs older than 30 days. You can safely delete everything in that folder manually if needed.
 
 **Claude vanishes the moment the agent uses the in-app Browser**
-That is the GPU-process crash in [#80444](https://github.com/anthropics/claude-code/issues/80444). Check `%APPDATA%\Claude\logs\main.log` for `GPU process gone` with `exitCode: 101457950`, and `unknown-window.log` for a burst of `WebGL: INVALID_ENUM: getInternalformatParameter` warnings a second or two earlier. Run `Prevent-ClaudeIssues.bat` and launch from the "Claude (no GPU)" shortcut it creates. If that does not hold, avoid the in-app Browser pane on this build and use a real browser window for testing.
+That is the GPU-process crash in [#80444](https://github.com/anthropics/claude-code/issues/80444). Check `main.log` in the app's log folder (`%LOCALAPPDATA%\Claude\logs` on app 6.18355; see [Where the app keeps its files](#where-the-app-keeps-its-files)) for `GPU process gone` with `exitCode: 101457950`, and `unknown-window.log` for a burst of `WebGL: INVALID_ENUM: getInternalformatParameter` warnings a second or two earlier. Run `Prevent-ClaudeIssues.bat` and launch from the "Claude (no GPU)" shortcut it creates. If that does not hold, avoid the in-app Browser pane on this build and use a real browser window for testing.
 
 **The script says Virtual Machine Platform is disabled, but Hyper-V is on**
 Those are different Windows features and both statements can be true at once. Run `Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform` to check the one that matters; a `*Hyper-V*` search cannot return it. That said, from v6.0.3 the script only names this feature as a cause when `vmcompute` and `hns` are genuinely missing, because full Hyper-V supplies the same underlying stack and Cowork runs perfectly well on it. If an earlier version told you to enable a feature and restart, and Cowork was working before that, you did not need to.
@@ -578,7 +602,7 @@ After a reboot, Claude Desktop may briefly close and reopen itself on the first 
 
 **This does not affect functionality.** No data is lost, no settings are changed, and the workspace starts correctly. ClaudeFix's BootPrep mode prevents the more serious `0x800707DE` construct failure; the close-reopen is a separate Claude Desktop bug that cannot be fixed externally.
 
-Relevant log pattern in `%APPDATA%\Claude\logs\cowork_vm_node.log`:
+Relevant log pattern in `cowork_vm_node.log`, in the app's log folder (see [Where the app keeps its files](#where-the-app-keeps-its-files)):
 ```
 [VM:start] Beginning startup, VM instance ID: ...
 [VM:start] Beginning startup, VM instance ID: ...  (duplicate)

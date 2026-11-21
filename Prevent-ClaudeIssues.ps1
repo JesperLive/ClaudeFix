@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 6.1.1
+    Version : 6.2.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -118,8 +118,11 @@ function Get-ClaudeEnvironment {
     #>
     param([switch]$SkipCacheInventory)
 
+    # Version 2 (6.2.0): the app's folders come from Resolve-ClaudeDataPaths
+    # instead of %APPDATA%\Claude. A version 1 record names the old folders,
+    # so Import-ClaudeEnvironment turns it away.
     $info = [ordered]@{
-        SchemaVersion = 1
+        SchemaVersion = 2
         DiscoveredUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
         PackageFound      = $false
@@ -143,11 +146,20 @@ function Get-ClaudeEnvironment {
 
         ProcessName = 'claude'
 
-        AppDataDir  = $null
-        LogDir      = $null
-        VmCachePath = $null
-        BundlePath  = $null
-        SessionsDir = $null
+        # AppDataDir is this toolkit's own folder: fix-logs, watch-logs,
+        # watch-state.json, the generated launchers. The app kept its data
+        # there too until 6.18355; DataRoot is where it keeps it now.
+        AppDataDir         = $null
+        DataRoot           = $null
+        DataRootSource     = $null
+        LogDir             = $null
+        LogDirSource       = $null
+        VmCachePath        = $null
+        BundlePath         = $null
+        SessionsDir        = $null
+        CodeSessionsDir    = $null
+        DataRootCandidates = @()
+        LogDirCandidates   = @()
 
         VmLogFile       = $null
         VmLogCandidates = @()
@@ -182,16 +194,14 @@ function Get-ClaudeEnvironment {
         else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
     } catch { $info.Warnings += "hcsdiag probe failed: $($_.Exception.Message)" }
 
-    # -- Per-user data locations -------------------------------------------
-    # %APPDATA% is the only location that exists on current builds. The old
-    # %ProgramData%\Claude tree is gone, so it is not probed here at all.
+    # -- This toolkit's own folder -----------------------------------------
+    # %APPDATA%\Claude, where the toolkit keeps its logs, state and launchers.
+    # Where the app keeps its own data and logs is found further down, once the
+    # package is known; see Resolve-ClaudeDataPaths. The old
+    # %ProgramData%\Claude tree is gone, so it is not probed at all.
     try {
         if ($env:APPDATA) {
-            $info.AppDataDir  = Join-Path $env:APPDATA "Claude"
-            $info.LogDir      = Join-Path $info.AppDataDir "logs"
-            $info.VmCachePath = Join-Path $info.AppDataDir "claude-code-vm"
-            $info.BundlePath  = Join-Path $info.AppDataDir "vm_bundles"
-            $info.SessionsDir = Join-Path $info.AppDataDir "local-agent-mode-sessions"
+            $info.AppDataDir = Join-Path $env:APPDATA "Claude"
         } else {
             $info.Warnings += "APPDATA is not set; per-user paths undiscoverable"
         }
@@ -253,6 +263,21 @@ function Get-ClaudeEnvironment {
     if ($info.PackageFamilyName -and $info.ApplicationId) {
         $info.Aumid = "shell:AppsFolder\$($info.PackageFamilyName)!$($info.ApplicationId)"
     }
+
+    # -- The app's data and log folders --------------------------------------
+    # After the package query because the package's LocalCache is one of the
+    # candidates. Every choice and every candidate passed over goes into
+    # Warnings, so claude-env.json says why a path was picked.
+    try {
+        $paths = Resolve-ClaudeDataPaths -PackageFamilyName $info.PackageFamilyName `
+                                         -AppDataDir $info.AppDataDir
+        foreach ($k in @('DataRoot', 'DataRootSource', 'LogDir', 'LogDirSource', 'VmCachePath',
+                         'BundlePath', 'SessionsDir', 'CodeSessionsDir',
+                         'DataRootCandidates', 'LogDirCandidates')) {
+            $info[$k] = $paths.$k
+        }
+        $info.Warnings += @($paths.Notes)
+    } catch { $info.Warnings += "Data folder discovery failed: $($_.Exception.Message)" }
 
     # -- Claude executable ---------------------------------------------------
     # Ordered by authority, not by convenience. The package branch runs first
@@ -360,33 +385,10 @@ function Get-ClaudeEnvironment {
     } catch { $null = $_ }
 
     # -- VM log selection ----------------------------------------------------
-    # Deliberately restricted to VM-relevant logs. main.log is excluded: it is
-    # the Electron main process log and it can sit frozen for a day at a time on
-    # a perfectly healthy machine, so keying staleness on it is a guaranteed
-    # false positive. Newest wins, and the age is recorded so a caller can
-    # reject a candidate that predates its own lookback window.
+    # See Get-ClaudeVmLogCandidates for which logs count and why.
     try {
         if ($info.LogDir -and (Test-Path $info.LogDir)) {
-            $cands = @()
-            foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
-                try {
-                    $p = Join-Path $info.LogDir $n
-                    if (Test-Path $p) {
-                        $fi = Get-Item $p -ErrorAction SilentlyContinue
-                        if ($fi) {
-                            $cands += [pscustomobject]@{
-                                Name          = $n
-                                Path          = $fi.FullName
-                                LastWriteTime = $fi.LastWriteTime
-                                AgeHours      = [math]::Round( `
-                                    ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
-                                Length        = $fi.Length
-                            }
-                        }
-                    }
-                } catch { $null = $_ }
-            }
-            $cands = @($cands | Sort-Object LastWriteTime -Descending)
+            $cands = @(Get-ClaudeVmLogCandidates -LogDir $info.LogDir)
             $info.VmLogCandidates = $cands
             if ($cands.Count -gt 0) { $info.VmLogFile = $cands[0].Path }
             else { $info.Warnings += "No VM log present in $($info.LogDir)" }
@@ -474,7 +476,7 @@ function Import-ClaudeEnvironment {
         if (-not $raw) { return $null }
         $obj = $raw | ConvertFrom-Json -ErrorAction Stop
         if (-not $obj) { return $null }
-        if ($obj.SchemaVersion -ne 1) { return $null }
+        if ($obj.SchemaVersion -ne 2) { return $null }
         if ($ExpectedPackageVersion -and
             "$($obj.PackageVersion)" -ne "$ExpectedPackageVersion") { return $null }
         return $obj
@@ -784,6 +786,137 @@ function Get-ClaudeDataCandidates {
         LogDirs   = @($logs | Sort-Object -Property $byNewest)
     }
 }
+
+function Resolve-ClaudeDataPaths {
+    <#
+    .SYNOPSIS
+        Picks the app's data root and log folder out of
+        Get-ClaudeDataCandidates and names the folders the repairs act on.
+    .DESCRIPTION
+        DataRoot is the freshest candidate holding Preferences or Local State.
+        LogDir is the logs folder whose newest *.log was written last. The two
+        are chosen separately because they are not nested: on app 6.18355 the
+        data root is %LOCALAPPDATA%\Claude-Data\claude_<id> and the live logs
+        are in %LOCALAPPDATA%\Claude\logs.
+
+        VmCachePath, BundlePath, SessionsDir and CodeSessionsDir are named
+        folders under DataRoot. Measured 2026-11-21 on 6.18355, all four are
+        there: claude-code-vm, vm_bundles, local-agent-mode-sessions and
+        claude-code-sessions.
+
+        When no candidate qualifies, a path falls back to where it was before
+        6.2.0, under AppDataDir, and says so. Notes holds one line per choice
+        and one per candidate passed over; Get-ClaudeEnvironment adds them to
+        Warnings.
+
+        This toolkit's own state (fix-logs, watch-logs, watch-state.json, the
+        generated launchers) stays in AppDataDir whatever is chosen here.
+        Never throws: Get-ClaudeDataCandidates does not, and the rest is string
+        work.
+    .PARAMETER PackageFamilyName
+        Passed to Get-ClaudeDataCandidates for the MSIX LocalCache candidates.
+    .PARAMETER AppDataDir
+        The toolkit's folder, %APPDATA%\Claude, used only as the fallback.
+    #>
+    param(
+        [string]$PackageFamilyName,
+        [string]$AppDataDir
+    )
+
+    $stamp = { param($t) if ($t) { $t.ToString('yyyy-MM-dd HH:mm') } else { 'never' } }
+    $notes = @()
+    $c = Get-ClaudeDataCandidates -PackageFamilyName $PackageFamilyName
+
+    $dataRoot   = $null
+    $dataSource = $null
+    $appRoots   = @($c.DataRoots | Where-Object { $_.IsAppData })
+    if ($appRoots.Count -gt 0) {
+        $dataRoot   = $appRoots[0].Path
+        $dataSource = $appRoots[0].Source
+        $notes += "Data root: $dataRoot ($dataSource, app files last written $(& $stamp $appRoots[0].Newest))"
+        foreach ($o in @($appRoots | Select-Object -Skip 1)) {
+            $notes += "Data root passed over: $($o.Path) ($($o.Source), app files last written $(& $stamp $o.Newest))"
+        }
+    } elseif ($AppDataDir) {
+        $dataRoot   = $AppDataDir
+        $dataSource = 'fallback'
+        $notes += "No folder holding Preferences or Local State was found; the data root falls back to $AppDataDir"
+    }
+
+    $logDir    = $null
+    $logSource = $null
+    $liveLogs  = @($c.LogDirs | Where-Object { $_.Newest })
+    if ($liveLogs.Count -gt 0) {
+        $logDir    = $liveLogs[0].Path
+        $logSource = $liveLogs[0].Source
+        $notes += "Log folder: $logDir ($logSource, newest log $(& $stamp $liveLogs[0].Newest))"
+        foreach ($o in @($liveLogs | Select-Object -Skip 1)) {
+            $notes += "Log folder passed over: $($o.Path) ($($o.Source), newest log $(& $stamp $o.Newest))"
+        }
+    } elseif ($AppDataDir) {
+        $logDir    = Join-Path $AppDataDir 'logs'
+        $logSource = 'fallback'
+        $notes += "No logs folder holding a *.log was found; the log folder falls back to $logDir"
+    }
+
+    $under = { param($leaf) if ($dataRoot) { Join-Path $dataRoot $leaf } else { $null } }
+    return [pscustomobject]@{
+        DataRoot           = $dataRoot
+        DataRootSource     = $dataSource
+        LogDir             = $logDir
+        LogDirSource       = $logSource
+        VmCachePath        = (& $under 'claude-code-vm')
+        BundlePath         = (& $under 'vm_bundles')
+        SessionsDir        = (& $under 'local-agent-mode-sessions')
+        CodeSessionsDir    = (& $under 'claude-code-sessions')
+        DataRootCandidates = @($c.DataRoots | ForEach-Object {
+            '{0} ({1}, app data {2}, app files last written {3})' -f $_.Path, $_.Source, $_.IsAppData, (& $stamp $_.Newest)
+        })
+        LogDirCandidates   = @($c.LogDirs | ForEach-Object {
+            '{0} ({1}, newest log {2})' -f $_.Path, $_.Source, (& $stamp $_.Newest)
+        })
+        Notes              = @($notes)
+    }
+}
+
+function Get-ClaudeVmLogCandidates {
+    <#
+    .SYNOPSIS
+        The VM logs present in a Claude log folder, newest first.
+    .DESCRIPTION
+        Deliberately restricted to VM-relevant logs. main.log is excluded: it is
+        the Electron main process log and it can sit frozen for a day at a time
+        on a perfectly healthy machine, so keying staleness on it is a
+        guaranteed false positive. Newest wins, and the age is recorded so a
+        caller can reject a candidate that predates its own lookback window.
+
+        A function of its own since 6.2.0 so Watch can pick the VM log again
+        when the log folder moves under it. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $cands = @()
+    if (-not $LogDir) { return $cands }
+    foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
+        try {
+            $p = Join-Path $LogDir $n
+            if (Test-Path $p) {
+                $fi = Get-Item $p -ErrorAction SilentlyContinue
+                if ($fi) {
+                    $cands += [pscustomobject]@{
+                        Name          = $n
+                        Path          = $fi.FullName
+                        LastWriteTime = $fi.LastWriteTime
+                        AgeHours      = [math]::Round( `
+                            ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
+                        Length        = $fi.Length
+                    }
+                }
+            }
+        } catch { $null = $_ }
+    }
+    return @($cands | Sort-Object LastWriteTime -Descending)
+}
 #endregion ClaudeEnv
 
 # -- Runtime discovery -----------------------------------------------
@@ -792,11 +925,18 @@ function Get-ClaudeDataCandidates {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.1.1"
+$ToolkitVersion   = "6.2.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
 $ClaudeAppData    = $script:ClaudeEnv.AppDataDir
+# Where the app keeps its data and VM image, which is what the storage check
+# and the Defender exclusion are about. Until app 6.18355 that was
+# $ClaudeAppData; since, it is %LOCALAPPDATA%\Claude-Data\claude_<id>, and
+# $ClaudeAppData holds only this toolkit's files. Discovery falls back to
+# $ClaudeAppData when it finds no data root.
+$ClaudeDataRoot   = $script:ClaudeEnv.DataRoot
+if (-not $ClaudeDataRoot) { $ClaudeDataRoot = $ClaudeAppData }
 
 # Both discovered. $ServiceName was removed in the first pass as an unused
 # variable, which it was: everything referred to the literal "CoworkVMService"
@@ -825,8 +965,10 @@ function Step {
 }
 
 function Initialize-ClaudeAppData {
-    # %APPDATA%\Claude is created by Claude Desktop on first launch. This script
-    # is meant to be runnable BEFORE Claude Desktop is installed, and it also
+    # %APPDATA%\Claude was created by Claude Desktop on first launch until app
+    # 6.18355, which keeps its data under %LOCALAPPDATA%\Claude-Data and need
+    # not create it at all. This script is meant to be runnable BEFORE Claude
+    # Desktop is installed, and it also
     # self-elevates -- which can land it in a different account's profile that
     # has never launched Claude. Either way the folder may not exist yet, and
     # every state file this script writes lives inside it.
@@ -1632,34 +1774,35 @@ if ($Undo) {
     $vmCachePath = $script:ClaudeEnv.VmCachePath
     $storageWarnings = @()
 
-    # Both checks used to read $env:APPDATA. They now read the discovered Claude
-    # folder, which is where the VM cache actually lives. On a default install
-    # the two are the same; if a user has redirected the folder they are not,
-    # and the redirected one is the answer that matters.
+    # Both checks read the discovered data root, which is where the VM cache
+    # actually lives. They read $env:APPDATA once, then %APPDATA%\Claude, which
+    # since app 6.18355 holds only this toolkit's files: the app keeps its data
+    # under %LOCALAPPDATA%\Claude-Data, so a sync folder or an external drive
+    # holding it went unreported.
     $cloudPaths = @("OneDrive", "Google Drive", "Dropbox", "iCloud", "Box")
     foreach ($cp in $cloudPaths) {
-        if ($ClaudeAppData -match [regex]::Escape($cp)) {
-            $storageWarnings += "The Claude folder is inside a '$cp' sync folder, this causes mount failures"
+        if ($ClaudeDataRoot -match [regex]::Escape($cp)) {
+            $storageWarnings += "The Claude data folder is inside a '$cp' sync folder, this causes mount failures"
         }
     }
 
-    # Check if the Claude folder is on an external/USB drive
+    # Check if the Claude data folder is on an external/USB drive
     try {
-        $appDataDrive = (Split-Path $ClaudeAppData -Qualifier) + "\"
+        $appDataDrive = (Split-Path $ClaudeDataRoot -Qualifier) + "\"
         $driveInfo = Get-Volume -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue
         if ($driveInfo) {
             $diskNumber = (Get-Partition -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue).DiskNumber
             if ($null -ne $diskNumber) {
                 $disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
                 if ($disk -and $disk.BusType -match "USB|Thunderbolt|1394") {
-                    $storageWarnings += "The Claude folder is on an external $($disk.BusType) drive, use a local SSD instead"
+                    $storageWarnings += "The Claude data folder is on an external $($disk.BusType) drive, use a local SSD instead"
                 }
             }
 
             # Check if it's a network drive
             $logDisk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($appDataDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue
             if ($logDisk -and $logDisk.DriveType -eq 4) {
-                $storageWarnings += "The Claude folder is on a network drive, VirtioFS requires local storage"
+                $storageWarnings += "The Claude data folder is on a network drive, VirtioFS requires local storage"
             }
         }
     } catch { $null = $_ }
@@ -1775,8 +1918,12 @@ if ($Undo) {
             # Check if Defender exclusions are already set
             try {
                 $exclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath
+                # The app's data root, which holds the VM image whose VirtioFS
+                # disk operations an AV filter driver gets in the way of. Until
+                # 6.2.0 this was %APPDATA%\Claude, which on app 6.18355 holds
+                # only this toolkit's files.
                 $neededPaths = @(
-                    $ClaudeAppData,
+                    $ClaudeDataRoot,
                     (Join-Path $env:ProgramFiles "Hyper-V"),
                     "$env:SystemRoot\System32\vmwp.exe",
                     "$env:SystemRoot\System32\vmms.exe"
@@ -1835,7 +1982,7 @@ if ($Undo) {
         } else {
             # Third-party AV, can only advise
             Log "Recommended exclusion paths for your AV:" -Colour DarkYellow -Indent
-            Log "  - $ClaudeAppData\" -Colour White -Indent
+            Log "  - $ClaudeDataRoot\" -Colour White -Indent
             Log "  - $env:ProgramFiles\Hyper-V\" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmwp.exe" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmms.exe" -Colour White -Indent
