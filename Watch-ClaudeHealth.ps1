@@ -8,7 +8,8 @@
     script.
 
     Monitors:
-    - Claude log files for "bad address", mount failure, and HCS error messages
+    - [error] entries in Claude's VM and main logs that carry a VirtioFS mount
+      or HCS failure signature
     - CoworkVMService status (stopped while Claude is running)
     - Windows Event Log for service, Hyper-V, and HCS Compute errors/warnings
     - WinNAT rules (VM network connectivity)
@@ -72,7 +73,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 6.2.0
+    Version : 6.2.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -948,7 +949,7 @@ function Get-ClaudeVmLogAge {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -----------------------------------------------------------
-$ToolkitVersion = "6.2.0"
+$ToolkitVersion = "6.2.1"
 $ServiceName    = $script:ClaudeEnv.ServiceName
 $ProcessName    = $script:ClaudeEnv.ProcessName
 # This toolkit's folder, %APPDATA%\Claude: watch-logs, watch-state.json and
@@ -1001,22 +1002,34 @@ function Get-StealthMarkerPath {
 }
 $script:StealthMarkerPath = Get-StealthMarkerPath
 
-# -- Legacy error signatures ---------------------------------------------
-# SECONDARY set, kept for continuity. None of these eleven strings occurs
-# anywhere in ~35 MB of current logs on build 1.24012.9.0: 0 matches for all
-# eleven. The one previously described as "the MOST RELIABLE" trigger has no
-# corroboration on this build at all.
+# -- Log error signatures ------------------------------------------------
+# Matched literally, and only inside an [error] entry of the app's VM and main
+# logs: see Find-LogErrorPattern and $LogTriggerFilePattern below. One hit in
+# a log starts a repair with no confirming second poll, so a line counts only
+# when the app itself says it is an error. Test-EventLogErrors matches the same
+# list against CoworkVMService events of level Error.
 #
-# Primary detection now runs on signals that verifiably exist. See
-# Test-PrimarySignals below.
+# Measured 2026-11-21 across every log in the app's logs folder on app 6.18355,
+# rotations included. The strings occur in two places:
 #
-# These are matched literally. The old set mixed a regex,
-# "isGuestConnected.*timeout", into a list consumed through [regex]::Escape(),
-# so that entry could never match anything; the literal
-# "Request timed out: isGuestConnected" above it covers the real message.
+#   - cowork_vm_node1.log, 2026-09-11: 31 [error] [VM:start] "Startup failed"
+#     entries carrying "RPC error -1", 30 of them "Plan9 mount failed", and 71
+#     [warn] [startVM] retries of the same mount. A real failure; the [error]
+#     entries still start a repair.
+#   - main.log and its rotations, 2026-10-31 to 2026-11-18: 14 [info]
+#     [remote-bash] lines carrying "RPC error -1". A remote session's probe
+#     finding its worker already running and carrying on. Harmless. Until
+#     6.2.1 each one started the repair path, which restarts the app.
+#
+# "bad address" left the list in 6.2.1. It is the bare text of EFAULT, which any
+# component can log, and the VirtioFS failure it described also carries
+# "Plan9 mount failed" or "failed to ensure virtiofs mount".
+#
+# The old set mixed a regex, "isGuestConnected.*timeout", into a list matched
+# literally, so that entry could never match anything; the literal
+# "Request timed out: isGuestConnected" below covers the real message.
 $LegacyErrorPatterns = @(
     "Plan9 mount failed",
-    "bad address",
     "failed to ensure virtiofs mount",
     "RPC error -1",
     "HCS operation failed",
@@ -1026,6 +1039,14 @@ $LegacyErrorPatterns = @(
     "Request timed out: isGuestConnected",
     "guest connection failed"
 )
+
+# The logs Test-LogsForErrors reads: cowork_vm_node*.log, where the VM's start
+# and its mounts are logged, and main*.log, the app's own process. The rest of
+# the folder is not the VM: in-app-browser, claude.ai-web and unknown-window
+# hold what web pages write to their consoles, the mcp logs hold MCP servers'
+# output, and coworkd.log, the daemon inside the VM, has no levels. A web page
+# that logs "HCS operation failed" is not the VM failing.
+$LogTriggerFilePattern = '^(cowork_vm_node|main)\d*\.log$'
 
 # -- Win32 APIs for user activity detection ------------------------------
 # NOTE: These APIs only work in interactive sessions (Session 1+).
@@ -1597,16 +1618,65 @@ function Test-PersistentFailure {
     return $recentFixes.Count -ge 3
 }
 
+function Find-LogErrorPattern {
+    <#
+    .SYNOPSIS
+        Returns the first pattern found inside an [error] entry of a chunk of
+        log text, or $null.
+    .DESCRIPTION
+        The app writes one entry per line, such as
+        "2026-11-18 15:26:11 [info] [remote-bash] text", and puts an error's
+        stack trace and message object on the lines after it, with no
+        timestamp. A line that starts with a timestamp opens a new entry; any
+        other line belongs to the entry above it and shares its level.
+
+        A pattern counts only in an entry whose level is error and whose
+        component does not start with "remote". The remote-bash component runs
+        remote sessions' commands in the VM, and its "RPC error -1" lines are a
+        probe's normal answer. Lines before the chunk's first timestamp belong
+        to an entry whose header was read on an earlier poll, so they have no
+        level here and never count.
+    #>
+    param(
+        [AllowEmptyString()][string]$Text,
+        [string[]]$Patterns
+    )
+    if (-not $Text) { return $null }
+    $level = ''
+    $component = ''
+    foreach ($line in ($Text -split "`r?`n")) {
+        $entry = [regex]::Match($line,
+            '^\d{4}[-/]\d{2}[-/]\d{2}[ T][0-9:.]+Z?(?:\s+\[(?<level>[A-Za-z]+)\])?(?:\s*\[(?<component>[^\]]*)\])?')
+        if ($entry.Success) {
+            $level = $entry.Groups['level'].Value
+            $component = $entry.Groups['component'].Value
+        }
+        if ($level -ne 'error') { continue }
+        if ($component -like 'remote*') { continue }
+        foreach ($pattern in $Patterns) {
+            if ($line.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                return $pattern
+            }
+        }
+    }
+    return $null
+}
+
 function Test-LogsForErrors {
     <#
     .SYNOPSIS
-        Scans all Claude log files for new VirtioFS error messages since last check.
-        Returns the error pattern found, or $null if clean.
-        This is the MOST RELIABLE trigger -- actual error strings in Claude's own logs.
+        Scans what the app's VM and main logs gained since the last poll for an
+        [error] entry carrying a VM failure signature. Returns the pattern
+        found, or $null if clean.
+    .DESCRIPTION
+        One hit starts a repair with no confirming second poll, so the files
+        are limited by $LogTriggerFilePattern and the lines by
+        Find-LogErrorPattern. $LegacyErrorPatterns records what the logs hold.
     #>
     if (-not (Test-Path $ClaudeLogDir)) { return $null }
 
-    $logFiles = Get-ChildItem $ClaudeLogDir -Filter "*.log" -ErrorAction SilentlyContinue
+    $logFiles = @(Get-ChildItem $ClaudeLogDir -Filter "*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $LogTriggerFilePattern })
     $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]'
 
     foreach ($logFile in $logFiles) {
@@ -1674,11 +1744,8 @@ function Test-LogsForErrors {
             # and the failure was swallowed by the catch below.
             $script:LogBaselines[$key] = $currentSize
 
-            foreach ($pattern in $LegacyErrorPatterns) {
-                if ($newContent -match [regex]::Escape($pattern)) {
-                    return $pattern
-                }
-            }
+            $hit = Find-LogErrorPattern -Text $newContent -Patterns $LegacyErrorPatterns
+            if ($hit) { return $hit }
         } catch {
             # Read failed. The baseline stays put, so this window is retried on
             # the next poll rather than silently skipped.
@@ -3288,7 +3355,9 @@ try {
             if ($claudeRunning) {
                 # ---- Critical checks (trigger auto-fix) ----
 
-                # Check 1: VirtioFS errors in log files (most reliable -- no consecutive gate needed)
+                # Check 1: a VM failure logged at [error] in the app's VM or
+                # main log. No consecutive gate, which is why the match is
+                # limited to [error] entries: see Find-LogErrorPattern.
                 if (-not (Test-StartupGracePeriod)) {
                     $logError = Test-LogsForErrors
                     if ($logError) {

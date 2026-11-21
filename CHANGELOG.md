@@ -8,6 +8,33 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.2.1] - 2026-11-21
+
+### Fixed
+
+- The health monitor no longer restarts Claude over a harmless log line.
+
+  The log check starts a repair on a single hit, and it matched its error
+  strings against every new byte of every `*.log` in the app's logs folder, at
+  any log level. App 6.18355 writes `RPC error -1` in an `[info]
+  [remote-bash]` line when a remote session's probe finds its worker already
+  running and carries on. Measured 2026-11-21: 14 such lines in `main.log` and
+  its rotations, on 2026-10-31, 11-07, 11-16 and 11-18, and each one reached
+  the repair path, which restarts the app.
+
+  A signature now counts only inside an entry the app logged at `[error]`,
+  never from a `remote*` component, and only in `cowork_vm_node*.log` and
+  `main*.log`. The browser, web and MCP logs hold what web pages and MCP
+  servers print, not the VM. The real VM failures in the same logs, the
+  `[error] [VM:start] Startup failed` entries of 2026-09-11 with `Plan9 mount
+  failed`, still start a repair. `bad address` left the pattern list: it is
+  the bare text of EFAULT, and the failure it described also carries
+  `Plan9 mount failed` or `failed to ensure virtiofs mount`.
+
+  `.ci/Test-LogTriggers.ps1` feeds the captured lines, worker names and
+  process ids replaced, to the shipped `Test-LogsForErrors` against a
+  throwaway logs folder.
+
 ## [6.2.0] - 2026-11-21
 
 Read "Repairs that could not run before can run now" below before you pull
