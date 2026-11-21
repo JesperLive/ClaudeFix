@@ -4010,7 +4010,8 @@ if ($SkipLaunch) {
     #
     # The list before discovery led with C:\ProgramData\Claude\Logs\coworkd.log.
     # That tree does not exist on any current build, the drive letter was
-    # hardcoded, and coworkd.log itself was last written in March.
+    # hardcoded, and the coworkd.log in %APPDATA%\Claude\logs was last
+    # written in March. 6.18355 writes a new one in %LOCALAPPDATA%\Claude\logs.
     $vmLogDir   = $script:ClaudeEnv.LogDir
     $vmCandList = @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)
     if ($vmCandList.Count -gt 0) {

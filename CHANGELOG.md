@@ -52,10 +52,17 @@ run the scripts straight from this folder, so pulling is deploying.
   had written their transcripts that minute while the newest session file was
   16 minutes old and the logs 13 to 38. The guard now also reads Claude
   Code's own transcripts, any `*.jsonl` under `%USERPROFILE%\.claude\projects`
-  (or `CLAUDE_CONFIG_DIR`) written in the last ten minutes. Run on that
+  (or `CLAUDE_CONFIG_DIR`) written in the last 35 minutes. Run on that
   machine, the old guard answered no and the new one yes. A terminal Claude
   Code session counts as well, which delays a repair by two minutes at a
   time.
+
+  The window is 35 minutes because a tool call writes nothing to the
+  transcript while it runs, and a foreground command may run for 30.
+  Measured 2026-11-21 in one project thread: three Bash calls of 25 minutes
+  each, nothing written during the first two. On the transcripts alone, a
+  10-minute window answered "no session" from minute 10 of each. The cost is
+  that a repair waits up to 35 minutes after the last Claude Code activity.
 
 - The app's logs, VM cache, bundles and session folders are found where the
   app keeps them.

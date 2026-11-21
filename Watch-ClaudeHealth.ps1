@@ -2470,7 +2470,7 @@ function Test-ClaudeCodeActive {
            when Code is streaming/processing; the third is written for Remote
            Control sessions, which is how project threads run on a PC.
         3. Claude Code's own transcripts: any *.jsonl under the CLI's
-           projects folder written in the last 10 min.
+           projects folder written in the last 35 min.
 
         WHY CHECK 3. Checks 1 and 2 are things the app writes about a session,
         and it does not write them while the session works. Measured
@@ -2481,6 +2481,16 @@ function Test-ClaudeCodeActive {
         message and tool result, and a subagent to its own file beside it.
         A terminal session counts too: holding a repair back for one costs a
         retry two minutes later, which is the cheap mistake.
+
+        WHY 35 MINUTES. A tool call writes nothing to the transcript while it
+        runs, and a foreground command may run for 30 minutes. Measured
+        2026-11-21 in one project thread's transcript: three Bash calls of 25
+        minutes each in a row, with no line written during the first two and
+        one queue line during the third. With a 10-minute window, and no
+        other session writing, the guard answered "no session" from minute 10
+        of each, and a repair could close the app under the running command.
+        The cost is that a repair waits up to 35 minutes after the last Code
+        activity.
 
         WHERE. Both checks used to read %APPDATA%\Claude only, through
         $ClaudeAppData and $ClaudeLogDir. On app 6.18355 (measured 2026-11-21)
@@ -2533,14 +2543,16 @@ function Test-ClaudeCodeActive {
         # is CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude; the
         # watchdog task runs as the user, so that is the user's. Measured
         # 2026-11-21: 3,904 files, listed in 160 ms. This runs only when a
-        # repair is about to start, never on the poll.
+        # repair is about to start, never on the poll. The window is longer
+        # than the CLI's 30-minute limit on a foreground command, because a
+        # tool call writes nothing here until it returns.
         $cfgDir = $env:CLAUDE_CONFIG_DIR
         if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
         if ($cfgDir) {
             $projects = Join-Path $cfgDir "projects"
             if (Test-Path -LiteralPath $projects -PathType Container) {
                 $recentTranscript = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
-                    Where-Object { ($now - $_.LastWriteTime).TotalMinutes -lt 10 } |
+                    Where-Object { ($now - $_.LastWriteTime).TotalMinutes -lt 35 } |
                     Select-Object -First 1
                 if ($recentTranscript) { return $true }
             }

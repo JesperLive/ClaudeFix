@@ -193,14 +193,23 @@ try {
     # project threads had written theirs that minute while the newest session
     # file was 16 minutes old and remote-control.log 13.
     $P = $env:USERPROFILE
-    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\old.jsonl') 30
-    Assert-Case "a transcript written 30 min ago: not active" (-not (Test-ClaudeCodeActive))
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\old.jsonl') 40
+    Assert-Case "a transcript written 40 min ago: not active" (-not (Test-ClaudeCodeActive))
     New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live.jsonl') 2
     Assert-Case "a transcript written 2 min ago, every app signal old: active" (Test-ClaudeCodeActive)
-    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live.jsonl') 30
+    # A tool call writes nothing to the transcript until it returns, and a
+    # foreground command may run 30 minutes. Measured 2026-11-21: three Bash
+    # calls of 25 minutes each in one project thread, nothing written during
+    # the first two.
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live.jsonl') 25
+    Assert-Case "a transcript last written 25 min ago, inside a long tool call: active" (Test-ClaudeCodeActive)
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live.jsonl') 34
+    Assert-Case "34 min ago, past the 30-minute command limit: still active" (Test-ClaudeCodeActive)
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live.jsonl') 36
+    Assert-Case "36 min ago: not active" (-not (Test-ClaudeCodeActive))
     New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live\subagents\workflows\wf_1\agent-a.jsonl') 1
     Assert-Case "a subagent transcript written 1 min ago: active" (Test-ClaudeCodeActive)
-    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live\subagents\workflows\wf_1\agent-a.jsonl') 30
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live\subagents\workflows\wf_1\agent-a.jsonl') 40
     New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\memory\notes.md') 1
     New-FixtureFile (Join-Path $P '.claude\settings.json') 1
     Assert-Case "fresh files that are not transcripts: not active" (-not (Test-ClaudeCodeActive))
