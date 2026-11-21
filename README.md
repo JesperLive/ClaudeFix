@@ -209,10 +209,10 @@ The menu is skipped when:
 | Step | Action |
 |------|--------|
 | 0 | Pre-emptive HCS state cleanup (stale cowork-vm entries) and session file housekeeping (>7 days) |
-| 1 | Captures Claude.exe path, then force-kills all claude.exe processes |
+| 1 | Captures Claude.exe path, then force-kills the Claude Desktop app's processes. Claude Code CLI processes, also named `claude.exe`, are left running (since 6.2.0) |
 | 2 | Stops CoworkVMService (graceful with admin, force-kill without) |
 | 3 | Checks for HCS errors and restarts vmcompute service if needed; escalates to vmms and HvHost (Deep mode only) |
-| 4 | Verifies no orphan processes remain |
+| 4 | Verifies no orphan app or service processes remain |
 | 5 | Kills orphan HCS compute systems via hcsdiag, and hung vmwp.exe processes |
 | 6 | Smart cache purge: backs up session VHDXs, nukes VM cache, restores session data; cleans temp files and legacy paths |
 | 7 | Restarts CoworkVMService (admin) or defers to Claude auto-restart (non-admin); restores VHDX backups |
@@ -548,7 +548,7 @@ Clean shutdown without repair. Double-click `Stop-ClaudeDesktop.bat` when you wa
 
 1. Stops `CoworkVMService` gracefully (waits up to 45s for the VM to shut down)
 2. Cleans any remaining HCS compute systems
-3. Kills all Claude Desktop UI processes
+3. Kills the Claude Desktop app's processes, leaving Claude Code CLI processes running
 4. Restarts the service in idle state (ready for next launch)
 5. Verifies clean state
 

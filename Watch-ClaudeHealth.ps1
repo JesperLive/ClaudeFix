@@ -264,12 +264,13 @@ function Get-ClaudeEnvironment {
     # TrustedInstaller ACL.
     #
     # Reading the path off a running process looks more reliable but is not.
-    # The Claude Code CLI also runs as a process named "claude", out of
-    # %APPDATA%\Claude\claude-code\<version>\claude.exe. Measured on this
-    # machine: 3 of 16 "claude" processes were the CLI. Taking the first
-    # readable one can therefore cache the CLI path and turn every later
-    # relaunch into a CLI start instead of an app start.
-    $cliPattern = '[\\/]claude-code[\\/]'
+    # The Claude Code CLI also runs as a process named "claude": the copies the
+    # app starts sit in claude-code\<version>\ under its data folder, and a
+    # terminal install sits in %USERPROFILE%\.local\bin. Measured 2026-11-21: 4
+    # of 18 "claude" processes were the CLI. Taking the first readable one can
+    # therefore cache the CLI path and turn every later relaunch into a CLI
+    # start instead of an app start. Test-ClaudeCodeCliPath rejects both kinds;
+    # the path pattern it replaced here only knew the first.
     if ($info.InstallLocation) {
         foreach ($rel in @('app\claude.exe', 'claude.exe')) {
             try {
@@ -285,7 +286,7 @@ function Get-ClaudeEnvironment {
             foreach ($rp in @(Get-Process -Name $info.ProcessName -ErrorAction SilentlyContinue)) {
                 try {
                     $cand = $rp.MainModule.FileName
-                    if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                    if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
                         $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'process'; break
                     }
                 } catch { $null = $_ }
@@ -297,7 +298,7 @@ function Get-ClaudeEnvironment {
             foreach ($wp in @(Get-CimInstance Win32_Process -Filter "Name LIKE '%claude%'" `
                               -ErrorAction SilentlyContinue)) {
                 $cand = "$($wp.ExecutablePath)"
-                if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
                     $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'wmi'; break
                 }
             }
@@ -530,6 +531,159 @@ function Get-CoworkHcsGuids {
         }
     }
     return @($found | Select-Object -Unique)
+}
+
+function Test-ClaudeCodeCliPath {
+    <#
+    .SYNOPSIS
+        True when an executable path is the Claude Code CLI, not the Claude
+        Desktop app.
+    .DESCRIPTION
+        Both run as a process named "claude". The CLI copies Claude Desktop
+        starts for Code sessions and project threads live in
+        claude-code\<version>\ under the app's data folder, which the path
+        pattern catches. A terminal install lives wherever its installer put
+        it, %USERPROFILE%\.local\bin on this machine, so the file's ProductName
+        decides the rest. Measured 2026-11-21 on app 6.18355: the app's
+        Claude.exe says "Claude", both CLI copies say "Claude Code".
+    #>
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    if ($Path -match '[\\/]claude-code[\\/]') { return $true }
+    try {
+        $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
+        if ($vi -and "$($vi.ProductName)" -eq 'Claude Code') { return $true }
+    } catch { $null = $_ }
+    return $false
+}
+
+function Get-ClaudeProcessInventory {
+    <#
+    .SYNOPSIS
+        Sorts every running process named "claude" into the desktop app and
+        everything else.
+    .DESCRIPTION
+        "claude" is not a unique process name. Measured 2026-11-21 on app
+        6.18355: 18 processes answered Get-Process -Name claude. 14 were the
+        desktop app, under the package InstallLocation. 3 were Claude Code CLI
+        processes the app had started for project threads, under
+        %LOCALAPPDATA%\Claude-Data\claude_<id>\claude-code\2.1.327\. 1 was a
+        terminal CLI in %USERPROFILE%\.local\bin. Every kill in this toolkit
+        stopped all 18.
+
+        A process is the desktop app when its executable sits under the package
+        InstallLocation, or under another version folder of the same package:
+        an update registers the new version while processes started from the
+        old folder are still running. With no package, the folder of the
+        discovered ClaudeExe stands in for InstallLocation. With neither, a
+        ProductName of "Claude" decides.
+
+        A process whose path cannot be read is not counted as the desktop app.
+        A process this function cannot place is not one the toolkit may kill.
+
+        Each result carries Process, Id, Path, Kind and IsDesktop. Kind is
+        desktop, cli, other or unknown.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+
+    $roots = @()
+    $siblingPattern = $null
+    try {
+        if ($Environment.InstallLocation) {
+            $loc = "$($Environment.InstallLocation)".TrimEnd('\')
+            $roots += $loc + '\'
+            # InstallLocation is <WindowsApps>\<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>
+            # and the family name is <Name>_<PublisherId>, so any version of
+            # this package matches <WindowsApps>\<Name>_*_<PublisherId>\.
+            $fam = "$($Environment.PackageFamilyName)"
+            $cut = $fam.LastIndexOf('_')
+            if ($cut -gt 0) {
+                $parent = Split-Path $loc -Parent
+                $siblingPattern = '^' + [regex]::Escape($parent + '\' + $fam.Substring(0, $cut) + '_') +
+                    '[^\\]*_' + [regex]::Escape($fam.Substring($cut + 1)) + '\\'
+            }
+        } elseif ($Environment.ClaudeExe -and -not (Test-ClaudeCodeCliPath "$($Environment.ClaudeExe)")) {
+            $dir = Split-Path "$($Environment.ClaudeExe)" -Parent
+            # A Squirrel install runs from <root>\app-<version>\ beside a
+            # <root>\Claude.exe stub, and an update adds a new app-<version>.
+            if ((Split-Path $dir -Leaf) -match '^app-\d') { $dir = Split-Path $dir -Parent }
+            $roots += $dir.TrimEnd('\') + '\'
+        }
+    } catch { $null = $_ }
+
+    $result = @()
+    $cimPaths = $null
+    $products = @{}
+    foreach ($p in @(Get-Process -Name $Environment.ProcessName -ErrorAction SilentlyContinue)) {
+        $path = $null
+        try { $path = $p.MainModule.FileName } catch { $null = $_ }
+        if (-not $path) {
+            # MainModule needs more access than the image name does. One CIM
+            # query answers for every process it could not read.
+            if ($null -eq $cimPaths) {
+                $cimPaths = @{}
+                try {
+                    $flt = "Name='$($Environment.ProcessName).exe'"
+                    foreach ($w in @(Get-CimInstance Win32_Process -Filter $flt -ErrorAction Stop)) {
+                        if ($w.ExecutablePath) { $cimPaths[[int]$w.ProcessId] = "$($w.ExecutablePath)" }
+                    }
+                } catch { $null = $_ }
+            }
+            if ($cimPaths.ContainsKey([int]$p.Id)) { $path = $cimPaths[[int]$p.Id] }
+        }
+
+        $kind = 'unknown'
+        if ($path) {
+            $kind = 'other'
+            if ($path -match '[\\/]claude-code[\\/]') { $kind = 'cli' }
+            else {
+                foreach ($r in $roots) {
+                    if ($path.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)) { $kind = 'desktop'; break }
+                }
+                if ($kind -eq 'other' -and $siblingPattern -and $path -match $siblingPattern) { $kind = 'desktop' }
+                if ($kind -eq 'other') {
+                    # Read once per distinct path: fourteen desktop processes
+                    # share one executable.
+                    if (-not $products.ContainsKey($path)) {
+                        $products[$path] = ''
+                        try {
+                            $products[$path] = "$((Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductName)"
+                        } catch { $null = $_ }
+                    }
+                    if ($products[$path] -eq 'Claude Code') { $kind = 'cli' }
+                    elseif ($roots.Count -eq 0 -and $products[$path] -eq 'Claude') { $kind = 'desktop' }
+                }
+            }
+        }
+        $result += [pscustomobject]@{
+            Process   = $p
+            Id        = $p.Id
+            Path      = $path
+            Kind      = $kind
+            IsDesktop = ($kind -eq 'desktop')
+        }
+    }
+    return $result
+}
+
+function Get-ClaudeDesktopProcess {
+    <#
+    .SYNOPSIS
+        The running Claude Desktop app processes, and no Claude Code CLI.
+    .DESCRIPTION
+        Use this for anything that kills Claude, and for anything that asks
+        whether the app is running before it does something. A check that only
+        holds a repair back because Claude looks busy may keep counting every
+        "claude" process: a busy CLI is a reason to wait as well.
+        Get-ClaudeProcessInventory says how the two are told apart.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+    return @(Get-ClaudeProcessInventory -Environment $Environment |
+             Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
 }
 #endregion ClaudeEnv
 
@@ -831,8 +985,8 @@ $script:LastStealthNotice    = $null
 $script:StealthNoAumidLogged = $false
 $script:StatePath            = Join-Path $WatchLogDir "watch-state.json"
 # Seeded from the current state so the first poll does not report a transition
-# that did not happen.
-$script:ClaudeWasRunning     = (@(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0)
+# that did not happen. The app only, as in the main loop.
+$script:ClaudeWasRunning     = (@(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0)
 
 function Import-WatchState {
     <#
@@ -1280,7 +1434,9 @@ function Test-ServiceHealth {
         Returns $true if healthy, $false if unhealthy.
         Now requires 2 CONSECUTIVE failures to avoid transient blips.
     #>
-    $claude = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    # The app, not any "claude". The service backs the app's workspace, and a
+    # Claude Code CLI process alone neither needs it nor means the app is up.
+    $claude = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
     if ($claude.Count -eq 0) {
         $script:ServiceDownCount = 0
         return $true
@@ -1838,6 +1994,9 @@ function Test-HcsStateHealth {
             if ($recentSpike.Count -gt 15) {
                 # Before restarting vmcompute, check if there is an active session
                 $coworkSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+                # Every process named claude counts, the Claude Code CLI
+                # included: this only holds a vmcompute restart back, and
+                # erring that way is safe.
                 $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
                 # Same two lock names Fix actually takes. This was still
                 # pinned to "Global\ClaudeDesktopFix_v4.8", so it never found
@@ -2093,6 +2252,9 @@ function Test-UserActivity {
         - Falls back to VM log + CPU sampling + Code session + Cowork session detection
     #>
     try {
+        # Every process named claude, the Claude Code CLI included: a busy
+        # project thread or terminal session is activity, and this only ever
+        # holds a repair back.
         $claudeProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
         if ($claudeProcs.Count -eq 0) { return $false }
 
@@ -2348,7 +2510,12 @@ function Invoke-AutoFix {
     # ---- SAFETY: Don't auto-fix during Claude startup ----
     # When Claude just launched, workspace initialization can take 30-60 seconds
     # and may show transient errors. Give it time to settle.
-    $claudeStartupProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    #
+    # The app's processes only. This measures how long ago the APP started, and
+    # the app starts a fresh Claude Code CLI process for project threads as they
+    # run, so counting those would read every thread wake as an app launch and
+    # could defer a repair for as long as threads keep waking.
+    $claudeStartupProcs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
     if ($claudeStartupProcs.Count -gt 0) {
         # .StartTime is read per process inside a try.
         #
@@ -2408,6 +2575,8 @@ function Invoke-AutoFix {
     # while Claude's VM is genuinely dead.
     $cancelFix = $false
     $cancelReason = ""
+    # Every process named claude, the Claude Code CLI included: this can only
+    # cancel the repair, and erring that way is safe.
     $claudeProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
     if ($claudeProcs.Count -gt 0) {
         # Cancel if Claude is the foreground window
@@ -2644,7 +2813,12 @@ try {
         try {
             Update-LogFile
 
-            $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
+            # The app, not any "claude". With every process named claude
+            # counted, a live Claude Code CLI process (a project thread, a
+            # terminal session) kept this true after the app had gone, so the
+            # exit below was never seen, a stealth update was never relaunched,
+            # and the checks under it ran against an app that was not there.
+            $claudeRunning = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0
 
             # Record Claude disappearing. Acted on only for a stealth update.
             #

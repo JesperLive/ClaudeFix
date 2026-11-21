@@ -74,7 +74,18 @@ Invoke-CommandInDesktopPackage ``
 
 `$ErrorActionPreference = 'Stop'
 
-`$running = @(Get-Process claude -ErrorAction SilentlyContinue)
+function Get-ClaudeAppProcess {
+    @(Get-Process claude -ErrorAction SilentlyContinue | Where-Object {
+        `$exe = `$null
+        try { `$exe = `$_.MainModule.FileName } catch { `$null = `$_ }
+        if (-not `$exe -or `$exe -match '[\\/]claude-code[\\/]') { return `$false }
+        `$product = ''
+        try { `$product = [string](Get-Item -LiteralPath `$exe).VersionInfo.ProductName } catch { `$null = `$_ }
+        `$product -ne 'Claude Code'
+    })
+}
+
+`$running = @(Get-ClaudeAppProcess)
 if (`$running.Count -gt 0) {
     Write-Host "  Closing `$(`$running.Count) running Claude process(es)..." -ForegroundColor DarkGray
     `$running | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -85,7 +96,7 @@ Write-Host "  Starting Claude with --disable-gpu..." -ForegroundColor Cyan
 $launchBody
 
 Start-Sleep -Seconds 3
-if (@(Get-Process claude -ErrorAction SilentlyContinue).Count -gt 0) {
+if (@(Get-ClaudeAppProcess).Count -gt 0) {
     Write-Host "  Claude is running without hardware GPU acceleration." -ForegroundColor Green
 } else {
     Write-Host "  [!] Claude did not start." -ForegroundColor Red
@@ -102,6 +113,14 @@ if (@(Get-Process claude -ErrorAction SilentlyContinue).Count -gt 0) {
     Assert "runtime `$ErrorActionPreference survived"  ($ps1Content -match '\$ErrorActionPreference')
     Assert "the version WAS interpolated"             ($ps1Content -match [regex]::Escape($ToolkitVersion))
     Assert "the launch body was inlined"              ($ps1Content -match 'disable-gpu')
+
+    # Only the app is closed. Every process named claude used to be, which
+    # took the Claude Code CLI down with it: project threads, Code sessions,
+    # terminal sessions.
+    Assert "runtime `$exe survived as a variable"     ($ps1Content -match '\$exe -match')
+    Assert "the CLI's claude-code folder is skipped"  ($ps1Content -match [regex]::Escape("'[\\/]claude-code[\\/]'"))
+    Assert "the CLI's product name is skipped"        ($ps1Content -match "-ne 'Claude Code'")
+    Assert "the close goes through the app filter"    ($ps1Content -match '\$running = @\(Get-ClaudeAppProcess\)')
 }
 
 # ------------------------------------------------------------------
@@ -114,6 +133,26 @@ $src = [System.IO.File]::ReadAllText($srcPath)
 $codeLines = @($src -split "`r?`n" | Where-Object { $_ -notmatch '^\s*#' })
 $hardcoded = @($codeLines | Where-Object { $_ -match 'Claude_pzs8sxrjxfjjc' })
 Assert "no hardcoded package family in code" ($hardcoded.Count -eq 0) ($hardcoded -join ' | ')
+
+# The admin launcher payload is a single-quoted here-string, so the source text
+# IS the generated script. Parse it as it stands.
+$adminPayload = [regex]::Match($src, "(?s)\`$launchCmd = @'\r?\n(.*?)\r?\n'@")
+Assert "the admin launcher payload was found" $adminPayload.Success
+if ($adminPayload.Success) {
+    Test-Parses "the admin launcher payload parses" $adminPayload.Groups[1].Value
+}
+
+# The copy above is a copy. These read the source itself, so a launcher that
+# goes back to treating every "claude" as the app fails here even when nobody
+# touches the copy.
+Assert "the NoGPU launcher closes through the app filter" `
+    ($src -match '`\$running = @\(Get-ClaudeAppProcess\)')
+Assert "no generated launcher closes every process named claude" `
+    ($src -notmatch '`\$running = @\(Get-Process claude')
+Assert "the admin launcher's already-running check skips the CLI" `
+    ($src -match "(?s)\`$existing = @\(Get-Process -Name claude.{0,400}claude-code")
+Assert "the admin launcher no longer reads its exe off a running process" `
+    ($src -notmatch '\$proc = Get-Process -Name Claude')
 
 Assert "the launcher reads PackageFamilyName from discovery" `
     ($src -match '\$script:ClaudeEnv\.PackageFamilyName')

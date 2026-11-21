@@ -62,6 +62,10 @@ jobs:
         shell: powershell
         run: .\.ci\Test-GeneratedLaunchers.ps1
 
+      - name: Only the desktop app is killed
+        shell: powershell
+        run: .\.ci\Test-ProcessInventory.ps1
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: |
