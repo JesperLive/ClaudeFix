@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 6.1.1
+    Version : 6.2.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -118,8 +118,11 @@ function Get-ClaudeEnvironment {
     #>
     param([switch]$SkipCacheInventory)
 
+    # Version 2 (6.2.0): the app's folders come from Resolve-ClaudeDataPaths
+    # instead of %APPDATA%\Claude. A version 1 record names the old folders,
+    # so Import-ClaudeEnvironment turns it away.
     $info = [ordered]@{
-        SchemaVersion = 1
+        SchemaVersion = 2
         DiscoveredUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
         PackageFound      = $false
@@ -143,11 +146,20 @@ function Get-ClaudeEnvironment {
 
         ProcessName = 'claude'
 
-        AppDataDir  = $null
-        LogDir      = $null
-        VmCachePath = $null
-        BundlePath  = $null
-        SessionsDir = $null
+        # AppDataDir is this toolkit's own folder: fix-logs, watch-logs,
+        # watch-state.json, the generated launchers. The app kept its data
+        # there too until 6.18355; DataRoot is where it keeps it now.
+        AppDataDir         = $null
+        DataRoot           = $null
+        DataRootSource     = $null
+        LogDir             = $null
+        LogDirSource       = $null
+        VmCachePath        = $null
+        BundlePath         = $null
+        SessionsDir        = $null
+        CodeSessionsDir    = $null
+        DataRootCandidates = @()
+        LogDirCandidates   = @()
 
         VmLogFile       = $null
         VmLogCandidates = @()
@@ -182,16 +194,14 @@ function Get-ClaudeEnvironment {
         else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
     } catch { $info.Warnings += "hcsdiag probe failed: $($_.Exception.Message)" }
 
-    # -- Per-user data locations -------------------------------------------
-    # %APPDATA% is the only location that exists on current builds. The old
-    # %ProgramData%\Claude tree is gone, so it is not probed here at all.
+    # -- This toolkit's own folder -----------------------------------------
+    # %APPDATA%\Claude, where the toolkit keeps its logs, state and launchers.
+    # Where the app keeps its own data and logs is found further down, once the
+    # package is known; see Resolve-ClaudeDataPaths. The old
+    # %ProgramData%\Claude tree is gone, so it is not probed at all.
     try {
         if ($env:APPDATA) {
-            $info.AppDataDir  = Join-Path $env:APPDATA "Claude"
-            $info.LogDir      = Join-Path $info.AppDataDir "logs"
-            $info.VmCachePath = Join-Path $info.AppDataDir "claude-code-vm"
-            $info.BundlePath  = Join-Path $info.AppDataDir "vm_bundles"
-            $info.SessionsDir = Join-Path $info.AppDataDir "local-agent-mode-sessions"
+            $info.AppDataDir = Join-Path $env:APPDATA "Claude"
         } else {
             $info.Warnings += "APPDATA is not set; per-user paths undiscoverable"
         }
@@ -254,6 +264,21 @@ function Get-ClaudeEnvironment {
         $info.Aumid = "shell:AppsFolder\$($info.PackageFamilyName)!$($info.ApplicationId)"
     }
 
+    # -- The app's data and log folders --------------------------------------
+    # After the package query because the package's LocalCache is one of the
+    # candidates. Every choice and every candidate passed over goes into
+    # Warnings, so claude-env.json says why a path was picked.
+    try {
+        $paths = Resolve-ClaudeDataPaths -PackageFamilyName $info.PackageFamilyName `
+                                         -AppDataDir $info.AppDataDir
+        foreach ($k in @('DataRoot', 'DataRootSource', 'LogDir', 'LogDirSource', 'VmCachePath',
+                         'BundlePath', 'SessionsDir', 'CodeSessionsDir',
+                         'DataRootCandidates', 'LogDirCandidates')) {
+            $info[$k] = $paths.$k
+        }
+        $info.Warnings += @($paths.Notes)
+    } catch { $info.Warnings += "Data folder discovery failed: $($_.Exception.Message)" }
+
     # -- Claude executable ---------------------------------------------------
     # Ordered by authority, not by convenience. The package branch runs first
     # because it is the only source that reliably identifies the DESKTOP app,
@@ -262,12 +287,13 @@ function Get-ClaudeEnvironment {
     # TrustedInstaller ACL.
     #
     # Reading the path off a running process looks more reliable but is not.
-    # The Claude Code CLI also runs as a process named "claude", out of
-    # %APPDATA%\Claude\claude-code\<version>\claude.exe. Measured on this
-    # machine: 3 of 16 "claude" processes were the CLI. Taking the first
-    # readable one can therefore cache the CLI path and turn every later
-    # relaunch into a CLI start instead of an app start.
-    $cliPattern = '[\\/]claude-code[\\/]'
+    # The Claude Code CLI also runs as a process named "claude": the copies the
+    # app starts sit in claude-code\<version>\ under its data folder, and a
+    # terminal install sits in %USERPROFILE%\.local\bin. Measured 2026-11-21: 4
+    # of 18 "claude" processes were the CLI. Taking the first readable one can
+    # therefore cache the CLI path and turn every later relaunch into a CLI
+    # start instead of an app start. Test-ClaudeCodeCliPath rejects both kinds;
+    # the path pattern it replaced here only knew the first.
     if ($info.InstallLocation) {
         foreach ($rel in @('app\claude.exe', 'claude.exe')) {
             try {
@@ -283,7 +309,7 @@ function Get-ClaudeEnvironment {
             foreach ($rp in @(Get-Process -Name $info.ProcessName -ErrorAction SilentlyContinue)) {
                 try {
                     $cand = $rp.MainModule.FileName
-                    if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                    if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
                         $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'process'; break
                     }
                 } catch { $null = $_ }
@@ -295,7 +321,7 @@ function Get-ClaudeEnvironment {
             foreach ($wp in @(Get-CimInstance Win32_Process -Filter "Name LIKE '%claude%'" `
                               -ErrorAction SilentlyContinue)) {
                 $cand = "$($wp.ExecutablePath)"
-                if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
                     $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'wmi'; break
                 }
             }
@@ -359,33 +385,10 @@ function Get-ClaudeEnvironment {
     } catch { $null = $_ }
 
     # -- VM log selection ----------------------------------------------------
-    # Deliberately restricted to VM-relevant logs. main.log is excluded: it is
-    # the Electron main process log and it can sit frozen for a day at a time on
-    # a perfectly healthy machine, so keying staleness on it is a guaranteed
-    # false positive. Newest wins, and the age is recorded so a caller can
-    # reject a candidate that predates its own lookback window.
+    # See Get-ClaudeVmLogCandidates for which logs count and why.
     try {
         if ($info.LogDir -and (Test-Path $info.LogDir)) {
-            $cands = @()
-            foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
-                try {
-                    $p = Join-Path $info.LogDir $n
-                    if (Test-Path $p) {
-                        $fi = Get-Item $p -ErrorAction SilentlyContinue
-                        if ($fi) {
-                            $cands += [pscustomobject]@{
-                                Name          = $n
-                                Path          = $fi.FullName
-                                LastWriteTime = $fi.LastWriteTime
-                                AgeHours      = [math]::Round( `
-                                    ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
-                                Length        = $fi.Length
-                            }
-                        }
-                    }
-                } catch { $null = $_ }
-            }
-            $cands = @($cands | Sort-Object LastWriteTime -Descending)
+            $cands = @(Get-ClaudeVmLogCandidates -LogDir $info.LogDir)
             $info.VmLogCandidates = $cands
             if ($cands.Count -gt 0) { $info.VmLogFile = $cands[0].Path }
             else { $info.Warnings += "No VM log present in $($info.LogDir)" }
@@ -473,7 +476,7 @@ function Import-ClaudeEnvironment {
         if (-not $raw) { return $null }
         $obj = $raw | ConvertFrom-Json -ErrorAction Stop
         if (-not $obj) { return $null }
-        if ($obj.SchemaVersion -ne 1) { return $null }
+        if ($obj.SchemaVersion -ne 2) { return $null }
         if ($ExpectedPackageVersion -and
             "$($obj.PackageVersion)" -ne "$ExpectedPackageVersion") { return $null }
         return $obj
@@ -529,6 +532,411 @@ function Get-CoworkHcsGuids {
     }
     return @($found | Select-Object -Unique)
 }
+
+function Test-ClaudeCodeCliPath {
+    <#
+    .SYNOPSIS
+        True when an executable path is the Claude Code CLI, not the Claude
+        Desktop app.
+    .DESCRIPTION
+        Both run as a process named "claude". The CLI copies Claude Desktop
+        starts for Code sessions and project threads live in
+        claude-code\<version>\ under the app's data folder, which the path
+        pattern catches. A terminal install lives wherever its installer put
+        it, %USERPROFILE%\.local\bin on this machine, so the file's ProductName
+        decides the rest. Measured 2026-11-21 on app 6.18355: the app's
+        Claude.exe says "Claude", both CLI copies say "Claude Code".
+    #>
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    if ($Path -match '[\\/]claude-code[\\/]') { return $true }
+    try {
+        $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
+        if ($vi -and "$($vi.ProductName)" -eq 'Claude Code') { return $true }
+    } catch { $null = $_ }
+    return $false
+}
+
+function Get-ClaudeProcessInventory {
+    <#
+    .SYNOPSIS
+        Sorts every running process named "claude" into the desktop app and
+        everything else.
+    .DESCRIPTION
+        "claude" is not a unique process name. Measured 2026-11-21 on app
+        6.18355: 18 processes answered Get-Process -Name claude. 14 were the
+        desktop app, under the package InstallLocation. 3 were Claude Code CLI
+        processes the app had started for project threads, under
+        %LOCALAPPDATA%\Claude-Data\claude_<id>\claude-code\2.1.327\. 1 was a
+        terminal CLI in %USERPROFILE%\.local\bin. Every kill in this toolkit
+        stopped all 18.
+
+        A process is the desktop app when its executable sits under the package
+        InstallLocation, or under another version folder of the same package:
+        an update registers the new version while processes started from the
+        old folder are still running. With no package, the folder of the
+        discovered ClaudeExe stands in for InstallLocation. With neither, a
+        ProductName of "Claude" decides.
+
+        A process whose path cannot be read is not counted as the desktop app.
+        A process this function cannot place is not one the toolkit may kill.
+
+        Each result carries Process, Id, Path, Kind and IsDesktop. Kind is
+        desktop, cli, other or unknown.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+
+    $roots = @()
+    $siblingPattern = $null
+    try {
+        if ($Environment.InstallLocation) {
+            $loc = "$($Environment.InstallLocation)".TrimEnd('\')
+            $roots += $loc + '\'
+            # InstallLocation is <WindowsApps>\<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>
+            # and the family name is <Name>_<PublisherId>, so any version of
+            # this package matches <WindowsApps>\<Name>_*_<PublisherId>\.
+            $fam = "$($Environment.PackageFamilyName)"
+            $cut = $fam.LastIndexOf('_')
+            if ($cut -gt 0) {
+                $parent = Split-Path $loc -Parent
+                $siblingPattern = '^' + [regex]::Escape($parent + '\' + $fam.Substring(0, $cut) + '_') +
+                    '[^\\]*_' + [regex]::Escape($fam.Substring($cut + 1)) + '\\'
+            }
+        } elseif ($Environment.ClaudeExe -and -not (Test-ClaudeCodeCliPath "$($Environment.ClaudeExe)")) {
+            $dir = Split-Path "$($Environment.ClaudeExe)" -Parent
+            # A Squirrel install runs from <root>\app-<version>\ beside a
+            # <root>\Claude.exe stub, and an update adds a new app-<version>.
+            if ((Split-Path $dir -Leaf) -match '^app-\d') { $dir = Split-Path $dir -Parent }
+            $roots += $dir.TrimEnd('\') + '\'
+        }
+    } catch { $null = $_ }
+
+    $result = @()
+    $cimPaths = $null
+    $products = @{}
+    foreach ($p in @(Get-Process -Name $Environment.ProcessName -ErrorAction SilentlyContinue)) {
+        $path = $null
+        try { $path = $p.MainModule.FileName } catch { $null = $_ }
+        if (-not $path) {
+            # MainModule needs more access than the image name does. One CIM
+            # query answers for every process it could not read.
+            if ($null -eq $cimPaths) {
+                $cimPaths = @{}
+                try {
+                    $flt = "Name='$($Environment.ProcessName).exe'"
+                    foreach ($w in @(Get-CimInstance Win32_Process -Filter $flt -ErrorAction Stop)) {
+                        if ($w.ExecutablePath) { $cimPaths[[int]$w.ProcessId] = "$($w.ExecutablePath)" }
+                    }
+                } catch { $null = $_ }
+            }
+            if ($cimPaths.ContainsKey([int]$p.Id)) { $path = $cimPaths[[int]$p.Id] }
+        }
+
+        $kind = 'unknown'
+        if ($path) {
+            $kind = 'other'
+            if ($path -match '[\\/]claude-code[\\/]') { $kind = 'cli' }
+            else {
+                foreach ($r in $roots) {
+                    if ($path.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)) { $kind = 'desktop'; break }
+                }
+                if ($kind -eq 'other' -and $siblingPattern -and $path -match $siblingPattern) { $kind = 'desktop' }
+                if ($kind -eq 'other') {
+                    # Read once per distinct path: fourteen desktop processes
+                    # share one executable.
+                    if (-not $products.ContainsKey($path)) {
+                        $products[$path] = ''
+                        try {
+                            $products[$path] = "$((Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductName)"
+                        } catch { $null = $_ }
+                    }
+                    if ($products[$path] -eq 'Claude Code') { $kind = 'cli' }
+                    elseif ($roots.Count -eq 0 -and $products[$path] -eq 'Claude') { $kind = 'desktop' }
+                }
+            }
+        }
+        $result += [pscustomobject]@{
+            Process   = $p
+            Id        = $p.Id
+            Path      = $path
+            Kind      = $kind
+            IsDesktop = ($kind -eq 'desktop')
+        }
+    }
+    return $result
+}
+
+function Get-ClaudeDesktopProcess {
+    <#
+    .SYNOPSIS
+        The running Claude Desktop app processes, and no Claude Code CLI.
+    .DESCRIPTION
+        Use this for anything that kills Claude, and for anything that asks
+        whether the app is running before it does something. A check that only
+        holds a repair back because Claude looks busy may keep counting every
+        "claude" process: a busy CLI is a reason to wait as well.
+        Get-ClaudeProcessInventory says how the two are told apart.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+    return @(Get-ClaudeProcessInventory -Environment $Environment |
+             Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
+}
+
+function Get-ClaudeDataCandidates {
+    <#
+    .SYNOPSIS
+        Every folder that may hold the Claude Desktop app's data or its logs,
+        freshest first.
+    .DESCRIPTION
+        The app has moved its data before. Until app 6.18355 it kept everything
+        in %APPDATA%\Claude. Measured 2026-11-21 on 6.18355: %APPDATA%\Claude
+        holds only this toolkit's own files, the data root is
+        %LOCALAPPDATA%\Claude-Data\claude_<publisher id> (Preferences written
+        that minute), whose logs folder the app last wrote on 2026-08-21, and
+        the live logs are in %LOCALAPPDATA%\Claude\logs. A fixed path is wrong
+        on one build or the other, so every place the app is known to use is
+        listed and the caller takes the freshest.
+
+        DataRoots: each existing candidate folder. Newest is the latest write
+        among the app's own files in it (Preferences, Local State, config.json,
+        Network, Session Storage, window-state.json, lockfile). IsAppData is
+        true when it holds Preferences or Local State, which every Electron data
+        folder has. The toolkit's own files (watch-logs, fix-logs, launchers)
+        are not markers, so a folder does not look fresh because the toolkit
+        writes to it.
+
+        LogDirs: the logs folder of each candidate, where it exists. Newest is
+        the latest write to a *.log directly in it.
+
+        Cheap enough to call on every poll: Test-Path and one directory listing
+        per candidate, nothing recursive. Never throws.
+    .PARAMETER PackageFamilyName
+        The MSIX package family. Its LocalCache, where Windows redirects a
+        packaged app's AppData writes, is probed as well.
+    #>
+    param([string]$PackageFamilyName)
+
+    $bases = @()
+    if ($env:LOCALAPPDATA) { $bases += @{ Path = $env:LOCALAPPDATA; Tag = 'LOCALAPPDATA' } }
+    if ($env:APPDATA)      { $bases += @{ Path = $env:APPDATA;      Tag = 'APPDATA' } }
+    if ($PackageFamilyName -and $env:LOCALAPPDATA) {
+        $lc = Join-Path $env:LOCALAPPDATA "Packages\$PackageFamilyName\LocalCache"
+        $bases += @{ Path = (Join-Path $lc 'Local');   Tag = 'LocalCache\Local' }
+        $bases += @{ Path = (Join-Path $lc 'Roaming'); Tag = 'LocalCache\Roaming' }
+    }
+
+    $wanted = @()
+    if ($env:CLAUDE_USER_DATA_DIR) {
+        $wanted += @{ Path = $env:CLAUDE_USER_DATA_DIR; Source = 'CLAUDE_USER_DATA_DIR' }
+    }
+    foreach ($b in $bases) {
+        foreach ($n in @('Claude-Data', 'Claude-3p')) {
+            try {
+                $parent = Join-Path $b.Path $n
+                if (Test-Path -LiteralPath $parent -PathType Container) {
+                    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue)) {
+                        $wanted += @{ Path = $d.FullName; Source = "$($b.Tag)\$n" }
+                    }
+                }
+            } catch { $null = $_ }
+        }
+        $wanted += @{ Path = (Join-Path $b.Path 'Claude'); Source = "$($b.Tag)\Claude" }
+    }
+
+    $markers = @('Preferences', 'Local State', 'config.json', 'Network', 'Session Storage',
+                 'window-state.json', 'lockfile')
+    $roots = @()
+    $logs  = @()
+    $seen  = @{}
+    foreach ($w in $wanted) {
+        try {
+            $full = "$($w.Path)".TrimEnd('\')
+            if (-not $full -or $seen.ContainsKey($full.ToLowerInvariant())) { continue }
+            $seen[$full.ToLowerInvariant()] = $true
+            if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
+
+            $newest = $null
+            $isApp  = $false
+            foreach ($m in $markers) {
+                $mi = Get-Item -LiteralPath (Join-Path $full $m) -Force -ErrorAction SilentlyContinue
+                if (-not $mi) { continue }
+                if ($m -eq 'Preferences' -or $m -eq 'Local State') { $isApp = $true }
+                if ($null -eq $newest -or $mi.LastWriteTime -gt $newest) { $newest = $mi.LastWriteTime }
+            }
+            $roots += [pscustomobject]@{ Path = $full; Source = $w.Source; IsAppData = $isApp; Newest = $newest }
+
+            $ld = Join-Path $full 'logs'
+            if (Test-Path -LiteralPath $ld -PathType Container) {
+                $lnewest = $null
+                foreach ($f in @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -Force -ErrorAction SilentlyContinue)) {
+                    if ($null -eq $lnewest -or $f.LastWriteTime -gt $lnewest) { $lnewest = $f.LastWriteTime }
+                }
+                $logs += [pscustomobject]@{ Path = $ld; Source = $w.Source; Newest = $lnewest }
+            }
+        } catch { $null = $_ }
+    }
+
+    $byNewest = @{ Expression = { if ($_.Newest) { $_.Newest } else { [datetime]::MinValue } }; Descending = $true }
+    return [pscustomobject]@{
+        DataRoots = @($roots | Sort-Object -Property @{ Expression = { [int]$_.IsAppData }; Descending = $true }, $byNewest)
+        LogDirs   = @($logs | Sort-Object -Property $byNewest)
+    }
+}
+
+function Resolve-ClaudeDataPaths {
+    <#
+    .SYNOPSIS
+        Picks the app's data root and log folder out of
+        Get-ClaudeDataCandidates and names the folders the repairs act on.
+    .DESCRIPTION
+        DataRoot is the freshest candidate holding Preferences or Local State.
+        LogDir is the logs folder whose newest *.log was written last. The two
+        are chosen separately because they are not nested: on app 6.18355 the
+        data root is %LOCALAPPDATA%\Claude-Data\claude_<id> and the live logs
+        are in %LOCALAPPDATA%\Claude\logs.
+
+        VmCachePath, BundlePath, SessionsDir and CodeSessionsDir are named
+        folders under DataRoot. Measured 2026-11-21 on 6.18355, all four are
+        there: claude-code-vm, vm_bundles, local-agent-mode-sessions and
+        claude-code-sessions.
+
+        When no candidate qualifies, a path falls back to where it was before
+        6.2.0, under AppDataDir, and says so. Notes holds one line per choice
+        and one per candidate passed over; Get-ClaudeEnvironment adds them to
+        Warnings.
+
+        This toolkit's own state (fix-logs, watch-logs, watch-state.json, the
+        generated launchers) stays in AppDataDir whatever is chosen here.
+        Never throws: Get-ClaudeDataCandidates does not, and the rest is string
+        work.
+    .PARAMETER PackageFamilyName
+        Passed to Get-ClaudeDataCandidates for the MSIX LocalCache candidates.
+    .PARAMETER AppDataDir
+        The toolkit's folder, %APPDATA%\Claude, used only as the fallback.
+    #>
+    param(
+        [string]$PackageFamilyName,
+        [string]$AppDataDir
+    )
+
+    $stamp = { param($t) if ($t) { $t.ToString('yyyy-MM-dd HH:mm') } else { 'never' } }
+    $notes = @()
+    $c = Get-ClaudeDataCandidates -PackageFamilyName $PackageFamilyName
+
+    $dataRoot   = $null
+    $dataSource = $null
+    $appRoots   = @($c.DataRoots | Where-Object { $_.IsAppData })
+    if ($appRoots.Count -gt 0) {
+        $dataRoot   = $appRoots[0].Path
+        $dataSource = $appRoots[0].Source
+        $notes += "Data root: $dataRoot ($dataSource, app files last written $(& $stamp $appRoots[0].Newest))"
+        foreach ($o in @($appRoots | Select-Object -Skip 1)) {
+            $notes += "Data root passed over: $($o.Path) ($($o.Source), app files last written $(& $stamp $o.Newest))"
+        }
+    } elseif ($AppDataDir) {
+        $dataRoot   = $AppDataDir
+        $dataSource = 'fallback'
+        $notes += "No folder holding Preferences or Local State was found; the data root falls back to $AppDataDir"
+    }
+
+    $logDir    = $null
+    $logSource = $null
+    $liveLogs  = @($c.LogDirs | Where-Object { $_.Newest })
+    if ($liveLogs.Count -gt 0) {
+        $logDir    = $liveLogs[0].Path
+        $logSource = $liveLogs[0].Source
+        $notes += "Log folder: $logDir ($logSource, newest log $(& $stamp $liveLogs[0].Newest))"
+        foreach ($o in @($liveLogs | Select-Object -Skip 1)) {
+            $notes += "Log folder passed over: $($o.Path) ($($o.Source), newest log $(& $stamp $o.Newest))"
+        }
+    } elseif ($AppDataDir) {
+        $logDir    = Join-Path $AppDataDir 'logs'
+        $logSource = 'fallback'
+        $notes += "No logs folder holding a *.log was found; the log folder falls back to $logDir"
+    }
+
+    $under = { param($leaf) if ($dataRoot) { Join-Path $dataRoot $leaf } else { $null } }
+    return [pscustomobject]@{
+        DataRoot           = $dataRoot
+        DataRootSource     = $dataSource
+        LogDir             = $logDir
+        LogDirSource       = $logSource
+        VmCachePath        = (& $under 'claude-code-vm')
+        BundlePath         = (& $under 'vm_bundles')
+        SessionsDir        = (& $under 'local-agent-mode-sessions')
+        CodeSessionsDir    = (& $under 'claude-code-sessions')
+        DataRootCandidates = @($c.DataRoots | ForEach-Object {
+            '{0} ({1}, app data {2}, app files last written {3})' -f $_.Path, $_.Source, $_.IsAppData, (& $stamp $_.Newest)
+        })
+        LogDirCandidates   = @($c.LogDirs | ForEach-Object {
+            '{0} ({1}, newest log {2})' -f $_.Path, $_.Source, (& $stamp $_.Newest)
+        })
+        Notes              = @($notes)
+    }
+}
+
+function Get-ClaudeVmLogCandidates {
+    <#
+    .SYNOPSIS
+        The VM logs present in a Claude log folder, newest first.
+    .DESCRIPTION
+        Deliberately restricted to VM-relevant logs. main.log is excluded: it is
+        the Electron main process log and it can sit frozen for a day at a time
+        on a perfectly healthy machine, so keying staleness on it is a
+        guaranteed false positive. Newest wins, and the age is recorded so a
+        caller can reject a candidate that predates its own lookback window.
+
+        A function of its own since 6.2.0 so Watch can pick the VM log again
+        when the log folder moves under it. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $cands = @()
+    if (-not $LogDir) { return $cands }
+    foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
+        try {
+            $p = Join-Path $LogDir $n
+            if (Test-Path -LiteralPath $p) {
+                $fi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
+                if ($fi) {
+                    $cands += [pscustomobject]@{
+                        Name          = $n
+                        Path          = $fi.FullName
+                        LastWriteTime = $fi.LastWriteTime
+                        AgeHours      = [math]::Round( `
+                            ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
+                        Length        = $fi.Length
+                    }
+                }
+            }
+        } catch { $null = $_ }
+    }
+    return @($cands | Sort-Object LastWriteTime -Descending)
+}
+
+function Get-ClaudeVmLogAge {
+    <#
+    .SYNOPSIS
+        Seconds since any VM log in a Claude log folder was last written, or
+        $null when the folder holds none.
+    .DESCRIPTION
+        Reads every VM log, now. App 6.18355 writes two of them, and which one
+        is newest changes through the day: cowork_vm_node.log is the host side
+        (each boot, each Cowork command) and coworkd.log is the daemon inside
+        the VM (each command again, and a clock line every few hours). A
+        freshness test that read only the log that happened to be newest when
+        the script started could be reading the quiet one. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
+    if ($c.Count -eq 0) { return $null }
+    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
+}
 #endregion ClaudeEnv
 
 # -- Runtime discovery -----------------------------------------------
@@ -537,11 +945,18 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.1.1"
+$ToolkitVersion   = "6.2.0"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
 $ClaudeAppData    = $script:ClaudeEnv.AppDataDir
+# Where the app keeps its data and VM image, which is what the storage check
+# and the Defender exclusion are about. Until app 6.18355 that was
+# $ClaudeAppData; since, it is %LOCALAPPDATA%\Claude-Data\claude_<id>, and
+# $ClaudeAppData holds only this toolkit's files. Discovery falls back to
+# $ClaudeAppData when it finds no data root.
+$ClaudeDataRoot   = $script:ClaudeEnv.DataRoot
+if (-not $ClaudeDataRoot) { $ClaudeDataRoot = $ClaudeAppData }
 
 # Both discovered. $ServiceName was removed in the first pass as an unused
 # variable, which it was: everything referred to the literal "CoworkVMService"
@@ -570,8 +985,10 @@ function Step {
 }
 
 function Initialize-ClaudeAppData {
-    # %APPDATA%\Claude is created by Claude Desktop on first launch. This script
-    # is meant to be runnable BEFORE Claude Desktop is installed, and it also
+    # %APPDATA%\Claude was created by Claude Desktop on first launch until app
+    # 6.18355, which keeps its data under %LOCALAPPDATA%\Claude-Data and need
+    # not create it at all. This script is meant to be runnable BEFORE Claude
+    # Desktop is installed, and it also
     # self-elevates -- which can land it in a different account's profile that
     # has never launched Claude. Either way the folder may not exist yet, and
     # every state file this script writes lives inside it.
@@ -602,6 +1019,37 @@ function Save-StateFile {
 function Get-ActivePlanGuid {
     $raw = (powercfg /getactivescheme) -replace '.*:\s*', '' -replace '\s*\(.*', ''
     return $raw.Trim()
+}
+
+function Test-DefenderExclusionCovers {
+    <#
+    .SYNOPSIS
+        True when one of Defender's ExclusionPath entries covers Path: the
+        same path, a folder above it, or a wildcard entry that matches it.
+    .DESCRIPTION
+        Until 6.2.0 this was a bare prefix test, which ignores folder
+        boundaries. The data root %LOCALAPPDATA%\Claude-Data\claude_<id>
+        sits beside the app's own %LOCALAPPDATA%\Claude, so an exclusion for
+        that folder read as covering the data root and the data root was
+        never excluded. Measured 2026-11-21: a machine in exactly that state.
+        An empty entry used to cover every path.
+
+        A Defender entry may use * and ? and environment variables, so those
+        are honoured; [ and ] are taken literally, as they are in a path.
+        An entry starting "N/A" is the placeholder Get-MpPreference returns
+        to a caller that may not read the list, and covers nothing.
+    #>
+    param([string]$Path, [string[]]$Exclusions)
+    if (-not $Path) { return $false }
+    $p = $Path.TrimEnd('\')
+    foreach ($ex in @($Exclusions)) {
+        if (-not $ex -or $ex -like 'N/A*') { continue }
+        $e = [Environment]::ExpandEnvironmentVariables($ex.Trim()).TrimEnd('\')
+        if (-not $e) { continue }
+        $pattern = $e -replace '[\[\]`]', '`$0'
+        if (($p -like $pattern) -or ($p -like "$pattern\*")) { return $true }
+    }
+    return $false
 }
 
 # -- Header ----------------------------------------------------------
@@ -1234,6 +1682,8 @@ if ($Undo) {
     $hcsExe = $script:ClaudeEnv.HcsDiagPath
     if ($hcsExe) {
         try {
+            # Every process named claude counts, the Claude Code CLI included:
+            # this only decides to leave the VM alone, and erring that way is safe.
             $claudeLive = @(Get-Process -Name claude -ErrorAction SilentlyContinue).Count -gt 0
             $hcsList = & $hcsExe list 2>&1 | Out-String
             $guids = Get-CoworkHcsGuids -ListOutput ([string]$hcsList)
@@ -1375,34 +1825,35 @@ if ($Undo) {
     $vmCachePath = $script:ClaudeEnv.VmCachePath
     $storageWarnings = @()
 
-    # Both checks used to read $env:APPDATA. They now read the discovered Claude
-    # folder, which is where the VM cache actually lives. On a default install
-    # the two are the same; if a user has redirected the folder they are not,
-    # and the redirected one is the answer that matters.
+    # Both checks read the discovered data root, which is where the VM cache
+    # actually lives. They read $env:APPDATA once, then %APPDATA%\Claude, which
+    # since app 6.18355 holds only this toolkit's files: the app keeps its data
+    # under %LOCALAPPDATA%\Claude-Data, so a sync folder or an external drive
+    # holding it went unreported.
     $cloudPaths = @("OneDrive", "Google Drive", "Dropbox", "iCloud", "Box")
     foreach ($cp in $cloudPaths) {
-        if ($ClaudeAppData -match [regex]::Escape($cp)) {
-            $storageWarnings += "The Claude folder is inside a '$cp' sync folder, this causes mount failures"
+        if ($ClaudeDataRoot -match [regex]::Escape($cp)) {
+            $storageWarnings += "The Claude data folder is inside a '$cp' sync folder, this causes mount failures"
         }
     }
 
-    # Check if the Claude folder is on an external/USB drive
+    # Check if the Claude data folder is on an external/USB drive
     try {
-        $appDataDrive = (Split-Path $ClaudeAppData -Qualifier) + "\"
+        $appDataDrive = (Split-Path $ClaudeDataRoot -Qualifier) + "\"
         $driveInfo = Get-Volume -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue
         if ($driveInfo) {
             $diskNumber = (Get-Partition -DriveLetter ($appDataDrive[0]) -ErrorAction SilentlyContinue).DiskNumber
             if ($null -ne $diskNumber) {
                 $disk = Get-Disk -Number $diskNumber -ErrorAction SilentlyContinue
                 if ($disk -and $disk.BusType -match "USB|Thunderbolt|1394") {
-                    $storageWarnings += "The Claude folder is on an external $($disk.BusType) drive, use a local SSD instead"
+                    $storageWarnings += "The Claude data folder is on an external $($disk.BusType) drive, use a local SSD instead"
                 }
             }
 
             # Check if it's a network drive
             $logDisk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($appDataDrive.TrimEnd('\'))'" -ErrorAction SilentlyContinue
             if ($logDisk -and $logDisk.DriveType -eq 4) {
-                $storageWarnings += "The Claude folder is on a network drive, VirtioFS requires local storage"
+                $storageWarnings += "The Claude data folder is on a network drive, VirtioFS requires local storage"
             }
         }
     } catch { $null = $_ }
@@ -1518,21 +1969,19 @@ if ($Undo) {
             # Check if Defender exclusions are already set
             try {
                 $exclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionPath
+                # The app's data root, which holds the VM image whose VirtioFS
+                # disk operations an AV filter driver gets in the way of. Until
+                # 6.2.0 this was %APPDATA%\Claude, which on app 6.18355 holds
+                # only this toolkit's files.
                 $neededPaths = @(
-                    $ClaudeAppData,
+                    $ClaudeDataRoot,
                     (Join-Path $env:ProgramFiles "Hyper-V"),
                     "$env:SystemRoot\System32\vmwp.exe",
                     "$env:SystemRoot\System32\vmms.exe"
                 )
                 $missing = @()
                 foreach ($np in $neededPaths) {
-                    $found = $false
-                    if ($exclusions) {
-                        foreach ($ex in $exclusions) {
-                            if ($np -like "$ex*") { $found = $true; break }
-                        }
-                    }
-                    if (-not $found) { $missing += $np }
+                    if (-not (Test-DefenderExclusionCovers -Path $np -Exclusions $exclusions)) { $missing += $np }
                 }
                 if ($missing.Count -gt 0) {
                     Log "Adding Defender exclusions for Hyper-V/Claude paths:" -Colour Green -Indent
@@ -1544,41 +1993,40 @@ if ($Undo) {
                             Log "  ! Could not add: $mp" -Colour Yellow -Indent
                         }
                     }
-                    # Also add process exclusions
-                    $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "$ServiceExe.exe")
-                    try {
-                        foreach ($rp in $requiredProcs) {
+                } else {
+                    Log "Defender path exclusions already configured" -Colour Green -Indent
+                }
+                # The process exclusions are checked on every run. Until 6.2.0
+                # they were only looked at when a path was missing, so a machine
+                # whose paths were all excluded never got them.
+                $requiredProcs = @("vmwp.exe", "vmms.exe", "vmcompute.exe", "$ServiceExe.exe")
+                try {
+                    $procExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
+                    $missingProcs = @($requiredProcs | Where-Object { -not ($procExclusions -contains $_) })
+                    if ($missingProcs.Count -gt 0) {
+                        foreach ($rp in $missingProcs) {
                             Add-MpPreference -ExclusionProcess $rp -ErrorAction SilentlyContinue
                         }
-                        Log "  + Process exclusions: $($requiredProcs -join ', ')" -Colour Green -Indent
-                    } catch { $null = $_ }
-                    # Verify process exclusions were applied (v4.8.0)
-                    try {
+                        Log "  + Process exclusions: $($missingProcs -join ', ')" -Colour Green -Indent
+                        # Verify they were applied (v4.8.0)
                         $procExclusions = (Get-MpPreference -ErrorAction SilentlyContinue).ExclusionProcess
-                        $missingProcs = @()
-                        foreach ($rp in $requiredProcs) {
-                            if (-not ($procExclusions -contains $rp)) { $missingProcs += $rp }
-                        }
-                        if ($missingProcs.Count -gt 0) {
-                            Log "  ! Missing process exclusions: $($missingProcs -join ', ')" -Colour Yellow -Indent
-                            foreach ($mp in $missingProcs) {
-                                Add-MpPreference -ExclusionProcess $mp -ErrorAction SilentlyContinue
-                            }
-                            Log "  Retried adding missing exclusions" -Colour DarkGray -Indent
+                        $stillMissing = @($requiredProcs | Where-Object { -not ($procExclusions -contains $_) })
+                        if ($stillMissing.Count -gt 0) {
+                            Log "  ! Could not add process exclusions: $($stillMissing -join ', ')" -Colour Yellow -Indent
                         } else {
                             Log "  All process exclusions verified" -Colour Green -Indent
                         }
-                    } catch { $null = $_ }
-                } else {
-                    Log "Defender exclusions already configured" -Colour Green -Indent
-                }
+                    } else {
+                        Log "Defender process exclusions already configured" -Colour Green -Indent
+                    }
+                } catch { $null = $_ }
             } catch {
                 Log "Could not check Defender exclusions, not critical" -Colour DarkGray -Indent
             }
         } else {
             # Third-party AV, can only advise
             Log "Recommended exclusion paths for your AV:" -Colour DarkYellow -Indent
-            Log "  - $ClaudeAppData\" -Colour White -Indent
+            Log "  - $ClaudeDataRoot\" -Colour White -Indent
             Log "  - $env:ProgramFiles\Hyper-V\" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmwp.exe" -Colour White -Indent
             Log "  - $env:SystemRoot\System32\vmms.exe" -Colour White -Indent
@@ -1771,6 +2219,8 @@ if ($Undo) {
             # Pre-check: skip if the VM service is already running (Claude got here
             # first) or if Claude itself is running (do not disrupt active session).
             # BootPrep is non-destructive: only restarts vmcompute, does not kill Claude.
+            # The Claude-is-running test counts every process named claude, the
+            # Claude Code CLI included. It only holds BootPrep back, which is safe.
             #
             # The service name is interpolated from discovery at install time rather
             # than written as a literal. The generated task is a standalone script
@@ -1910,11 +2360,12 @@ if (`$claude) {
         # logon. The task gets a full unfiltered admin token, no UAC prompt, and the
         # GUI is visible in the user's desktop session.
         #
-        # The task action finds Claude at runtime via three methods:
+        # The task action finds Claude at runtime via two methods:
         #   1) Get-AppxPackage (MSIX installs from Store/winget)
         #   2) Common install paths (traditional .exe installer)
-        #   3) Running process fallback (any install method)
-        # This survives version updates and works with any install type.
+        # This survives version updates. A third, reading the path off a
+        # running "claude" process, was removed in 6.2.0: it only ran when no
+        # app process was running, so all it could find was the Claude Code CLI.
 
         $elevTaskName = "LaunchClaudeAdmin"
 
@@ -1922,16 +2373,27 @@ if (`$claude) {
         try { Unregister-ScheduledTask -TaskName $elevTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
 
         # PowerShell command that finds and launches Claude
-        # Priority: 1) MSIX via Get-AppxPackage  2) Traditional .exe install paths  3) Running process
+        # Priority: 1) MSIX via Get-AppxPackage  2) Traditional .exe install paths
         # NOTE: We MUST use direct .exe launch (Start-Process $exe) to inherit the
         # task's elevated token. shell:AppsFolder routes through the non-elevated desktop
         # shell and the app gets medium integrity -- defeating the entire purpose.
         # Trade-off: MSIX installs will show a second taskbar icon. This is unavoidable
         # because Windows enforces medium integrity for all shell-activated MSIX apps.
         $launchCmd = @'
-# If Claude is already running, don't launch again
-$existing = Get-Process -Name Claude -ErrorAction SilentlyContinue
-if ($existing) { exit 0 }
+# If Claude Desktop is already running, don't launch again. The Claude Code CLI
+# runs as "claude" too and does not count: with a project thread or a terminal
+# session alive, this used to exit without launching anything. A process whose
+# path cannot be read does count, so a doubt ends in no second launch.
+$existing = @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object {
+    $pexe = $null
+    try { $pexe = $_.MainModule.FileName } catch { $null = $_ }
+    if (-not $pexe) { return $true }
+    if ($pexe -match '[\\/]claude-code[\\/]') { return $false }
+    $product = ''
+    try { $product = [string](Get-Item -LiteralPath $pexe).VersionInfo.ProductName } catch { $null = $_ }
+    $product -ne 'Claude Code'
+})
+if ($existing.Count -gt 0) { exit 0 }
 $exe = $null
 # 1. MSIX install (Windows Store / winget MSIX)
 $p = Get-AppxPackage | Where-Object { $_.Name -eq 'Claude' -or $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
@@ -1947,11 +2409,9 @@ if (-not $exe) {
     )
     foreach ($c in $candidates) { if (Test-Path $c) { $exe = $c; break } }
 }
-# 3. Fallback: find from running process
-if (-not $exe) {
-    $proc = Get-Process -Name Claude -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($proc -and $proc.MainModule) { $exe = $proc.MainModule.FileName }
-}
+# There was a third method, reading the path off a running "claude" process.
+# By this line no app process is running, so it could only ever find the Claude
+# Code CLI, and then launched that instead of the app.
 if ($exe) { Start-Process $exe } else { throw 'Claude Desktop not found. Is it installed?' }
 '@
 
@@ -2182,7 +2642,24 @@ Invoke-CommandInDesktopPackage ``
 # Claude is single-instance. Launching a second copy while one is running just
 # focuses the existing window, and the flag is silently ignored. So the running
 # instance has to go first, or this does nothing at all.
-`$running = @(Get-Process claude -ErrorAction SilentlyContinue)
+#
+# The app only. The Claude Code CLI runs as "claude" too: the copies Claude
+# starts for Code sessions and project threads, out of a claude-code folder,
+# and any terminal session. Closing those would end that work. A process whose
+# path cannot be read is left alone as well: it could be either, and an app
+# that was started elevated cannot be closed from here anyway.
+function Get-ClaudeAppProcess {
+    @(Get-Process claude -ErrorAction SilentlyContinue | Where-Object {
+        `$exe = `$null
+        try { `$exe = `$_.MainModule.FileName } catch { `$null = `$_ }
+        if (-not `$exe -or `$exe -match '[\\/]claude-code[\\/]') { return `$false }
+        `$product = ''
+        try { `$product = [string](Get-Item -LiteralPath `$exe).VersionInfo.ProductName } catch { `$null = `$_ }
+        `$product -ne 'Claude Code'
+    })
+}
+
+`$running = @(Get-ClaudeAppProcess)
 if (`$running.Count -gt 0) {
     Write-Host "  Closing `$(`$running.Count) running Claude process(es)..." -ForegroundColor DarkGray
     `$running | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -2193,7 +2670,7 @@ Write-Host "  Starting Claude with --disable-gpu..." -ForegroundColor Cyan
 $launchBody
 
 Start-Sleep -Seconds 3
-if (@(Get-Process claude -ErrorAction SilentlyContinue).Count -gt 0) {
+if (@(Get-ClaudeAppProcess).Count -gt 0) {
     Write-Host "  Claude is running without hardware GPU acceleration." -ForegroundColor Green
     Write-Host "  The UI may feel slightly slower. That is the trade." -ForegroundColor DarkGray
 } else {

@@ -3,10 +3,12 @@
     Claude Desktop / Cowork, Reset and Fix
 
 .DESCRIPTION
-    Kills all Claude processes, stops CoworkVMService, recovers from HCS
-    (Host Compute Service) errors, performs orphan compute system cleanup,
-    purges stale VM cache, restarts the service, and relaunches Claude
-    Desktop with elevated privileges when available.
+    Kills the Claude Desktop app's processes, stops CoworkVMService, recovers
+    from HCS (Host Compute Service) errors, performs orphan compute system
+    cleanup, purges stale VM cache, restarts the service, and relaunches
+    Claude Desktop with elevated privileges when available. Claude Code CLI
+    processes, which are also named "claude", are left running: they carry
+    project threads, Code sessions and terminal sessions.
 
     Use -Close for a clean shutdown without relaunching (kills Claude UI,
     waits for VM shutdown, restarts service for next launch). Pair with
@@ -63,7 +65,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.1.1
+    Version : 6.2.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -153,8 +155,11 @@ function Get-ClaudeEnvironment {
     #>
     param([switch]$SkipCacheInventory)
 
+    # Version 2 (6.2.0): the app's folders come from Resolve-ClaudeDataPaths
+    # instead of %APPDATA%\Claude. A version 1 record names the old folders,
+    # so Import-ClaudeEnvironment turns it away.
     $info = [ordered]@{
-        SchemaVersion = 1
+        SchemaVersion = 2
         DiscoveredUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
         PackageFound      = $false
@@ -178,11 +183,20 @@ function Get-ClaudeEnvironment {
 
         ProcessName = 'claude'
 
-        AppDataDir  = $null
-        LogDir      = $null
-        VmCachePath = $null
-        BundlePath  = $null
-        SessionsDir = $null
+        # AppDataDir is this toolkit's own folder: fix-logs, watch-logs,
+        # watch-state.json, the generated launchers. The app kept its data
+        # there too until 6.18355; DataRoot is where it keeps it now.
+        AppDataDir         = $null
+        DataRoot           = $null
+        DataRootSource     = $null
+        LogDir             = $null
+        LogDirSource       = $null
+        VmCachePath        = $null
+        BundlePath         = $null
+        SessionsDir        = $null
+        CodeSessionsDir    = $null
+        DataRootCandidates = @()
+        LogDirCandidates   = @()
 
         VmLogFile       = $null
         VmLogCandidates = @()
@@ -217,16 +231,14 @@ function Get-ClaudeEnvironment {
         else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
     } catch { $info.Warnings += "hcsdiag probe failed: $($_.Exception.Message)" }
 
-    # -- Per-user data locations -------------------------------------------
-    # %APPDATA% is the only location that exists on current builds. The old
-    # %ProgramData%\Claude tree is gone, so it is not probed here at all.
+    # -- This toolkit's own folder -----------------------------------------
+    # %APPDATA%\Claude, where the toolkit keeps its logs, state and launchers.
+    # Where the app keeps its own data and logs is found further down, once the
+    # package is known; see Resolve-ClaudeDataPaths. The old
+    # %ProgramData%\Claude tree is gone, so it is not probed at all.
     try {
         if ($env:APPDATA) {
-            $info.AppDataDir  = Join-Path $env:APPDATA "Claude"
-            $info.LogDir      = Join-Path $info.AppDataDir "logs"
-            $info.VmCachePath = Join-Path $info.AppDataDir "claude-code-vm"
-            $info.BundlePath  = Join-Path $info.AppDataDir "vm_bundles"
-            $info.SessionsDir = Join-Path $info.AppDataDir "local-agent-mode-sessions"
+            $info.AppDataDir = Join-Path $env:APPDATA "Claude"
         } else {
             $info.Warnings += "APPDATA is not set; per-user paths undiscoverable"
         }
@@ -289,6 +301,21 @@ function Get-ClaudeEnvironment {
         $info.Aumid = "shell:AppsFolder\$($info.PackageFamilyName)!$($info.ApplicationId)"
     }
 
+    # -- The app's data and log folders --------------------------------------
+    # After the package query because the package's LocalCache is one of the
+    # candidates. Every choice and every candidate passed over goes into
+    # Warnings, so claude-env.json says why a path was picked.
+    try {
+        $paths = Resolve-ClaudeDataPaths -PackageFamilyName $info.PackageFamilyName `
+                                         -AppDataDir $info.AppDataDir
+        foreach ($k in @('DataRoot', 'DataRootSource', 'LogDir', 'LogDirSource', 'VmCachePath',
+                         'BundlePath', 'SessionsDir', 'CodeSessionsDir',
+                         'DataRootCandidates', 'LogDirCandidates')) {
+            $info[$k] = $paths.$k
+        }
+        $info.Warnings += @($paths.Notes)
+    } catch { $info.Warnings += "Data folder discovery failed: $($_.Exception.Message)" }
+
     # -- Claude executable ---------------------------------------------------
     # Ordered by authority, not by convenience. The package branch runs first
     # because it is the only source that reliably identifies the DESKTOP app,
@@ -297,12 +324,13 @@ function Get-ClaudeEnvironment {
     # TrustedInstaller ACL.
     #
     # Reading the path off a running process looks more reliable but is not.
-    # The Claude Code CLI also runs as a process named "claude", out of
-    # %APPDATA%\Claude\claude-code\<version>\claude.exe. Measured on this
-    # machine: 3 of 16 "claude" processes were the CLI. Taking the first
-    # readable one can therefore cache the CLI path and turn every later
-    # relaunch into a CLI start instead of an app start.
-    $cliPattern = '[\\/]claude-code[\\/]'
+    # The Claude Code CLI also runs as a process named "claude": the copies the
+    # app starts sit in claude-code\<version>\ under its data folder, and a
+    # terminal install sits in %USERPROFILE%\.local\bin. Measured 2026-11-21: 4
+    # of 18 "claude" processes were the CLI. Taking the first readable one can
+    # therefore cache the CLI path and turn every later relaunch into a CLI
+    # start instead of an app start. Test-ClaudeCodeCliPath rejects both kinds;
+    # the path pattern it replaced here only knew the first.
     if ($info.InstallLocation) {
         foreach ($rel in @('app\claude.exe', 'claude.exe')) {
             try {
@@ -318,7 +346,7 @@ function Get-ClaudeEnvironment {
             foreach ($rp in @(Get-Process -Name $info.ProcessName -ErrorAction SilentlyContinue)) {
                 try {
                     $cand = $rp.MainModule.FileName
-                    if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                    if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
                         $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'process'; break
                     }
                 } catch { $null = $_ }
@@ -330,7 +358,7 @@ function Get-ClaudeEnvironment {
             foreach ($wp in @(Get-CimInstance Win32_Process -Filter "Name LIKE '%claude%'" `
                               -ErrorAction SilentlyContinue)) {
                 $cand = "$($wp.ExecutablePath)"
-                if ($cand -and $cand -notmatch $cliPattern -and (Test-Path $cand)) {
+                if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
                     $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'wmi'; break
                 }
             }
@@ -394,33 +422,10 @@ function Get-ClaudeEnvironment {
     } catch { $null = $_ }
 
     # -- VM log selection ----------------------------------------------------
-    # Deliberately restricted to VM-relevant logs. main.log is excluded: it is
-    # the Electron main process log and it can sit frozen for a day at a time on
-    # a perfectly healthy machine, so keying staleness on it is a guaranteed
-    # false positive. Newest wins, and the age is recorded so a caller can
-    # reject a candidate that predates its own lookback window.
+    # See Get-ClaudeVmLogCandidates for which logs count and why.
     try {
         if ($info.LogDir -and (Test-Path $info.LogDir)) {
-            $cands = @()
-            foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
-                try {
-                    $p = Join-Path $info.LogDir $n
-                    if (Test-Path $p) {
-                        $fi = Get-Item $p -ErrorAction SilentlyContinue
-                        if ($fi) {
-                            $cands += [pscustomobject]@{
-                                Name          = $n
-                                Path          = $fi.FullName
-                                LastWriteTime = $fi.LastWriteTime
-                                AgeHours      = [math]::Round( `
-                                    ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
-                                Length        = $fi.Length
-                            }
-                        }
-                    }
-                } catch { $null = $_ }
-            }
-            $cands = @($cands | Sort-Object LastWriteTime -Descending)
+            $cands = @(Get-ClaudeVmLogCandidates -LogDir $info.LogDir)
             $info.VmLogCandidates = $cands
             if ($cands.Count -gt 0) { $info.VmLogFile = $cands[0].Path }
             else { $info.Warnings += "No VM log present in $($info.LogDir)" }
@@ -508,7 +513,7 @@ function Import-ClaudeEnvironment {
         if (-not $raw) { return $null }
         $obj = $raw | ConvertFrom-Json -ErrorAction Stop
         if (-not $obj) { return $null }
-        if ($obj.SchemaVersion -ne 1) { return $null }
+        if ($obj.SchemaVersion -ne 2) { return $null }
         if ($ExpectedPackageVersion -and
             "$($obj.PackageVersion)" -ne "$ExpectedPackageVersion") { return $null }
         return $obj
@@ -564,6 +569,411 @@ function Get-CoworkHcsGuids {
     }
     return @($found | Select-Object -Unique)
 }
+
+function Test-ClaudeCodeCliPath {
+    <#
+    .SYNOPSIS
+        True when an executable path is the Claude Code CLI, not the Claude
+        Desktop app.
+    .DESCRIPTION
+        Both run as a process named "claude". The CLI copies Claude Desktop
+        starts for Code sessions and project threads live in
+        claude-code\<version>\ under the app's data folder, which the path
+        pattern catches. A terminal install lives wherever its installer put
+        it, %USERPROFILE%\.local\bin on this machine, so the file's ProductName
+        decides the rest. Measured 2026-11-21 on app 6.18355: the app's
+        Claude.exe says "Claude", both CLI copies say "Claude Code".
+    #>
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    if ($Path -match '[\\/]claude-code[\\/]') { return $true }
+    try {
+        $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
+        if ($vi -and "$($vi.ProductName)" -eq 'Claude Code') { return $true }
+    } catch { $null = $_ }
+    return $false
+}
+
+function Get-ClaudeProcessInventory {
+    <#
+    .SYNOPSIS
+        Sorts every running process named "claude" into the desktop app and
+        everything else.
+    .DESCRIPTION
+        "claude" is not a unique process name. Measured 2026-11-21 on app
+        6.18355: 18 processes answered Get-Process -Name claude. 14 were the
+        desktop app, under the package InstallLocation. 3 were Claude Code CLI
+        processes the app had started for project threads, under
+        %LOCALAPPDATA%\Claude-Data\claude_<id>\claude-code\2.1.327\. 1 was a
+        terminal CLI in %USERPROFILE%\.local\bin. Every kill in this toolkit
+        stopped all 18.
+
+        A process is the desktop app when its executable sits under the package
+        InstallLocation, or under another version folder of the same package:
+        an update registers the new version while processes started from the
+        old folder are still running. With no package, the folder of the
+        discovered ClaudeExe stands in for InstallLocation. With neither, a
+        ProductName of "Claude" decides.
+
+        A process whose path cannot be read is not counted as the desktop app.
+        A process this function cannot place is not one the toolkit may kill.
+
+        Each result carries Process, Id, Path, Kind and IsDesktop. Kind is
+        desktop, cli, other or unknown.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+
+    $roots = @()
+    $siblingPattern = $null
+    try {
+        if ($Environment.InstallLocation) {
+            $loc = "$($Environment.InstallLocation)".TrimEnd('\')
+            $roots += $loc + '\'
+            # InstallLocation is <WindowsApps>\<Name>_<Version>_<Arch>_<ResourceId>_<PublisherId>
+            # and the family name is <Name>_<PublisherId>, so any version of
+            # this package matches <WindowsApps>\<Name>_*_<PublisherId>\.
+            $fam = "$($Environment.PackageFamilyName)"
+            $cut = $fam.LastIndexOf('_')
+            if ($cut -gt 0) {
+                $parent = Split-Path $loc -Parent
+                $siblingPattern = '^' + [regex]::Escape($parent + '\' + $fam.Substring(0, $cut) + '_') +
+                    '[^\\]*_' + [regex]::Escape($fam.Substring($cut + 1)) + '\\'
+            }
+        } elseif ($Environment.ClaudeExe -and -not (Test-ClaudeCodeCliPath "$($Environment.ClaudeExe)")) {
+            $dir = Split-Path "$($Environment.ClaudeExe)" -Parent
+            # A Squirrel install runs from <root>\app-<version>\ beside a
+            # <root>\Claude.exe stub, and an update adds a new app-<version>.
+            if ((Split-Path $dir -Leaf) -match '^app-\d') { $dir = Split-Path $dir -Parent }
+            $roots += $dir.TrimEnd('\') + '\'
+        }
+    } catch { $null = $_ }
+
+    $result = @()
+    $cimPaths = $null
+    $products = @{}
+    foreach ($p in @(Get-Process -Name $Environment.ProcessName -ErrorAction SilentlyContinue)) {
+        $path = $null
+        try { $path = $p.MainModule.FileName } catch { $null = $_ }
+        if (-not $path) {
+            # MainModule needs more access than the image name does. One CIM
+            # query answers for every process it could not read.
+            if ($null -eq $cimPaths) {
+                $cimPaths = @{}
+                try {
+                    $flt = "Name='$($Environment.ProcessName).exe'"
+                    foreach ($w in @(Get-CimInstance Win32_Process -Filter $flt -ErrorAction Stop)) {
+                        if ($w.ExecutablePath) { $cimPaths[[int]$w.ProcessId] = "$($w.ExecutablePath)" }
+                    }
+                } catch { $null = $_ }
+            }
+            if ($cimPaths.ContainsKey([int]$p.Id)) { $path = $cimPaths[[int]$p.Id] }
+        }
+
+        $kind = 'unknown'
+        if ($path) {
+            $kind = 'other'
+            if ($path -match '[\\/]claude-code[\\/]') { $kind = 'cli' }
+            else {
+                foreach ($r in $roots) {
+                    if ($path.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)) { $kind = 'desktop'; break }
+                }
+                if ($kind -eq 'other' -and $siblingPattern -and $path -match $siblingPattern) { $kind = 'desktop' }
+                if ($kind -eq 'other') {
+                    # Read once per distinct path: fourteen desktop processes
+                    # share one executable.
+                    if (-not $products.ContainsKey($path)) {
+                        $products[$path] = ''
+                        try {
+                            $products[$path] = "$((Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductName)"
+                        } catch { $null = $_ }
+                    }
+                    if ($products[$path] -eq 'Claude Code') { $kind = 'cli' }
+                    elseif ($roots.Count -eq 0 -and $products[$path] -eq 'Claude') { $kind = 'desktop' }
+                }
+            }
+        }
+        $result += [pscustomobject]@{
+            Process   = $p
+            Id        = $p.Id
+            Path      = $path
+            Kind      = $kind
+            IsDesktop = ($kind -eq 'desktop')
+        }
+    }
+    return $result
+}
+
+function Get-ClaudeDesktopProcess {
+    <#
+    .SYNOPSIS
+        The running Claude Desktop app processes, and no Claude Code CLI.
+    .DESCRIPTION
+        Use this for anything that kills Claude, and for anything that asks
+        whether the app is running before it does something. A check that only
+        holds a repair back because Claude looks busy may keep counting every
+        "claude" process: a busy CLI is a reason to wait as well.
+        Get-ClaudeProcessInventory says how the two are told apart.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+    return @(Get-ClaudeProcessInventory -Environment $Environment |
+             Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
+}
+
+function Get-ClaudeDataCandidates {
+    <#
+    .SYNOPSIS
+        Every folder that may hold the Claude Desktop app's data or its logs,
+        freshest first.
+    .DESCRIPTION
+        The app has moved its data before. Until app 6.18355 it kept everything
+        in %APPDATA%\Claude. Measured 2026-11-21 on 6.18355: %APPDATA%\Claude
+        holds only this toolkit's own files, the data root is
+        %LOCALAPPDATA%\Claude-Data\claude_<publisher id> (Preferences written
+        that minute), whose logs folder the app last wrote on 2026-08-21, and
+        the live logs are in %LOCALAPPDATA%\Claude\logs. A fixed path is wrong
+        on one build or the other, so every place the app is known to use is
+        listed and the caller takes the freshest.
+
+        DataRoots: each existing candidate folder. Newest is the latest write
+        among the app's own files in it (Preferences, Local State, config.json,
+        Network, Session Storage, window-state.json, lockfile). IsAppData is
+        true when it holds Preferences or Local State, which every Electron data
+        folder has. The toolkit's own files (watch-logs, fix-logs, launchers)
+        are not markers, so a folder does not look fresh because the toolkit
+        writes to it.
+
+        LogDirs: the logs folder of each candidate, where it exists. Newest is
+        the latest write to a *.log directly in it.
+
+        Cheap enough to call on every poll: Test-Path and one directory listing
+        per candidate, nothing recursive. Never throws.
+    .PARAMETER PackageFamilyName
+        The MSIX package family. Its LocalCache, where Windows redirects a
+        packaged app's AppData writes, is probed as well.
+    #>
+    param([string]$PackageFamilyName)
+
+    $bases = @()
+    if ($env:LOCALAPPDATA) { $bases += @{ Path = $env:LOCALAPPDATA; Tag = 'LOCALAPPDATA' } }
+    if ($env:APPDATA)      { $bases += @{ Path = $env:APPDATA;      Tag = 'APPDATA' } }
+    if ($PackageFamilyName -and $env:LOCALAPPDATA) {
+        $lc = Join-Path $env:LOCALAPPDATA "Packages\$PackageFamilyName\LocalCache"
+        $bases += @{ Path = (Join-Path $lc 'Local');   Tag = 'LocalCache\Local' }
+        $bases += @{ Path = (Join-Path $lc 'Roaming'); Tag = 'LocalCache\Roaming' }
+    }
+
+    $wanted = @()
+    if ($env:CLAUDE_USER_DATA_DIR) {
+        $wanted += @{ Path = $env:CLAUDE_USER_DATA_DIR; Source = 'CLAUDE_USER_DATA_DIR' }
+    }
+    foreach ($b in $bases) {
+        foreach ($n in @('Claude-Data', 'Claude-3p')) {
+            try {
+                $parent = Join-Path $b.Path $n
+                if (Test-Path -LiteralPath $parent -PathType Container) {
+                    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue)) {
+                        $wanted += @{ Path = $d.FullName; Source = "$($b.Tag)\$n" }
+                    }
+                }
+            } catch { $null = $_ }
+        }
+        $wanted += @{ Path = (Join-Path $b.Path 'Claude'); Source = "$($b.Tag)\Claude" }
+    }
+
+    $markers = @('Preferences', 'Local State', 'config.json', 'Network', 'Session Storage',
+                 'window-state.json', 'lockfile')
+    $roots = @()
+    $logs  = @()
+    $seen  = @{}
+    foreach ($w in $wanted) {
+        try {
+            $full = "$($w.Path)".TrimEnd('\')
+            if (-not $full -or $seen.ContainsKey($full.ToLowerInvariant())) { continue }
+            $seen[$full.ToLowerInvariant()] = $true
+            if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
+
+            $newest = $null
+            $isApp  = $false
+            foreach ($m in $markers) {
+                $mi = Get-Item -LiteralPath (Join-Path $full $m) -Force -ErrorAction SilentlyContinue
+                if (-not $mi) { continue }
+                if ($m -eq 'Preferences' -or $m -eq 'Local State') { $isApp = $true }
+                if ($null -eq $newest -or $mi.LastWriteTime -gt $newest) { $newest = $mi.LastWriteTime }
+            }
+            $roots += [pscustomobject]@{ Path = $full; Source = $w.Source; IsAppData = $isApp; Newest = $newest }
+
+            $ld = Join-Path $full 'logs'
+            if (Test-Path -LiteralPath $ld -PathType Container) {
+                $lnewest = $null
+                foreach ($f in @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -Force -ErrorAction SilentlyContinue)) {
+                    if ($null -eq $lnewest -or $f.LastWriteTime -gt $lnewest) { $lnewest = $f.LastWriteTime }
+                }
+                $logs += [pscustomobject]@{ Path = $ld; Source = $w.Source; Newest = $lnewest }
+            }
+        } catch { $null = $_ }
+    }
+
+    $byNewest = @{ Expression = { if ($_.Newest) { $_.Newest } else { [datetime]::MinValue } }; Descending = $true }
+    return [pscustomobject]@{
+        DataRoots = @($roots | Sort-Object -Property @{ Expression = { [int]$_.IsAppData }; Descending = $true }, $byNewest)
+        LogDirs   = @($logs | Sort-Object -Property $byNewest)
+    }
+}
+
+function Resolve-ClaudeDataPaths {
+    <#
+    .SYNOPSIS
+        Picks the app's data root and log folder out of
+        Get-ClaudeDataCandidates and names the folders the repairs act on.
+    .DESCRIPTION
+        DataRoot is the freshest candidate holding Preferences or Local State.
+        LogDir is the logs folder whose newest *.log was written last. The two
+        are chosen separately because they are not nested: on app 6.18355 the
+        data root is %LOCALAPPDATA%\Claude-Data\claude_<id> and the live logs
+        are in %LOCALAPPDATA%\Claude\logs.
+
+        VmCachePath, BundlePath, SessionsDir and CodeSessionsDir are named
+        folders under DataRoot. Measured 2026-11-21 on 6.18355, all four are
+        there: claude-code-vm, vm_bundles, local-agent-mode-sessions and
+        claude-code-sessions.
+
+        When no candidate qualifies, a path falls back to where it was before
+        6.2.0, under AppDataDir, and says so. Notes holds one line per choice
+        and one per candidate passed over; Get-ClaudeEnvironment adds them to
+        Warnings.
+
+        This toolkit's own state (fix-logs, watch-logs, watch-state.json, the
+        generated launchers) stays in AppDataDir whatever is chosen here.
+        Never throws: Get-ClaudeDataCandidates does not, and the rest is string
+        work.
+    .PARAMETER PackageFamilyName
+        Passed to Get-ClaudeDataCandidates for the MSIX LocalCache candidates.
+    .PARAMETER AppDataDir
+        The toolkit's folder, %APPDATA%\Claude, used only as the fallback.
+    #>
+    param(
+        [string]$PackageFamilyName,
+        [string]$AppDataDir
+    )
+
+    $stamp = { param($t) if ($t) { $t.ToString('yyyy-MM-dd HH:mm') } else { 'never' } }
+    $notes = @()
+    $c = Get-ClaudeDataCandidates -PackageFamilyName $PackageFamilyName
+
+    $dataRoot   = $null
+    $dataSource = $null
+    $appRoots   = @($c.DataRoots | Where-Object { $_.IsAppData })
+    if ($appRoots.Count -gt 0) {
+        $dataRoot   = $appRoots[0].Path
+        $dataSource = $appRoots[0].Source
+        $notes += "Data root: $dataRoot ($dataSource, app files last written $(& $stamp $appRoots[0].Newest))"
+        foreach ($o in @($appRoots | Select-Object -Skip 1)) {
+            $notes += "Data root passed over: $($o.Path) ($($o.Source), app files last written $(& $stamp $o.Newest))"
+        }
+    } elseif ($AppDataDir) {
+        $dataRoot   = $AppDataDir
+        $dataSource = 'fallback'
+        $notes += "No folder holding Preferences or Local State was found; the data root falls back to $AppDataDir"
+    }
+
+    $logDir    = $null
+    $logSource = $null
+    $liveLogs  = @($c.LogDirs | Where-Object { $_.Newest })
+    if ($liveLogs.Count -gt 0) {
+        $logDir    = $liveLogs[0].Path
+        $logSource = $liveLogs[0].Source
+        $notes += "Log folder: $logDir ($logSource, newest log $(& $stamp $liveLogs[0].Newest))"
+        foreach ($o in @($liveLogs | Select-Object -Skip 1)) {
+            $notes += "Log folder passed over: $($o.Path) ($($o.Source), newest log $(& $stamp $o.Newest))"
+        }
+    } elseif ($AppDataDir) {
+        $logDir    = Join-Path $AppDataDir 'logs'
+        $logSource = 'fallback'
+        $notes += "No logs folder holding a *.log was found; the log folder falls back to $logDir"
+    }
+
+    $under = { param($leaf) if ($dataRoot) { Join-Path $dataRoot $leaf } else { $null } }
+    return [pscustomobject]@{
+        DataRoot           = $dataRoot
+        DataRootSource     = $dataSource
+        LogDir             = $logDir
+        LogDirSource       = $logSource
+        VmCachePath        = (& $under 'claude-code-vm')
+        BundlePath         = (& $under 'vm_bundles')
+        SessionsDir        = (& $under 'local-agent-mode-sessions')
+        CodeSessionsDir    = (& $under 'claude-code-sessions')
+        DataRootCandidates = @($c.DataRoots | ForEach-Object {
+            '{0} ({1}, app data {2}, app files last written {3})' -f $_.Path, $_.Source, $_.IsAppData, (& $stamp $_.Newest)
+        })
+        LogDirCandidates   = @($c.LogDirs | ForEach-Object {
+            '{0} ({1}, newest log {2})' -f $_.Path, $_.Source, (& $stamp $_.Newest)
+        })
+        Notes              = @($notes)
+    }
+}
+
+function Get-ClaudeVmLogCandidates {
+    <#
+    .SYNOPSIS
+        The VM logs present in a Claude log folder, newest first.
+    .DESCRIPTION
+        Deliberately restricted to VM-relevant logs. main.log is excluded: it is
+        the Electron main process log and it can sit frozen for a day at a time
+        on a perfectly healthy machine, so keying staleness on it is a
+        guaranteed false positive. Newest wins, and the age is recorded so a
+        caller can reject a candidate that predates its own lookback window.
+
+        A function of its own since 6.2.0 so Watch can pick the VM log again
+        when the log folder moves under it. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $cands = @()
+    if (-not $LogDir) { return $cands }
+    foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
+        try {
+            $p = Join-Path $LogDir $n
+            if (Test-Path -LiteralPath $p) {
+                $fi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
+                if ($fi) {
+                    $cands += [pscustomobject]@{
+                        Name          = $n
+                        Path          = $fi.FullName
+                        LastWriteTime = $fi.LastWriteTime
+                        AgeHours      = [math]::Round( `
+                            ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
+                        Length        = $fi.Length
+                    }
+                }
+            }
+        } catch { $null = $_ }
+    }
+    return @($cands | Sort-Object LastWriteTime -Descending)
+}
+
+function Get-ClaudeVmLogAge {
+    <#
+    .SYNOPSIS
+        Seconds since any VM log in a Claude log folder was last written, or
+        $null when the folder holds none.
+    .DESCRIPTION
+        Reads every VM log, now. App 6.18355 writes two of them, and which one
+        is newest changes through the day: cowork_vm_node.log is the host side
+        (each boot, each Cowork command) and coworkd.log is the daemon inside
+        the VM (each command again, and a clock line every few hours). A
+        freshness test that read only the log that happened to be newest when
+        the script started could be reading the quiet one. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
+    if ($c.Count -eq 0) { return $null }
+    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
+}
 #endregion ClaudeEnv
 
 # -- Runtime discovery -----------------------------------------------
@@ -573,16 +983,20 @@ function Get-CoworkHcsGuids {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.1.1"
+$ToolkitVersion  = "6.2.0"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName
+# This toolkit's folder, %APPDATA%\Claude: fix-logs, the exe cache, the VHDX
+# backup. The app's own cache folders are under the discovered data root,
+# which on app 6.18355 is %LOCALAPPDATA%\Claude-Data\claude_<id>.
 $ClaudeAppData   = $script:ClaudeEnv.AppDataDir
 $VmCachePath     = $script:ClaudeEnv.VmCachePath
 $BundlePath      = $script:ClaudeEnv.BundlePath
 
-# Without the per-user data folder there is no cache to purge, no log to read
-# and nowhere to write a transcript, so there is nothing useful left to do.
+# Without the toolkit's folder there is nowhere to write a transcript or to
+# back the session data up to before a purge, so there is nothing useful left
+# to do.
 if (-not $ClaudeAppData) {
     Write-Host ""
     Write-Host "  [!] Could not locate the per-user Claude folder under %APPDATA%." -ForegroundColor Red
@@ -737,6 +1151,38 @@ public static class Win32Window {
 }
 '@
 
+# -- Stop the desktop app (shared function) ---------------------------
+function Stop-ClaudeDesktopApp {
+    <#
+    .SYNOPSIS
+        Stops the Claude Desktop app's processes and no other process named
+        claude, says how many others it left alone, and returns how many it
+        stopped.
+    .DESCRIPTION
+        "claude" is not a unique process name: the Claude Code CLI runs under
+        it too, for the app's project threads and for terminal sessions.
+        Get-ClaudeProcessInventory tells the app apart. The two escalations
+        after a relaunch kill through here; by then the relaunched app may
+        have started new CLI processes, and the log says how many were spared.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    $inventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+    $appProcs  = @($inventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
+    $spared    = @($inventory | Where-Object { -not $_.IsDesktop }).Count
+    $stopped   = 0
+    if ($appProcs.Count -gt 0 -and $PSCmdlet.ShouldProcess("$($appProcs.Count) Claude process(es)", "Stop")) {
+        $appProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+        $stopped = $appProcs.Count
+    }
+    if ($spared -gt 0) {
+        Log "Left $spared other process(es) named claude alone (Claude Code CLI, or not identifiable as the app)" `
+            -Colour DarkGray -Indent
+    }
+    return $stopped
+}
+
 # -- Find Claude.exe (shared function) -------------------------------
 function Find-ClaudeExe {
     <#
@@ -768,12 +1214,14 @@ function Find-ClaudeExe {
         return $script:CapturedClaudeExe
     }
 
-    # 1. Cached path from a previous run. The claude-code filter matters here
-    #    too: a cache written by an older build may hold the CLI path.
+    # 1. Cached path from a previous run. The CLI filter matters here too: a
+    #    cache written before 6.2.0 may hold a CLI path, because the old
+    #    Step 1 capture took the first process named claude and only knew the
+    #    claude-code folder, not the terminal install in .local\bin.
     if (Test-Path $ExePathCache) {
         try {
             $cached = (Get-Content $ExePathCache -Raw -ErrorAction Stop).Trim()
-            if ($cached -and $cached -notmatch '[\\/]claude-code[\\/]' -and (Test-Path $cached)) {
+            if ($cached -and -not (Test-ClaudeCodeCliPath $cached) -and (Test-Path $cached)) {
                 Log "Found (cached): $cached" -Colour DarkGray -Indent
                 return $cached
             }
@@ -794,7 +1242,7 @@ function Find-ClaudeExe {
                     $appPath = Join-Path $props.Path "Claude.exe"
                 }
             }
-            if ($appPath -and (Test-Path $appPath)) {
+            if ($appPath -and -not (Test-ClaudeCodeCliPath $appPath) -and (Test-Path $appPath)) {
                 Log "Found (App Paths): $appPath" -Colour DarkGray -Indent
                 return $appPath
             }
@@ -816,7 +1264,7 @@ function Find-ClaudeExe {
             if (-not $lnk) { continue }
             $shell  = New-Object -ComObject WScript.Shell
             $target = $shell.CreateShortcut($lnk.FullName).TargetPath
-            if ($target -and $target -notmatch '[\\/]claude-code[\\/]' -and (Test-Path $target)) {
+            if ($target -and -not (Test-ClaudeCodeCliPath $target) -and (Test-Path $target)) {
                 Log "Found (Start Menu shortcut): $target" -Colour DarkGray -Indent
                 return $target
             }
@@ -1329,7 +1777,8 @@ function Test-RecentHcsErrors {
     $hcsPatterns = @("HCS operation failed", "failed to create compute system",
                      "HcsWaitForOperationResult", "0x800707DE")
     # %ProgramData%\Claude does not exist on any current build, so the only
-    # live log directory is the per-user one that discovery resolved.
+    # live log directory is the one discovery resolved: the freshest logs
+    # folder, %LOCALAPPDATA%\Claude\logs on app 6.18355.
     $claudeLogDirs = @()
     if ($script:ClaudeEnv.LogDir) { $claudeLogDirs += $script:ClaudeEnv.LogDir }
     $recentLogs = @()
@@ -1660,6 +2109,12 @@ if (-not $script:IsAdmin) {
 if ($WhatIfPreference) {
     Log "DRY RUN, no changes will be made" -Colour Yellow
 }
+# Where this run reads the app's logs and finds its VM cache. Both were fixed
+# paths under %APPDATA%\Claude until 6.2.0, and on app 6.18355 neither is there,
+# so a run that found nothing to read or purge had no way to say why.
+# claude-env.json in fix-logs lists every candidate that was passed over.
+Log "App data : $($script:ClaudeEnv.DataRoot) ($($script:ClaudeEnv.DataRootSource))" -Colour DarkGray
+Log "App logs : $($script:ClaudeEnv.LogDir) ($($script:ClaudeEnv.LogDirSource))" -Colour DarkGray
 Write-Host ""
 
 # -- Close mode: clean shutdown only, no relaunch ----------------
@@ -1712,12 +2167,21 @@ if ($Close) {
     # torn down while Claude was still running and Claude simply recreated it a
     # moment later. The main repair path has always had this order right.
     Log "[2/5] Terminating Claude processes..." -Colour Yellow
-    $procs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    # The desktop app only. The Claude Code CLI runs as "claude" too, and this
+    # used to stop the copies running project threads and any terminal session
+    # along with the app. See Get-ClaudeProcessInventory.
+    $procInventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+    $procs = @($procInventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
+    $procsSpared = @($procInventory | Where-Object { -not $_.IsDesktop }).Count
     if ($procs.Count -gt 0) {
         $procs | Stop-Process -Force -ErrorAction SilentlyContinue
         Log "Killed $($procs.Count) Claude process(es)" -Colour Green -Indent
     } else {
         Log "No Claude processes found" -Colour DarkGray -Indent
+    }
+    if ($procsSpared -gt 0) {
+        Log "Left $procsSpared other process(es) named claude alone (Claude Code CLI, or not identifiable as the app)" `
+            -Colour DarkGray -Indent
     }
 
     # 3) Clean up any remaining HCS compute systems
@@ -1780,7 +2244,7 @@ if ($Close) {
     # 5) Verify clean state
     Log "[5/5] Verifying clean state..." -Colour Yellow
     Start-Sleep -Seconds 1
-    $remainingProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    $remainingProcs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
     $remainingSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     $remainingHcs = $false
     try {
@@ -1973,8 +2437,9 @@ if ($script:SelectedMode -eq "Diagnostic") {
     }
 
     # Claude processes
-    $diagProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
-    Log "  Claude procs  : $($diagProcs.Count) running" -Colour Cyan
+    $diagProcs = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+    $diagDesktop = @($diagProcs | Where-Object { $_.IsDesktop }).Count
+    Log "  Claude procs  : $diagDesktop app, $($diagProcs.Count - $diagDesktop) other (Claude Code CLI or unidentified)" -Colour Cyan
 
     # VM cache
     foreach ($cp in @(
@@ -2426,7 +2891,9 @@ if ($BootPrep) {
         if ($hcsList) {
             if ($hcsList -match "cowork-vm") {
                 # Distinguish stale VMs (from before reboot) from active ones
-                # If Claude is running and cowork-vm exists, it is likely active
+                # If Claude is running and cowork-vm exists, it is likely active.
+                # Every process named claude counts here, the CLI included: this
+                # only decides to leave the VM alone, and erring that way is safe.
                 $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
                 if ($claudeRunning) {
                     $activeWorkspace = $true
@@ -2491,7 +2958,9 @@ if ($BootPrep) {
 if ($Quiet) {
     $isActive = $false
 
-    # Check 1: Any Claude process burning CPU (active request processing)
+    # Check 1: Any Claude process burning CPU (active request processing).
+    # The Claude Code CLI counts as well: a busy project thread is a reason to
+    # hold the repair back, and the repair would end it.
     $claudeCheck = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
     foreach ($cp in $claudeCheck) {
         try {
@@ -2505,17 +2974,12 @@ if ($Quiet) {
 
     # Check 2: VM log active within 120s (Code may be thinking)
     #
-    # Discovery already ranked the VM logs by recency. The list this replaces
-    # led with C:\ProgramData\Claude\Logs\coworkd.log, on a hardcoded drive
-    # letter, in a tree that does not exist.
+    # Every VM log in the app's log folder, read now (Get-ClaudeVmLogAge). The
+    # list before discovery led with C:\ProgramData\Claude\Logs\coworkd.log, on
+    # a hardcoded drive letter, in a tree that does not exist.
     if (-not $isActive) {
-        $safetyVmLog = $script:ClaudeEnv.VmLogFile
-        if ($safetyVmLog -and (Test-Path $safetyVmLog)) {
-            try {
-                $ageSec = ((Get-Date) - (Get-Item $safetyVmLog).LastWriteTime).TotalSeconds
-                if ($ageSec -lt 120) { $isActive = $true }
-            } catch { $null = $_ }
-        }
+        $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeEnv.LogDir
+        if ($null -ne $ageSec -and $ageSec -lt 120) { $isActive = $true }
     }
 
     # Check 3: User input within 3 minutes (interactive sessions only)
@@ -2599,6 +3063,8 @@ if ($script:IsAdmin) {
             #
             # A VM belonging to a running Claude is dealt with by Step 5, after
             # the process is gone. BootPrep already draws this distinction.
+            # Every process named claude counts, the CLI included: this only
+            # decides to leave the VM alone until Step 5.
             $claudeUp = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
             if ($claudeUp) {
                 Log "cowork-vm present but Claude is running; leaving it for Step 5" -Colour DarkGray -Indent
@@ -2656,18 +3122,27 @@ if ($PurgeSessions) {
 }
 
 # ====================================================================
-# STEP 1 -- Kill all Claude processes
+# STEP 1 -- Kill the Claude Desktop app's processes
 # ====================================================================
 Log "[1/10] Terminating Claude processes..." -Colour Yellow
 
-$claudeProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+# The desktop app only. The Claude Code CLI runs as "claude" too: the copies the
+# app starts for project threads and Code sessions, and any terminal session.
+# This step used to kill all of them along with the app.
+$claudeInventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+$claudeProcs     = @($claudeInventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
+$claudeSpared    = @($claudeInventory | Where-Object { -not $_.IsDesktop }).Count
+if ($claudeSpared -gt 0) {
+    Log "Leaving $claudeSpared other process(es) named claude alone (Claude Code CLI, or not identifiable as the app)" `
+        -Colour DarkGray -Indent
+}
 if ($claudeProcs.Count -gt 0) {
     # Discovery already resolved this, preferring the package, which is the only
     # authoritative source for the DESKTOP app. Reading it off a live process is
     # a fallback, not the primary, because the Claude Code CLI also runs as a
-    # process named "claude" out of %APPDATA%\Claude\claude-code\<version>\.
-    # Latching onto one of those caches the CLI path and turns every later
-    # relaunch into a CLI start.
+    # process named "claude", out of claude-code\<version>\ under the app's data
+    # folder or out of a terminal install. Latching onto one of those caches the
+    # CLI path and turns every later relaunch into a CLI start.
     if ($script:CapturedClaudeExe) {
         Log "Exe path from discovery ($($script:ClaudeEnv.ClaudeExeSource)): $($script:CapturedClaudeExe)" `
             -Colour DarkGray -Indent
@@ -2675,7 +3150,7 @@ if ($claudeProcs.Count -gt 0) {
         foreach ($cp in $claudeProcs) {
             try {
                 $exeFromProc = $cp.MainModule.FileName
-                if ($exeFromProc -and $exeFromProc -notmatch '[\\/]claude-code[\\/]' -and
+                if ($exeFromProc -and -not (Test-ClaudeCodeCliPath $exeFromProc) -and
                     (Test-Path $exeFromProc)) {
                     $script:CapturedClaudeExe = $exeFromProc
                     Log "Captured exe path: $exeFromProc" -Colour DarkGray -Indent
@@ -2844,18 +3319,24 @@ try {
 # ====================================================================
 Log "[4/10] Checking for orphan processes..." -Colour Yellow
 
-$remaining = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.Name -eq $ProcessName) -or ($_.Name -eq $ServiceExe)
-})
+# The app's own processes and the service only. A Claude Code CLI process is not
+# an orphan of the app: it belongs to a project thread or a terminal session.
+$orphanInventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+$orphanSpared    = @($orphanInventory | Where-Object { -not $_.IsDesktop }).Count
+$remaining = @(@($orphanInventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process }) +
+               @(Get-Process -Name $ServiceExe -ErrorAction SilentlyContinue))
+if ($orphanSpared -gt 0) {
+    Log "Leaving $orphanSpared other process(es) named claude alone (Claude Code CLI, or not identifiable as the app)" `
+        -Colour DarkGray -Indent
+}
 if ($remaining.Count -gt 0) {
     if ($PSCmdlet.ShouldProcess("$($remaining.Count) orphan process(es)", "Force-kill")) {
         foreach ($proc in $remaining) {
             try { $proc | Stop-Process -Force -ErrorAction Stop } catch { $null = $_ }
         }
         Start-Sleep -Seconds 1
-        $stubborn = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
-            ($_.Name -eq $ProcessName) -or ($_.Name -eq $ServiceExe)
-        })
+        $stubborn = @(@(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv) +
+                      @(Get-Process -Name $ServiceExe -ErrorAction SilentlyContinue))
         if ($stubborn.Count -gt 0) {
             Log "[!] $($stubborn.Count) process(es) refuse to die, a reboot may be needed" -Colour Red -Indent
         } else {
@@ -3452,10 +3933,12 @@ if ($SkipLaunch) {
         if ($taskExists) {
             if ($PSCmdlet.ShouldProcess($elevTaskPath, "Launch (elevated task)")) {
                 Start-ScheduledTask -TaskName "LaunchClaudeAdmin" -TaskPath "\Claude\" -ErrorAction Stop
-                # Verify the task actually started something (give it 3 seconds)
+                # Verify the task actually started something (give it 3 seconds).
+                # The app, not any "claude": a Claude Code CLI process that
+                # survived Step 1 would otherwise read as a successful launch.
                 Start-Sleep -Seconds 3
-                $claudeProc = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
-                if ($claudeProc) {
+                $claudeProc = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
+                if ($claudeProc.Count -gt 0) {
                     Log "Launched elevated via scheduled task: $elevTaskPath" -Colour Green -Indent
                     $launched = $true
                 } else {
@@ -3543,7 +4026,8 @@ if ($SkipLaunch) {
     # STEP 9 -- Wait for Cowork workspace readiness (now Step 9/10)
     # ====================================================================
     # Detection strategy (in order of reliability):
-    #   A. Log file: cowork_vm_node.log -- "Startup complete" or "Keepalive"
+    #   A. VM logs: cowork_vm_node.log -- "Startup complete" or "Keepalive";
+    #      coworkd.log -- "connected, waiting for commands"
     #   B. Hyper-V VM state: Get-VM "claudevm" shows Running + heartbeat
     #   C. Log file: step markers like "guest_vsock_connect completed"
     #   D. File size stability fallback (last resort)
@@ -3554,75 +4038,90 @@ if ($SkipLaunch) {
 
     $vmReady = $false
 
-    # Discovery already selected the newest VM-relevant log at startup, and it
-    # records each candidate's age, so a stale file is reported rather than
-    # silently preferred.
+    # Every VM log in the app's log folder is read, each from where it stood
+    # when the wait began. App 6.18355 writes a boot to two of them in the
+    # same second: "[VM:start] Startup complete" and "[Keepalive] Starting"
+    # to cowork_vm_node.log, "[coworkd] connected, waiting for commands" to
+    # coworkd.log. This used to read only the log that was newest when the
+    # script started, which on 6.18355 is usually coworkd.log, and none of the
+    # markers below matched a boot there. A Smart run could then wait out its
+    # deadline on a VM that had come up, and escalate to Deep, which deletes
+    # the VM cache.
     #
-    # The list this replaces led with C:\ProgramData\Claude\Logs\coworkd.log.
+    # The list before discovery led with C:\ProgramData\Claude\Logs\coworkd.log.
     # That tree does not exist on any current build, the drive letter was
-    # hardcoded, and coworkd.log itself was last written in March.
-    $vmLogFile  = $script:ClaudeEnv.VmLogFile
-    $vmCandList = @($script:ClaudeEnv.VmLogCandidates)
-    if ($vmLogFile -and $vmCandList.Count -gt 0) {
-        Log "Using log file: $vmLogFile (last written $($vmCandList[0].AgeHours)h ago)" -Colour DarkGray -Indent
+    # hardcoded, and the coworkd.log in %APPDATA%\Claude\logs was last
+    # written in March. 6.18355 writes a new one in %LOCALAPPDATA%\Claude\logs.
+    $vmLogDir   = $script:ClaudeEnv.LogDir
+    $vmCandList = @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)
+    if ($vmCandList.Count -gt 0) {
         foreach ($cand in $vmCandList) {
-            if ($cand.Name -ne $vmCandList[0].Name -and $cand.AgeHours -gt 24) {
-                Log "Ignoring stale candidate $($cand.Name) ($($cand.AgeHours)h old)" -Colour DarkGray -Indent
-            }
+            Log "Reading VM log: $($cand.Path) (last written $($cand.AgeHours)h ago)" -Colour DarkGray -Indent
         }
     } else {
         Log "No VM log file found; readiness will rely on guest and HCS signals" -Colour DarkYellow -Indent
     }
 
-    # Safe size read for the chosen VM log. Returns 0 when no log was found,
-    # or when the file vanished between the existence test and the read, which
-    # would otherwise be a property access on $null under StrictMode.
-    function Get-VmLogSize {
-        if (-not $vmLogFile) { return [long]0 }
-        $item = Get-Item $vmLogFile -ErrorAction SilentlyContinue
-        if (-not $item) { return [long]0 }
-        return [long]$item.Length
+    # Where each VM log stands now, by path. A log that is missing here and
+    # appears later is read from its start. Never throws: the candidate list
+    # is built that way.
+    function Get-VmLogSizes {
+        $sizes = @{}
+        foreach ($cand in @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)) {
+            $sizes[$cand.Path] = [long]$cand.Length
+        }
+        return $sizes
     }
 
-    # Record the log file size at the START so we only check new entries
-    $logBaselineSize = Get-VmLogSize
+    # Record where each log stands at the START so we only check new entries
+    $logBaseline = Get-VmLogSizes
 
-    # Helper: check recent log entries for boot completion markers
+    # Helper: check the entries written to any VM log since the baseline for
+    # boot completion markers
     function Test-VmLogReady {
-        param([long]$Baseline)
-        # $vmLogFile is $null whenever no candidate log existed. Test-Path $null
-        # throws, and this call site sits outside the try below, so the throw
-        # unwound to the outer catch and abandoned every remaining step.
-        if (-not $vmLogFile -or -not (Test-Path $vmLogFile)) { return $null }
-        try {
-            $fi = Get-Item $vmLogFile -ErrorAction Stop
-            if ($fi.Length -le $Baseline) { return $null }
-            # Read only the new portion of the log
-            $stream = $null
-            $reader = $null
+        param([hashtable]$Baseline)
+        $newContent = ''
+        foreach ($cand in @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)) {
             try {
-                $stream = New-Object System.IO.FileStream(
-                    $vmLogFile, [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                $stream.Position = $Baseline
-                $reader = New-Object System.IO.StreamReader($stream)
-                $newContent = $reader.ReadToEnd()
-            } finally {
-                if ($reader) { try { $reader.Close() } catch { $null = $_ } }
-                if ($stream) { try { $stream.Close() } catch { $null = $_ } }
-            }
-            # Check for completion markers (most definitive first)
-            # Old markers (cowork_vm_node.log)
-            if ($newContent -match "Startup complete") { return "startup-complete" }
-            if ($newContent -match "\[Keepalive\]") { return "keepalive" }
-            if ($newContent -match "guest_vsock_connect completed") { return "vsock-connected" }
-            if ($newContent -match "sdk_install completed") { return "sdk-installed" }
-            # New markers (coworkd.log in ProgramData, v5.1.0)
-            if ($newContent -match "\[process:[0-9a-f-]+\] started PID") { return "process-started" }
-            if ($newContent -match "\[coworkd\] mounted .+ at /sessions/") { return "mounts-ready" }
-            if ($newContent -match "full egress mode enabled") { return "egress-ready" }
-            return $null
-        } catch { return $null }
+                $start = [long]0
+                if ($Baseline -and $Baseline.ContainsKey($cand.Path)) {
+                    $start = [long]$Baseline[$cand.Path]
+                }
+                # Shorter than at the baseline means the log was rotated, and
+                # everything in the new file is new.
+                if ([long]$cand.Length -lt $start) { $start = [long]0 }
+                if ([long]$cand.Length -le $start) { continue }
+                # Read only the new portion of the log
+                $stream = $null
+                $reader = $null
+                try {
+                    $stream = New-Object System.IO.FileStream(
+                        $cand.Path, [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    $stream.Position = $start
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $newContent += $reader.ReadToEnd() + "`n"
+                } finally {
+                    if ($reader) { try { $reader.Close() } catch { $null = $_ } }
+                    if ($stream) { try { $stream.Close() } catch { $null = $_ } }
+                }
+            } catch { $null = $_ }
+        }
+        if (-not $newContent) { return $null }
+        # Check for completion markers (most definitive first)
+        # cowork_vm_node.log
+        if ($newContent -match "Startup complete") { return "startup-complete" }
+        # coworkd.log's line for the same boot, in the same second
+        if ($newContent -match "\[coworkd\] connected, waiting for commands") { return "startup-complete" }
+        if ($newContent -match "\[Keepalive\]") { return "keepalive" }
+        if ($newContent -match "guest_vsock_connect completed") { return "vsock-connected" }
+        if ($newContent -match "sdk_install completed") { return "sdk-installed" }
+        # coworkd.log. The id is "oneshot-<uuid>" on 6.18355, which the
+        # hex-only pattern this used to be never matched.
+        if ($newContent -match "\[process:[^\]]+\] started PID") { return "process-started" }
+        if ($newContent -match "\[coworkd\] mounted .+ at /sessions/") { return "mounts-ready" }
+        if ($newContent -match "full egress mode enabled") { return "egress-ready" }
+        return $null
     }
 
     # Helper: check HCS compute system state via hcsdiag.
@@ -3765,7 +4264,7 @@ if ($SkipLaunch) {
                 # Guest reports connected but VM log hasn't caught up yet --
                 # give it a few more seconds then accept
                 Start-Sleep -Seconds 5
-                $logStatus = Test-VmLogReady -Baseline $logBaselineSize
+                $logStatus = Test-VmLogReady -Baseline $logBaseline
                 if ($logStatus) {
                     $vmReady = $true
                     Log "Workspace ready (guest connected + log: $logStatus)" -Colour Green -Indent
@@ -3787,9 +4286,7 @@ if ($SkipLaunch) {
                 Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 5
                 # Reset baseline so we check fresh log entries
-                if ($vmLogFile) {
-                    $logBaselineSize = Get-VmLogSize
-                }
+                $logBaseline = Get-VmLogSizes
                 Log "Service restarted, continuing to wait..." -Colour DarkGray -Indent
             } elseif ($guestState -eq "guest-error" -and $vmElapsed -ge 60) {
                 Log "[!] Guest connection errors detected in cowork-service.log" -Colour DarkYellow -Indent
@@ -3798,7 +4295,7 @@ if ($SkipLaunch) {
 
         # No-progress detector: if 60s in and nothing happening, escalate (v5.0.0)
         if ($vmElapsed -ge 60 -and -not $vmReady) {
-            $hasLogActivity = ($null -ne (Test-VmLogReady -Baseline $logBaselineSize))
+            $hasLogActivity = ($null -ne (Test-VmLogReady -Baseline $logBaseline))
             $hasGuestActivity = ($guestState -and $guestState -ne "no-polling")
             $hasHcsVm = $false
             try {
@@ -3813,8 +4310,8 @@ if ($SkipLaunch) {
                     $script:NoProgressEscalated = $true
                     Log "[!] No progress after ${vmElapsed}s, no log activity, no guest polling" -Colour Red -Indent
                     Log "Escalating: killing Claude, cleaning HCS, relaunching..." -Colour Yellow -Indent
-                    # Kill Claude
-                    Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Stop-Process -Force
+                    # Kill the app, not the Claude Code CLI processes beside it
+                    $null = Stop-ClaudeDesktopApp
                     Start-Sleep -Seconds 2
                     # Clean HCS
                     try { Close-StaleHcsVms -Action kill | Out-Null } catch { $null = $_ }
@@ -3825,9 +4322,7 @@ if ($SkipLaunch) {
                     Start-Sleep -Seconds 5
                     $null = Start-ClaudeDesktop
                     # Reset log baseline and timers
-                    if ($vmLogFile) {
-                        $logBaselineSize = Get-VmLogSize
-                    }
+                    $logBaseline = Get-VmLogSizes
                     # Don't reset vmElapsed -- let the outer timeout still apply
                     Log "Waiting for workspace after relaunch..." -Colour DarkGray -Indent
                     continue
@@ -3836,7 +4331,7 @@ if ($SkipLaunch) {
         }
 
         # A. Check log file for boot completion (new entries since baseline)
-        $logStatus = Test-VmLogReady -Baseline $logBaselineSize
+        $logStatus = Test-VmLogReady -Baseline $logBaseline
         if ($logStatus -in @("startup-complete", "keepalive", "process-started", "egress-ready")) {
             $vmReady = $true
             Log "Workspace ready (log: $logStatus)" -Colour Green -Indent
@@ -3844,33 +4339,38 @@ if ($SkipLaunch) {
         }
 
         # A2. Fallback: workspace may already be running (baseline captured after boot).
-        #     Check the tail of the log for recent boot markers regardless of baseline.
-        if (-not $logStatus -and $vmElapsed -ge 30 -and $vmLogFile -and (Test-Path $vmLogFile)) {
-            try {
-                $fi = Get-Item $vmLogFile -ErrorAction Stop
-                $recentlyWritten = ($fi.LastWriteTime -gt (Get-Date).AddMinutes(-3))
-                if ($recentlyWritten -and $fi.Length -gt 0) {
-                    $tailSize = [math]::Min($fi.Length, 8192)
+        #     Check the tail of each VM log written in the last 3 minutes for
+        #     boot markers, regardless of baseline.
+        if (-not $logStatus -and $vmElapsed -ge 30) {
+            foreach ($cand in @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)) {
+                try {
+                    $recentlyWritten = ($cand.LastWriteTime -gt (Get-Date).AddMinutes(-3))
+                    if (-not $recentlyWritten -or $cand.Length -le 0) { continue }
+                    $tailSize = [math]::Min([long]$cand.Length, 8192)
+                    $tailContent = ''
                     $stream = $null
                     $reader = $null
                     try {
                         $stream = New-Object System.IO.FileStream(
-                            $vmLogFile, [System.IO.FileMode]::Open,
+                            $cand.Path, [System.IO.FileMode]::Open,
                             [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                        $stream.Position = $fi.Length - $tailSize
+                        $stream.Position = [long]$cand.Length - $tailSize
                         $reader = New-Object System.IO.StreamReader($stream)
                         $tailContent = $reader.ReadToEnd()
                     } finally {
                         if ($reader) { try { $reader.Close() } catch { $null = $_ } }
                         if ($stream) { try { $stream.Close() } catch { $null = $_ } }
                     }
-                    if ($tailContent -match "Startup complete|\[Keepalive\]|started PID|full egress mode") {
+                    if ($tailContent -match "Startup complete|\[Keepalive\]|connected, waiting for commands|started PID|full egress mode") {
                         $vmReady = $true
-                        Log "Workspace ready (log tail: recently active with boot markers)" -Colour Green -Indent
                         break
                     }
-                }
-            } catch { $null = $_ }
+                } catch { $null = $_ }
+            }
+            if ($vmReady) {
+                Log "Workspace ready (log tail: recently active with boot markers)" -Colour Green -Indent
+                break
+            }
         }
 
         # B. Note once whether an HCS compute system exists at all.
@@ -3916,7 +4416,7 @@ if ($SkipLaunch) {
 
     if (-not $vmReady) {
         # Final check: if log has vsock-connected or sdk-installed, partially ready
-        $finalLog = Test-VmLogReady -Baseline $logBaselineSize
+        $finalLog = Test-VmLogReady -Baseline $logBaseline
         if ($finalLog) {
             Log "Workspace partially ready (log: $finalLog), may still be loading" -Colour Yellow -Indent
         } else {
@@ -3929,15 +4429,15 @@ if ($SkipLaunch) {
 # -- Smart mode: escalate to Deep if workspace didn't come up (v5.0.0) --
 if (-not $vmReady -and -not $SkipLaunch -and $script:IsAdmin -and
     $script:SelectedMode -eq "Smart" -and -not $script:DeepEscalated) {
-    # -SkipLaunch never enters the Step 9 branch, so $vmLogFile and
-    # $logBaselineSize below only exist when that branch ran. Without this
+    # -SkipLaunch never enters the Step 9 branch, so $vmLogDir and
+    # $logBaseline below only exist when that branch ran. Without this
     # guard, -SkipLaunch purged 13.5 GB and then died under StrictMode with
     # the cache already gone.
     $script:DeepEscalated = $true
     Log "" -Colour White
     Log "Smart mode: workspace not ready after quick fix, escalating to Deep" -Colour Yellow
-    # Phase 0: Kill Claude + HCS cleanup
-    Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Stop-Process -Force
+    # Phase 0: Kill the app (not the Claude Code CLI) + HCS cleanup
+    $null = Stop-ClaudeDesktopApp
     Start-Sleep -Seconds 2
     try { Close-StaleHcsVms -Action kill | Out-Null } catch { $null = $_ }
     # Phase 1: stop the service
@@ -3986,16 +4486,14 @@ if (-not $vmReady -and -not $SkipLaunch -and $script:IsAdmin -and
     $escalateElapsed = 0
     if ($relaunched) {
         Log "Waiting for workspace after deep escalation..." -Colour Yellow -Indent
-        if ($vmLogFile) {
-            $logBaselineSize = Get-VmLogSize
-        }
+        $logBaseline = Get-VmLogSizes
     } else {
         Log "Nothing was relaunched, so there is nothing to wait for" -Colour DarkYellow -Indent
     }
     while ($relaunched -and $escalateElapsed -lt $escalateTimeout) {
         Start-Sleep -Seconds 5
         $escalateElapsed += 5
-        $logStatus = Test-VmLogReady -Baseline $logBaselineSize
+        $logStatus = Test-VmLogReady -Baseline $logBaseline
         if ($logStatus -in @("startup-complete", "keepalive", "process-started", "egress-ready")) {
             $vmReady = $true
             Log "Workspace ready after deep escalation ($logStatus)" -Colour Green -Indent
@@ -4030,14 +4528,14 @@ if (-not $vmReady -and -not $SkipLaunch) {
             # Reset the baseline after the restart. Without this the loop below
             # re-reads content written before this retry began and treats it as
             # evidence that the retry worked.
-            $logBaselineSize = Get-VmLogSize
+            $logBaseline = Get-VmLogSizes
 
             # Wait up to 60s for workspace
             $retryElapsed = 0
             while ($retryElapsed -lt 60) {
                 Start-Sleep -Seconds 5
                 $retryElapsed += 5
-                $retryStatus = Test-VmLogReady -Baseline $logBaselineSize
+                $retryStatus = Test-VmLogReady -Baseline $logBaseline
                 # The same four definitive markers the main loop requires. This
                 # used to accept ANY non-null marker, so a partial signal such
                 # as sdk-installed reported a failed fix as a success and
@@ -4075,7 +4573,7 @@ Write-Host "  +-------------------------------------------+" -ForegroundColor Gr
 Write-Host ""
 
 $fSvc   = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-$fProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+$fProcs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
 $svcOk  = $fSvc -and $fSvc.Status -eq "Running"
 
 $svcStatusText  = "Not found"
@@ -4085,7 +4583,7 @@ if ($fSvc) {
     if ($svcOk) { $svcStatusColor = "Green" }
 }
 Write-Host "  VM Service:       $svcStatusText" -ForegroundColor $svcStatusColor
-Write-Host "  Claude processes: $($fProcs.Count) active" -ForegroundColor Cyan
+Write-Host "  Claude processes: $($fProcs.Count) active (app only)" -ForegroundColor Cyan
 
 # If the service can never start, say so here rather than leaving the reader
 # to guess from an "sc start" error code.

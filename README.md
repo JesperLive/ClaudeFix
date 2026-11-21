@@ -148,7 +148,7 @@ The underlying HCS error (`failed to create compute system: HcsWaitForOperationR
 
 ### Guest Connection Timeout
 
-A third class of failure occurs after the VM boots but the guest operating system never establishes its connection back to the host. Claude Desktop polls `cowork-svc.exe` via a named pipe (`\\.\pipe\cowork-vm-service`) every ~1 second with `isGuestConnected` RPC calls. If the guest never reports as connected, the UI shows `"Request timed out: isGuestConnected"`. This can be caused by: the VM booting but vsock/networking failing to initialise, `cowork-svc.exe` being CPU-starved by its own Authenticode signature verification loop (each poll re-hashes the 204 MB `claude.exe` binary, consuming ~960ms per call), or HCS state corruption preventing guest-host communication. The service log at `%APPDATA%\Claude\logs\cowork-service.log` records each RPC call. See issue #31848 for the Authenticode CPU burn.
+A third class of failure occurs after the VM boots but the guest operating system never establishes its connection back to the host. Claude Desktop polls `cowork-svc.exe` via a named pipe (`\\.\pipe\cowork-vm-service`) every ~1 second with `isGuestConnected` RPC calls. If the guest never reports as connected, the UI shows `"Request timed out: isGuestConnected"`. This can be caused by: the VM booting but vsock/networking failing to initialise, `cowork-svc.exe` being CPU-starved by its own Authenticode signature verification loop (each poll re-hashes the 204 MB `claude.exe` binary, consuming ~960ms per call), or HCS state corruption preventing guest-host communication. The service log `cowork-service.log` in the app's log folder (see [Where the app keeps its files](#where-the-app-keeps-its-files)) records each RPC call. See issue #31848 for the Authenticode CPU burn.
 
 Note that on current builds this file has not been written since March. The toolkit checks its age before parsing it, so a stale copy is ignored rather than mined for answers about the last 60 seconds.
 
@@ -209,15 +209,15 @@ The menu is skipped when:
 | Step | Action |
 |------|--------|
 | 0 | Pre-emptive HCS state cleanup (stale cowork-vm entries) and session file housekeeping (>7 days) |
-| 1 | Captures Claude.exe path, then force-kills all claude.exe processes |
+| 1 | Captures Claude.exe path, then force-kills the Claude Desktop app's processes. Claude Code CLI processes, also named `claude.exe`, are left running (since 6.2.0) |
 | 2 | Stops CoworkVMService (graceful with admin, force-kill without) |
 | 3 | Checks for HCS errors and restarts vmcompute service if needed; escalates to vmms and HvHost (Deep mode only) |
-| 4 | Verifies no orphan processes remain |
+| 4 | Verifies no orphan app or service processes remain |
 | 5 | Kills orphan HCS compute systems via hcsdiag, and hung vmwp.exe processes |
 | 6 | Smart cache purge: backs up session VHDXs, nukes VM cache, restores session data; cleans temp files and legacy paths |
 | 7 | Restarts CoworkVMService (admin) or defers to Claude auto-restart (non-admin); restores VHDX backups |
 | 8 | Relaunches Claude Desktop with elevated privileges via scheduled task (Method 0), falling back to MSIX shell protocol or direct exe launch |
-| 9 | Watches the newest VM log for boot completion and hcsdiag for instance state, confirms workspace is ready |
+| 9 | Watches every VM log for boot completion and hcsdiag for instance state, confirms workspace is ready |
 
 **Step 8** first attempts to relaunch Claude with elevated privileges via the `LaunchClaudeAdmin` scheduled task created by Prevent (Method 0). This gives Claude a full admin token without a UAC prompt. If the task doesn't exist or fails, it falls through to three standard methods: Method A launches MSIX installs via `shell:AppsFolder` protocol (no duplicate taskbar icons), Method B launches traditional `.exe` installs directly, and Method C uses Start Menu shortcuts as a last resort. All methods respect `-WhatIf` and each has a `$launched` guard to prevent double-launch.
 
@@ -276,6 +276,30 @@ deep purge, and restoring it would put back whatever was wrong with it. That
 ### Diagnostics
 
 Each run writes a timestamped log to `%APPDATA%\Claude\fix-logs\`. The health monitor logs to `%APPDATA%\Claude\watch-logs\`. Recent CoworkVMService errors from the Windows Event Log are shown in the summary.
+
+### Where the app keeps its files
+
+The toolkit's own files stay in `%APPDATA%\Claude`: `fix-logs`, `watch-logs`,
+`watch-state.json` and the support bundles. The app's own files have moved
+between versions, so from 6.2.0 the toolkit looks for them instead of
+assuming a folder:
+
+| Version | App logs | App data (VM cache, bundles, sessions) |
+|---|---|---|
+| Before 6.18355 | `%APPDATA%\Claude\logs` | `%APPDATA%\Claude` |
+| 6.18355 (measured 2026-11-21) | `%LOCALAPPDATA%\Claude\logs` | `%LOCALAPPDATA%\Claude-Data\claude_<id>` |
+
+Every folder the app has used is a candidate: `Claude-Data\*`, `Claude-3p\*`
+and `Claude` under `%LOCALAPPDATA%` and `%APPDATA%`, the MSIX package's
+`LocalCache` copies of both, and `CLAUDE_USER_DATA_DIR` when it is set. The
+data root is the freshest candidate holding `Preferences` or `Local State`,
+and the log folder is the candidate whose newest log was written last. When
+nothing is found, both fall back to `%APPDATA%\Claude`, the pre-6.2.0
+behaviour. The choice and every candidate passed over are written to
+`Warnings` in `fix-logs\claude-env.json`, Fix prints both folders at the top
+of its log, and the health monitor prints them in its startup banner, looks
+again every ten minutes and whenever the app starts, and logs a line when
+either folder moves.
 
 **Support bundles.** `-Mode Diagnostic` changes nothing and, at the end, writes a zip you can attach to a bug report:
 
@@ -365,18 +389,18 @@ Two corrections here, both from the 6.0.x audit. Every version before 6.0.0 call
 
 **Time synchronisation** (step 19): If the host clock drifts more than 5 seconds from NTP, Hyper-V's time synchronisation integration service can't correct the guest clock. This causes TLS certificate validation failures and API timeouts inside the VM. The script checks the W32Time service, measures actual drift, and forces a resync if needed. The health monitor continues to check every 5 minutes.
 
-**Antivirus exclusions** (step 20): Antivirus filter drivers sit in the I/O path between VirtioFS and the host filesystem. They can delay or block disk operations that VirtioFS depends on, causing timeouts and mount failures. For Windows Defender, the script automatically adds exclusions for Claude's data directory, Hyper-V binaries, and the CoworkVMService process. For third-party AV products, it lists the recommended exclusion paths for you to add manually.
+**Antivirus exclusions** (step 20): Antivirus filter drivers sit in the I/O path between VirtioFS and the host filesystem. They can delay or block disk operations that VirtioFS depends on, causing timeouts and mount failures. When Windows Defender is the only antivirus it finds, the script adds path exclusions for the app's data root (see [Where the app keeps its files](#where-the-app-keeps-its-files)), the Hyper-V folder, `vmwp.exe` and `vmms.exe`, and process exclusions for `vmwp.exe`, `vmms.exe`, `vmcompute.exe` and the CoworkVMService, each only if no existing exclusion covers it. An existing path exclusion covers a path when it is the same path, a folder above it, or a wildcard that matches it, so an exclusion for the app's own `%LOCALAPPDATA%\Claude` does not count for `%LOCALAPPDATA%\Claude-Data` beside it. For third-party AV products, it lists the recommended exclusion paths for you to add manually.
 
 ### The Health Monitor
 
 A persistent background process that starts at logon and polls every 30 seconds.
 
-1. **Claude log files**: scans the newest VM log for known error strings. The log is chosen by write time rather than by a fixed preference order, and `main.log` is deliberately excluded: it can sit frozen for a day on a perfectly healthy machine.
+1. **Claude log files**: scans every `*.log` in the app's log folder for known VirtioFS error strings, reading only what each file has gained since the last poll. A file seen for the first time is read from its current end, so old errors are not replayed.
 2. **Service status**: detects when `CoworkVMService` stops while Claude is still running (2 consecutive checks)
 3. **Windows Event Log**: checks for Claude-specific `CoworkVMService` errors and Hyper-V Worker/VMMS errors (2 consecutive checks, whole message examined, not just the first line)
 4. **WinNAT health**: reports a missing NAT rule (every 60 seconds, warning only)
 5. **Workspace storage**: checks that the VM cache is readable and its volume has room (warning only)
-6. **VM log staleness**: catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if the VM was previously active)
+6. **VM log staleness**: catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if the VM was previously active). Every VM log is read on each poll, and `main.log` is not one: it can sit frozen for a day on a perfectly healthy machine.
 7. **Clock drift**: checks NTP drift every 5 minutes and auto-resyncs if >5 seconds (warning only)
 8. **vmcompute health**: monitors `vmcompute.exe` handle count every 60 seconds. Warning at 12000, trigger at 20000, 2 consecutive checks required
 9. **HCS state health**: watches for stale cowork-vm entries via hcsdiag and tracks 0xC037010D shutdown failure frequency. Kills stale instances, keeping the live one, and restarts vmcompute if more than 15 shutdown failures occur within 5 minutes. Guarded by active-session detection and a check for a running Fix
@@ -400,7 +424,7 @@ The entire toolkit is designed to **never interrupt active work**, whether you'r
 
 - **Electron-aware activity detection**: uses `GetWindowThreadProcessId` to correctly detect Claude's Electron renderer windows (the old `MainWindowHandle` comparison failed because Electron child processes own the visible window, not the main process)
 - **Session 0 safe**: when running as a SYSTEM scheduled task (Session 0), Win32 window/input APIs return garbage. The monitor detects this and falls back to process-only heuristics (VM log + CPU sampling)
-- **Claude Code session awareness**: detects active Code sessions via session persistence files and renderer logs (`unknown-window*.log`, `claude.ai-web*.log`). Code runs inside Claude Desktop but doesn't use the Cowork VM, so VM staleness is expected and normal during Code usage. Without this check, the monitor could kill an active Code session while trying to fix a "stale" VM that was never needed
+- **Claude Code session awareness**: detects active Code sessions via Claude Code's own transcripts (`%USERPROFILE%\.claude\projects\**\*.jsonl`, or under `CLAUDE_CONFIG_DIR`), the app's session persistence files, and its logs (`unknown-window*.log`, `claude.ai-web*.log`, `remote-control*.log`). A session file or log counts when written in the last 10 minutes, a transcript in the last 35: a tool call writes nothing to the transcript while it runs, and a foreground command may run for 30 minutes. The transcripts are the signal that keeps up: measured 2026-11-21, two working project threads had written theirs that minute while the app's session file and logs were 13 to 38 minutes old. A terminal Claude Code session counts too, which only delays a repair by two minutes at a time. Code runs inside Claude Desktop but doesn't use the Cowork VM, so VM staleness is expected and normal during Code usage. Without this check, the monitor could kill an active Code session while trying to fix a "stale" VM that was never needed
 - **Extended CPU sampling**: the 30s grace period re-check now takes 3 samples x 1s (was 1 x 500ms) with a lower threshold (50ms, was 100ms). Code has bursty CPU with long near-zero periods during API waits; the wider sampling window catches these patterns
 - **CPU sampling**: measures actual processor time on Claude processes over 500ms. Catches active request processing even when the UI is idle (e.g., Code thinking)
 - **Extended VM log window**: activity check uses 120s window (was 30s). Code's "thinking" phases can leave the VM log quiet for minutes; the old 30s window caused false negatives
@@ -533,7 +557,7 @@ The VM booted but the guest OS did not connect back to the host. Run `Fix-Claude
 The fix script auto-cleans logs older than 30 days. You can safely delete everything in that folder manually if needed.
 
 **Claude vanishes the moment the agent uses the in-app Browser**
-That is the GPU-process crash in [#80444](https://github.com/anthropics/claude-code/issues/80444). Check `%APPDATA%\Claude\logs\main.log` for `GPU process gone` with `exitCode: 101457950`, and `unknown-window.log` for a burst of `WebGL: INVALID_ENUM: getInternalformatParameter` warnings a second or two earlier. Run `Prevent-ClaudeIssues.bat` and launch from the "Claude (no GPU)" shortcut it creates. If that does not hold, avoid the in-app Browser pane on this build and use a real browser window for testing.
+That is the GPU-process crash in [#80444](https://github.com/anthropics/claude-code/issues/80444). Check `main.log` in the app's log folder (`%LOCALAPPDATA%\Claude\logs` on app 6.18355; see [Where the app keeps its files](#where-the-app-keeps-its-files)) for `GPU process gone` with `exitCode: 101457950`, and `unknown-window.log` for a burst of `WebGL: INVALID_ENUM: getInternalformatParameter` warnings a second or two earlier. Run `Prevent-ClaudeIssues.bat` and launch from the "Claude (no GPU)" shortcut it creates. If that does not hold, avoid the in-app Browser pane on this build and use a real browser window for testing.
 
 **The script says Virtual Machine Platform is disabled, but Hyper-V is on**
 Those are different Windows features and both statements can be true at once. Run `Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform` to check the one that matters; a `*Hyper-V*` search cannot return it. That said, from v6.0.3 the script only names this feature as a cause when `vmcompute` and `hns` are genuinely missing, because full Hyper-V supplies the same underlying stack and Cowork runs perfectly well on it. If an earlier version told you to enable a feature and restart, and Cowork was working before that, you did not need to.
@@ -548,7 +572,7 @@ Clean shutdown without repair. Double-click `Stop-ClaudeDesktop.bat` when you wa
 
 1. Stops `CoworkVMService` gracefully (waits up to 45s for the VM to shut down)
 2. Cleans any remaining HCS compute systems
-3. Kills all Claude Desktop UI processes
+3. Kills the Claude Desktop app's processes, leaving Claude Code CLI processes running
 4. Restarts the service in idle state (ready for next launch)
 5. Verifies clean state
 
@@ -578,7 +602,7 @@ After a reboot, Claude Desktop may briefly close and reopen itself on the first 
 
 **This does not affect functionality.** No data is lost, no settings are changed, and the workspace starts correctly. ClaudeFix's BootPrep mode prevents the more serious `0x800707DE` construct failure; the close-reopen is a separate Claude Desktop bug that cannot be fixed externally.
 
-Relevant log pattern in `%APPDATA%\Claude\logs\cowork_vm_node.log`:
+Relevant log pattern in `cowork_vm_node.log`, in the app's log folder (see [Where the app keeps its files](#where-the-app-keeps-its-files)):
 ```
 [VM:start] Beginning startup, VM instance ID: ...
 [VM:start] Beginning startup, VM instance ID: ...  (duplicate)

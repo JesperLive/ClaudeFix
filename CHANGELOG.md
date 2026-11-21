@@ -8,6 +8,168 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.2.0] - 2026-11-21
+
+Read "Repairs that could not run before can run now" below before you pull
+this onto a machine where the health monitor or the boot-fix task runs. Both
+run the scripts straight from this folder, so pulling is deploying.
+
+### Fixed
+
+- A repair no longer ends every Claude Code session on the machine.
+
+  "claude" is not a unique process name. Measured 2026-11-21 on app 6.18355:
+  18 processes answered to it, 14 of them the desktop app, 3 Claude Code CLI
+  processes the app had started for project threads, and 1 a CLI in a
+  terminal. Every kill in the toolkit stopped all 18. Fix's Step 1, `-Close`,
+  the orphan sweep and both escalations now stop only processes whose image
+  is under the app's package install folder (or the discovered `claude.exe`'s
+  install root), and say how many other `claude` processes they left alone.
+  The launch check, the remaining-process check and the closing summary count
+  the app only, so a surviving CLI no longer reads as a successful launch.
+
+- A relaunch starts the app, not the terminal CLI.
+
+  The old Step 1 cached the exe of the first process named `claude`, and the
+  cache check only knew the CLI by its `claude-code` folder, so a cache
+  written while a terminal CLI ran first could hold `.local\bin\claude.exe`
+  and every relaunch would start the CLI. The cached path, the App Paths key
+  and the Start Menu shortcut are now each refused when they name the CLI by
+  folder or by product name, and a refused cache is deleted.
+
+- The health monitor sees the app quit while a CLI is running.
+
+  With every `claude` counted, a live CLI kept "Claude is running" true after
+  the app had gone, so the exit was never logged, a stealth update was never
+  relaunched, the checks ran against an absent app, and every thread wake read
+  as an app launch that deferred repairs. The running test, its startup seed,
+  the service check and the startup deferral now count the app only. The
+  checks that only hold a repair back (user activity, the pre-fix recheck,
+  the vmcompute spike guard) still count every `claude` process.
+
+- The Claude Code guard finds a running session again.
+
+  `Test-ClaudeCodeActive` keeps the monitor from repairing the app under a
+  working Code session. It looked in `%APPDATA%\Claude\claude-code-sessions`
+  and `%APPDATA%\Claude\logs`, and on app 6.18355 neither is written, so it
+  answered "no session" with one running. It now searches every candidate
+  data root, recursively, and every candidate log folder written in the last
+  ten minutes, and counts `remote-control.log` as a session too.
+
+  Those are files the app writes about a session, and it does not write them
+  while the session works: measured 2026-11-21, two working project threads
+  had written their transcripts that minute while the newest session file was
+  16 minutes old and the logs 13 to 38. The guard now also reads Claude
+  Code's own transcripts, any `*.jsonl` under `%USERPROFILE%\.claude\projects`
+  (or `CLAUDE_CONFIG_DIR`) written in the last 35 minutes. Run on that
+  machine, the old guard answered no and the new one yes. A terminal Claude
+  Code session counts as well, which delays a repair by two minutes at a
+  time.
+
+  The window is 35 minutes because a tool call writes nothing to the
+  transcript while it runs, and a foreground command may run for 30.
+  Measured 2026-11-21 in one project thread: three Bash calls of 25 minutes
+  each, nothing written during the first two. On the transcripts alone, a
+  10-minute window answered "no session" from minute 10 of each. The cost is
+  that a repair waits up to 35 minutes after the last Claude Code activity.
+
+- The app's logs, VM cache, bundles and session folders are found where the
+  app keeps them.
+
+  They were fixed paths under `%APPDATA%\Claude`. App 6.18355 writes its logs
+  to `%LOCALAPPDATA%\Claude\logs` and its data to
+  `%LOCALAPPDATA%\Claude-Data\claude_<id>`, and `%APPDATA%\Claude` holds only
+  this toolkit's own files. The log scan read a folder nobody wrote, the VM
+  log check had no file, and Fix's cache backup and purge pointed at a folder
+  that did not exist. Discovery now picks the freshest candidate for each; see
+  "Where the app keeps its files" in the README. The toolkit's own files
+  (`fix-logs`, `watch-logs`, `watch-state.json`) stay in `%APPDATA%\Claude`.
+
+- Prevent's generated launchers leave the CLI alone. The "Claude (no GPU)"
+  launcher closes only the app, and the admin launcher's already-running test
+  skips the CLI. Its third way of finding the exe, reading it off a running
+  `claude` process, is gone: it only ran when the app was not running, so it
+  could only find the CLI. Run Prevent again to regenerate both.
+
+- Every VM log is read, each in its own format.
+
+  App 6.18355 writes a VM boot to two logs in the same second:
+  `cowork_vm_node.log` gets "Startup complete" and "[Keepalive] Starting",
+  `coworkd.log` gets "connected, waiting for commands", with slashes in its
+  dates. The checks read only the VM log that was newest when the script
+  started, which is usually `coworkd.log`, and looked in it for the node
+  log's markers. Fix's wait for the VM after a restart therefore saw none of
+  its readiness markers, and a Smart repair could wait out its deadline on a
+  VM that had booted and escalate to Deep, which deletes the VM cache. The
+  monitor's Cowork guard, which holds a repair back while a Cowork session
+  waits on the model, always answered "no session". The monitor's VM log
+  freshness checks kept reading the file named at startup after the other
+  log had become the newer one.
+
+  Fix now reads every VM log from where each stood when the wait began,
+  reads a log that was rotated or that appeared during the wait from its
+  start, and knows coworkd's boot line and its process starts, whose id is
+  now `oneshot-<uuid>` and never matched the old hex-only pattern. The
+  Cowork guard reads `cowork_vm_node.log` by name, and the freshness checks
+  read every VM log on each poll. Fed the same log lines, the code before
+  this fix answered "no session" and saw no boot at all.
+
+### Changed
+
+- The health monitor looks for the app's folders again every ten minutes and
+  whenever the app starts, and logs a line when the data root, the log folder
+  or the VM log moves. A fallback answer is never followed. Its startup banner
+  shows the log folder and the data root, each with how it was found.
+
+- Fix prints the app's data root and log folder at the top of its log.
+
+- The stealth-update marker is looked for in the data root, where the app's
+  userData now is. That location is inferred from the 6.18355 layout, not
+  seen during a real stealth update.
+
+- Prevent's storage check and its Defender exclusion use the app's data root.
+  Running Prevent adds an exclusion for `%LOCALAPPDATA%\Claude-Data\claude_<id>`
+  on a 6.18355 machine; the old `%APPDATA%\Claude` exclusion is not removed.
+
+  An existing exclusion now counts only when it is the same path, a folder
+  above it, or a wildcard that matches it. The old test compared the start of
+  the string, so an exclusion for the app's own `%LOCALAPPDATA%\Claude`
+  counted for `%LOCALAPPDATA%\Claude-Data` beside it, and an empty entry
+  counted for everything. Measured 2026-11-21: a machine with that exclusion,
+  where the old test would never have added the data root. The process
+  exclusions are now checked on every run; they were only looked at when a
+  path exclusion was missing.
+
+- `claude-env.json` is schema version 2: it gains `DataRoot`, `LogDir`, how
+  each was found, the VM-cache, bundle and session folders under the data
+  root, and the candidates passed over. `Import-ClaudeEnvironment` refuses a
+  version 1 file.
+
+- CI: the kill check parses the three scripts and the scripts they generate,
+  instead of matching one line at a time, and follows a process lookup through
+  a variable or a foreach. Run on 0aa8d07 it finds all six broad kills, where
+  the line check found the two escalations only, and it proves itself against
+  copies of those kills on every run. The launcher check builds the "Claude
+  (no GPU)" launcher from Prevent's own source and runs its process filter
+  against fake processes, instead of testing a hand copy that had drifted.
+
+### Repairs that could not run before can run now
+
+The path fix re-arms checks that pointed at empty folders:
+
+- The log scan reads live logs again, so a VirtioFS or HCS error there can
+  start an automatic repair. New log files are read from their current end,
+  so the backlog is not replayed.
+- The VM log checks have files to read, and Fix's wait for the VM after a
+  restart reads every one of them (see above).
+- A deep or escalated Fix backs up and purges the real VM cache. Measured
+  2026-11-21 that is about 18 GB under
+  `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude-code-vm`: `rootfs.vhdx`
+  (8.6 GB) is deleted and re-downloaded, `sessiondata.vhdx` (9.7 GB) is
+  backed up to `fix-logs\vhdx-backup` and restored. Check the free space on
+  the drive holding `%APPDATA%` before a deep purge.
+- A stealth-update relaunch can fire again.
+
 ## [6.1.1] - 2026-10-09
 
 ### Fixed
