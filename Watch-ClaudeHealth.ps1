@@ -685,6 +685,107 @@ function Get-ClaudeDesktopProcess {
     return @(Get-ClaudeProcessInventory -Environment $Environment |
              Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
 }
+
+function Get-ClaudeDataCandidates {
+    <#
+    .SYNOPSIS
+        Every folder that may hold the Claude Desktop app's data or its logs,
+        freshest first.
+    .DESCRIPTION
+        The app has moved its data before. Until app 6.18355 it kept everything
+        in %APPDATA%\Claude. Measured 2026-11-21 on 6.18355: %APPDATA%\Claude
+        holds only this toolkit's own files, the data root is
+        %LOCALAPPDATA%\Claude-Data\claude_<publisher id> (Preferences written
+        that minute), whose logs folder the app last wrote on 2026-08-21, and
+        the live logs are in %LOCALAPPDATA%\Claude\logs. A fixed path is wrong
+        on one build or the other, so every place the app is known to use is
+        listed and the caller takes the freshest.
+
+        DataRoots: each existing candidate folder. Newest is the latest write
+        among the app's own files in it (Preferences, Local State, config.json,
+        Network, Session Storage, window-state.json, lockfile). IsAppData is
+        true when it holds Preferences or Local State, which every Electron data
+        folder has. The toolkit's own files (watch-logs, fix-logs, launchers)
+        are not markers, so a folder does not look fresh because the toolkit
+        writes to it.
+
+        LogDirs: the logs folder of each candidate, where it exists. Newest is
+        the latest write to a *.log directly in it.
+
+        Cheap enough to call on every poll: Test-Path and one directory listing
+        per candidate, nothing recursive. Never throws.
+    .PARAMETER PackageFamilyName
+        The MSIX package family. Its LocalCache, where Windows redirects a
+        packaged app's AppData writes, is probed as well.
+    #>
+    param([string]$PackageFamilyName)
+
+    $bases = @()
+    if ($env:LOCALAPPDATA) { $bases += @{ Path = $env:LOCALAPPDATA; Tag = 'LOCALAPPDATA' } }
+    if ($env:APPDATA)      { $bases += @{ Path = $env:APPDATA;      Tag = 'APPDATA' } }
+    if ($PackageFamilyName -and $env:LOCALAPPDATA) {
+        $lc = Join-Path $env:LOCALAPPDATA "Packages\$PackageFamilyName\LocalCache"
+        $bases += @{ Path = (Join-Path $lc 'Local');   Tag = 'LocalCache\Local' }
+        $bases += @{ Path = (Join-Path $lc 'Roaming'); Tag = 'LocalCache\Roaming' }
+    }
+
+    $wanted = @()
+    if ($env:CLAUDE_USER_DATA_DIR) {
+        $wanted += @{ Path = $env:CLAUDE_USER_DATA_DIR; Source = 'CLAUDE_USER_DATA_DIR' }
+    }
+    foreach ($b in $bases) {
+        foreach ($n in @('Claude-Data', 'Claude-3p')) {
+            try {
+                $parent = Join-Path $b.Path $n
+                if (Test-Path -LiteralPath $parent -PathType Container) {
+                    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue)) {
+                        $wanted += @{ Path = $d.FullName; Source = "$($b.Tag)\$n" }
+                    }
+                }
+            } catch { $null = $_ }
+        }
+        $wanted += @{ Path = (Join-Path $b.Path 'Claude'); Source = "$($b.Tag)\Claude" }
+    }
+
+    $markers = @('Preferences', 'Local State', 'config.json', 'Network', 'Session Storage',
+                 'window-state.json', 'lockfile')
+    $roots = @()
+    $logs  = @()
+    $seen  = @{}
+    foreach ($w in $wanted) {
+        try {
+            $full = "$($w.Path)".TrimEnd('\')
+            if (-not $full -or $seen.ContainsKey($full.ToLowerInvariant())) { continue }
+            $seen[$full.ToLowerInvariant()] = $true
+            if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
+
+            $newest = $null
+            $isApp  = $false
+            foreach ($m in $markers) {
+                $mi = Get-Item -LiteralPath (Join-Path $full $m) -Force -ErrorAction SilentlyContinue
+                if (-not $mi) { continue }
+                if ($m -eq 'Preferences' -or $m -eq 'Local State') { $isApp = $true }
+                if ($null -eq $newest -or $mi.LastWriteTime -gt $newest) { $newest = $mi.LastWriteTime }
+            }
+            $roots += [pscustomobject]@{ Path = $full; Source = $w.Source; IsAppData = $isApp; Newest = $newest }
+
+            $ld = Join-Path $full 'logs'
+            if (Test-Path -LiteralPath $ld -PathType Container) {
+                $lnewest = $null
+                foreach ($f in @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -Force -ErrorAction SilentlyContinue)) {
+                    if ($null -eq $lnewest -or $f.LastWriteTime -gt $lnewest) { $lnewest = $f.LastWriteTime }
+                }
+                $logs += [pscustomobject]@{ Path = $ld; Source = $w.Source; Newest = $lnewest }
+            }
+        } catch { $null = $_ }
+    }
+
+    $byNewest = @{ Expression = { if ($_.Newest) { $_.Newest } else { [datetime]::MinValue } }; Descending = $true }
+    return [pscustomobject]@{
+        DataRoots = @($roots | Sort-Object -Property @{ Expression = { [int]$_.IsAppData }; Descending = $true }, $byNewest)
+        LogDirs   = @($logs | Sort-Object -Property $byNewest)
+    }
+}
 #endregion ClaudeEnv
 
 # -- Runtime discovery ---------------------------------------------------
@@ -983,7 +1084,9 @@ $script:LastStealthNotice    = $null
 # after a marker that read perfectly well -- which is exactly when the
 # text-keyed suppression above has just been cleared.
 $script:StealthNoAumidLogged = $false
-$script:StatePath            = Join-Path $WatchLogDir "watch-state.json"
+# Test-ClaudeCodeActive says once when it finds no claude-code-sessions folder.
+$script:NoCodeSessionDirLogged = $false
+$script:StatePath           = Join-Path $WatchLogDir "watch-state.json"
 # Seeded from the current state so the first poll does not report a transition
 # that did not happen. The app only, as in the main loop.
 $script:ClaudeWasRunning     = (@(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0)
@@ -2196,31 +2299,53 @@ function Test-ClaudeCodeActive {
 
         CHECKS:
         1. Session files: claude-code-sessions folder for recently-modified files (10 min)
-        2. Renderer logs: unknown-window*.log or claude.ai-web*.log recently written (10 min)
-           These logs show LOCAL_SESSION activity when Code is streaming/processing.
+        2. App logs: unknown-window*.log, claude.ai-web*.log or remote-control*.log
+           recently written (10 min). The first two show LOCAL_SESSION activity
+           when Code is streaming/processing; the third is written for Remote
+           Control sessions, which is how project threads run on a PC.
+
+        WHERE. Both checks used to read %APPDATA%\Claude only, through
+        $ClaudeAppData and $ClaudeLogDir. On app 6.18355 (measured 2026-11-21)
+        neither folder is written any more: the sessions live under
+        %LOCALAPPDATA%\Claude-Data\claude_<id>\claude-code-sessions\ and the
+        logs in %LOCALAPPDATA%\Claude\logs, so this returned false with a
+        Code session running and stopped holding repairs back. It now asks
+        Get-ClaudeDataCandidates on every call and reads every candidate, so a
+        later move is covered without a restart. Reading a stale folder as
+        well costs a directory listing; missing the live one cost the guard.
     #>
     try {
-        # Check 1: Claude Code session persistence files
-        # Code writes session state to: %AppData%\Claude\claude-code-sessions\{accountId}\{orgId}\
-        $codeSessionDir = Join-Path $ClaudeAppData "claude-code-sessions"
-        if (Test-Path $codeSessionDir) {
-            # Find any .json file modified in the last 10 minutes (Code writes as it works)
-            $recentFiles = Get-ChildItem -Path $codeSessionDir -Filter "*.json" -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { ((Get-Date) - $_.LastWriteTime).TotalMinutes -lt 10 } |
+        $cands = Get-ClaudeDataCandidates -PackageFamilyName $script:ClaudeEnv.PackageFamilyName
+        $now = Get-Date
+
+        # Check 1: Claude Code session persistence files, written as Code works,
+        # under <data root>\claude-code-sessions\{accountId}\{orgId}\.
+        $sessionDirsSeen = 0
+        foreach ($root in @($cands.DataRoots)) {
+            $codeSessionDir = Join-Path $root.Path "claude-code-sessions"
+            if (-not (Test-Path -LiteralPath $codeSessionDir -PathType Container)) { continue }
+            $sessionDirsSeen++
+            $recentFiles = Get-ChildItem -LiteralPath $codeSessionDir -Filter "*.json" -Recurse -File -ErrorAction SilentlyContinue |
+                Where-Object { ($now - $_.LastWriteTime).TotalMinutes -lt 10 } |
                 Select-Object -First 1
             if ($recentFiles) { return $true }
         }
+        if ($sessionDirsSeen -eq 0 -and -not $script:NoCodeSessionDirLogged) {
+            # Said once: either Code has never run here, or the app has moved
+            # its data somewhere Get-ClaudeDataCandidates does not look.
+            $script:NoCodeSessionDirLogged = $true
+            Write-WatchLog "Test-ClaudeCodeActive: no claude-code-sessions folder under any known data root; only the log check can see a Code session"
+        }
 
-        # Check 2: Renderer log recency
-        # When Code is active, the renderer writes LOCAL_SESSION messages to these logs.
-        # Even during quiet API-wait periods, messages appear every few minutes.
-        $rendererLogs = @(
-            Get-ChildItem -Path $ClaudeLogDir -Filter "unknown-window*.log" -ErrorAction SilentlyContinue
-            Get-ChildItem -Path $ClaudeLogDir -Filter "claude.ai-web*.log" -ErrorAction SilentlyContinue
-        )
-        foreach ($rLog in $rendererLogs) {
-            if ($rLog -and ((Get-Date) - $rLog.LastWriteTime).TotalMinutes -lt 10) {
-                return $true
+        # Check 2: app log recency. Even during quiet API-wait periods,
+        # messages appear every few minutes. A folder whose newest log is older
+        # than the window cannot hold a recent one, so it is skipped unread.
+        foreach ($ld in @($cands.LogDirs)) {
+            if (-not $ld.Newest -or ($now - $ld.Newest).TotalMinutes -ge 10) { continue }
+            foreach ($pattern in @('unknown-window*.log', 'claude.ai-web*.log', 'remote-control*.log')) {
+                foreach ($rLog in @(Get-ChildItem -LiteralPath $ld.Path -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+                    if (($now - $rLog.LastWriteTime).TotalMinutes -lt 10) { return $true }
+                }
             }
         }
     } catch {

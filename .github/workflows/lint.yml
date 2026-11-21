@@ -66,6 +66,10 @@ jobs:
         shell: powershell
         run: .\.ci\Test-ProcessInventory.ps1
 
+      - name: Data and log discovery
+        shell: powershell
+        run: .\.ci\Test-DataDiscovery.ps1
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: |
