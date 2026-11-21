@@ -902,8 +902,8 @@ function Get-ClaudeVmLogCandidates {
     foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
         try {
             $p = Join-Path $LogDir $n
-            if (Test-Path $p) {
-                $fi = Get-Item $p -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $p) {
+                $fi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
                 if ($fi) {
                     $cands += [pscustomobject]@{
                         Name          = $n
@@ -918,6 +918,26 @@ function Get-ClaudeVmLogCandidates {
         } catch { $null = $_ }
     }
     return @($cands | Sort-Object LastWriteTime -Descending)
+}
+
+function Get-ClaudeVmLogAge {
+    <#
+    .SYNOPSIS
+        Seconds since any VM log in a Claude log folder was last written, or
+        $null when the folder holds none.
+    .DESCRIPTION
+        Reads every VM log, now. App 6.18355 writes two of them, and which one
+        is newest changes through the day: cowork_vm_node.log is the host side
+        (each boot, each Cowork command) and coworkd.log is the daemon inside
+        the VM (each command again, and a clock line every few hours). A
+        freshness test that read only the log that happened to be newest when
+        the script started could be reading the quiet one. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
+    if ($c.Count -eq 0) { return $null }
+    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
 }
 #endregion ClaudeEnv
 
@@ -1288,13 +1308,10 @@ function Import-WatchState {
         }
     } catch { $null = $_ }
 
-    # Seed from the log itself, not from the saved file.
+    # Seed from the logs themselves, not from the saved file.
     try {
-        $seedLog = $script:ClaudeEnv.VmLogFile
-        if ($seedLog -and (Test-Path $seedLog)) {
-            $seedAge = ((Get-Date) - (Get-Item $seedLog).LastWriteTime).TotalMinutes
-            if ($seedAge -lt 60) { $script:VmLogEverActive = $true }
-        }
+        $seedAge = Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir
+        if ($null -ne $seedAge -and $seedAge -lt 3600) { $script:VmLogEverActive = $true }
     } catch { $null = $_ }
 }
 
@@ -1985,16 +2002,16 @@ function Test-VmLogStaleness {
         - Only triggers if the log was PREVIOUSLY active (VmLogEverActive)
           This prevents false positives when user is in Chat mode (no Cowork)
     #>
-    # Discovery selects the newest VM-relevant log. Preferring coworkd.log, as
-    # this used to, meant measuring the staleness of a file last written in
-    # March: permanently stale, and the only thing standing between that and a
-    # constant repair loop was the VmLogEverActive gate below.
+    # Staleness of the freshest VM log, read now (Get-ClaudeVmLogAge). Reading
+    # one chosen file, as this used to, measured whichever log was newest when
+    # the monitor started: once a file last written in March, and on app
+    # 6.18355 possibly coworkd.log while the boot and command lines go to
+    # cowork_vm_node.log.
     #
     # main.log is deliberately NOT a candidate. It is the Electron main process
     # log and it can sit frozen for a day at a time on a completely healthy
     # machine, which makes staleness there a guaranteed false positive.
-    $vmLogFile = $script:ClaudeEnv.VmLogFile
-    if (-not $vmLogFile -or -not (Test-Path $vmLogFile)) {
+    if ($null -eq (Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir)) {
         $script:VmLogStaleCount = 0
         return $null
     }
@@ -2012,8 +2029,8 @@ function Test-VmLogStaleness {
     }
 
     try {
-        $lastWrite = (Get-Item $vmLogFile -ErrorAction Stop).LastWriteTime
-        $staleSec = ((Get-Date) - $lastWrite).TotalSeconds
+        $staleSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir
+        if ($null -eq $staleSec) { return $null }
 
         # Track if the log has ever been active during this monitor session
         if ($staleSec -lt 60) {
@@ -2613,15 +2630,13 @@ function Test-UserActivity {
         }
 
         # Check 3: VM log active within 120s (was 30s -- covers Code thinking phases)
-        # Discovery selects the newest VM-relevant log. This chain used to
-        # prefer coworkd.log, which on current builds was last written in
-        # March, so the freshness test below was reading a dead file.
-        $vmLog = $script:ClaudeEnv.VmLogFile
-        if ($vmLog -and (Test-Path $vmLog)) {
-            $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
-            if ($ageSec -lt 120) {
-                return $true  # VM was active recently -- Code may be thinking
-            }
+        # Any VM log, read now (Get-ClaudeVmLogAge). This used to read the one
+        # log chosen when the monitor started, which once meant a file last
+        # written in March and on app 6.18355 can mean coworkd.log while the
+        # host side writes to cowork_vm_node.log.
+        $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir
+        if ($null -ne $ageSec -and $ageSec -lt 120) {
+            return $true  # VM was active recently -- Code may be thinking
         }
 
         # Check 4: CPU sampling -- any Claude process using >100ms CPU in 500ms.
@@ -2678,9 +2693,9 @@ function Test-CoworkSessionActive {
     .SYNOPSIS
         Returns $true when the Cowork VM has logged activity recently.
 
-        Reads the newest VM log and looks for a recent [Keepalive], [startVM],
-        [VM:start], [postConnect] or [vmOneShot] entry within the last 180
-        seconds.
+        Reads cowork_vm_node.log in the current log folder and looks for a
+        recent [Keepalive], [startVM], [VM:start], [postConnect] or
+        [vmOneShot] entry within the last 180 seconds.
 
         During API-wait periods, when the model is thinking server side, a
         Cowork session burns no local CPU but is very much alive. This check is
@@ -2689,20 +2704,26 @@ function Test-CoworkSessionActive {
         It previously paired [Process:UUID] Created against Cleaned up. Neither
         marker appears in the current log format at all.
     #>
-    # Discovery selects the newest VM-relevant log rather than preferring
-    # coworkd.log, which is months stale on current builds.
-    $vmLogFile = $script:ClaudeEnv.VmLogFile
-    if (-not $vmLogFile -or -not (Test-Path $vmLogFile)) { return $false }
+    # cowork_vm_node.log by name, because that is the only log whose lines
+    # this parses. This used to read whichever VM log was newest when the
+    # monitor started. On app 6.18355 that is usually coworkd.log, which has
+    # none of the tags below and writes its dates with slashes, so the answer
+    # was always "no session" and the Cowork guard was off. The node log has a
+    # [vmOneShot] line for every command coworkd runs, so nothing is lost.
+    $vmLogFile = $null
+    if ($script:ClaudeLogDir) { $vmLogFile = Join-Path $script:ClaudeLogDir 'cowork_vm_node.log' }
+    if (-not $vmLogFile -or -not (Test-Path -LiteralPath $vmLogFile)) { return $false }
     try {
         # Only read the last 200 lines to stay fast
-        $lines = @(Get-Content $vmLogFile -Tail 200 -ErrorAction SilentlyContinue)
+        $lines = @(Get-Content -LiteralPath $vmLogFile -Tail 200 -ErrorAction SilentlyContinue)
         if ($lines.Count -eq 0) { return $false }
 
         # Liveness comes from recent VM activity tags, not from pairing
         # [Process:UUID] Created against Cleaned up.
         #
         # Those two markers occur ZERO times in the live VM log. They belong to
-        # the March-era coworkd.log format. Reading that dead file, the last 200
+        # the March-era coworkd.log format (6.18355 writes coworkd.log again, in
+        # a newer format with neither). Reading that dead file, the last 200
         # lines held old Created entries whose matching Cleaned up lines had
         # scrolled away, so the function reported an active session forever and
         # every auto-fix took the BLOCKED branch.
@@ -2930,14 +2951,9 @@ function Invoke-AutoFix {
 
     # Cancel if VM log became active during the 30s window
     if (-not $cancelFix) {
-        # Discovery selects the newest VM-relevant log. This chain used to
-        # prefer coworkd.log, which on current builds was last written in
-        # March, so the freshness test below was reading a dead file.
-        $vmLog = $script:ClaudeEnv.VmLogFile
-        if ($vmLog -and (Test-Path $vmLog)) {
-            $ageSec = ((Get-Date) - (Get-Item $vmLog).LastWriteTime).TotalSeconds
-            if ($ageSec -lt 120) { $cancelFix = $true; $cancelReason = "VM log became active" }
-        }
+        # Any VM log, read now: the same test as Test-UserActivity's check 3.
+        $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir
+        if ($null -ne $ageSec -and $ageSec -lt 120) { $cancelFix = $true; $cancelReason = "VM log became active" }
     }
 
     # Cancel if a Claude Code session is active
@@ -3074,9 +3090,14 @@ function Sync-ClaudeDataPaths {
         call costs Get-ClaudeDataCandidates: a few Test-Path calls and one
         directory listing per candidate.
 
-        The VM log is picked again only when the log folder changed. Two VM
-        logs in one folder can take turns at being the newest, and following
-        that would reset the VM log checks every ten minutes for no reason.
+        The VM log named in the log is picked again when the log folder
+        changed, or when there was none and one has appeared since. Two VM
+        logs in one folder take turns at being the newest, so following that
+        would log a move every ten minutes for nothing. The checks themselves
+        do not use that name: they read every VM log in $script:ClaudeLogDir
+        on each poll (Get-ClaudeVmLogAge), or the node log by name
+        (Test-CoworkSessionActive), so they follow a moved folder and a log
+        that appears later on their own.
 
         A fallback answer is never followed. Discovery falls back to
         %APPDATA%\Claude when it finds nothing, and a candidate folder that
@@ -3117,6 +3138,15 @@ function Sync-ClaudeDataPaths {
                 $script:ClaudeEnv.VmLogFile = $newVm
             }
         }
+        $curVm = $script:ClaudeEnv.VmLogFile
+        if (-not $curVm -or -not (Test-Path -LiteralPath $curVm)) {
+            $vm = @(Get-ClaudeVmLogCandidates -LogDir $script:ClaudeLogDir)
+            if ($vm.Count -gt 0) {
+                $script:ClaudeEnv.VmLogCandidates = $vm
+                Write-WatchLog "VM log found: $($vm[0].Path)"
+                $script:ClaudeEnv.VmLogFile = $vm[0].Path
+            }
+        }
     } catch {
         Write-WatchLog "Looking for the app's folders again failed: $($_.Exception.Message)"
     }
@@ -3130,7 +3160,9 @@ Write-WatchLog "  Cooldown      : ${Cooldown} min"
 Write-WatchLog "  Fix script    : $fixScript"
 Write-WatchLog "  Log directory : $ClaudeLogDir ($($script:ClaudeEnv.LogDirSource))"
 Write-WatchLog "  Data root     : $($script:ClaudeEnv.DataRoot) ($($script:ClaudeEnv.DataRootSource))"
-Write-WatchLog "  VM log        : $($script:ClaudeEnv.VmLogFile)"
+$vmLogNames = @($script:ClaudeEnv.VmLogCandidates | ForEach-Object { $_.Name }) -join ', '
+if (-not $vmLogNames) { $vmLogNames = "none yet" }
+Write-WatchLog "  VM logs       : $vmLogNames (all read on each poll)"
 # Reports what this feature can actually do on THIS machine, in the same spirit
 # as the monitor list below: a banner that advertises a capability the run does
 # not have is how dead monitors went unnoticed for months.

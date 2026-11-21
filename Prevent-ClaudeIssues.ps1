@@ -900,8 +900,8 @@ function Get-ClaudeVmLogCandidates {
     foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
         try {
             $p = Join-Path $LogDir $n
-            if (Test-Path $p) {
-                $fi = Get-Item $p -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $p) {
+                $fi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
                 if ($fi) {
                     $cands += [pscustomobject]@{
                         Name          = $n
@@ -916,6 +916,26 @@ function Get-ClaudeVmLogCandidates {
         } catch { $null = $_ }
     }
     return @($cands | Sort-Object LastWriteTime -Descending)
+}
+
+function Get-ClaudeVmLogAge {
+    <#
+    .SYNOPSIS
+        Seconds since any VM log in a Claude log folder was last written, or
+        $null when the folder holds none.
+    .DESCRIPTION
+        Reads every VM log, now. App 6.18355 writes two of them, and which one
+        is newest changes through the day: cowork_vm_node.log is the host side
+        (each boot, each Cowork command) and coworkd.log is the daemon inside
+        the VM (each command again, and a clock line every few hours). A
+        freshness test that read only the log that happened to be newest when
+        the script started could be reading the quiet one. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
+    if ($c.Count -eq 0) { return $null }
+    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
 }
 #endregion ClaudeEnv
 

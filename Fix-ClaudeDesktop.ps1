@@ -937,8 +937,8 @@ function Get-ClaudeVmLogCandidates {
     foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
         try {
             $p = Join-Path $LogDir $n
-            if (Test-Path $p) {
-                $fi = Get-Item $p -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $p) {
+                $fi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
                 if ($fi) {
                     $cands += [pscustomobject]@{
                         Name          = $n
@@ -953,6 +953,26 @@ function Get-ClaudeVmLogCandidates {
         } catch { $null = $_ }
     }
     return @($cands | Sort-Object LastWriteTime -Descending)
+}
+
+function Get-ClaudeVmLogAge {
+    <#
+    .SYNOPSIS
+        Seconds since any VM log in a Claude log folder was last written, or
+        $null when the folder holds none.
+    .DESCRIPTION
+        Reads every VM log, now. App 6.18355 writes two of them, and which one
+        is newest changes through the day: cowork_vm_node.log is the host side
+        (each boot, each Cowork command) and coworkd.log is the daemon inside
+        the VM (each command again, and a clock line every few hours). A
+        freshness test that read only the log that happened to be newest when
+        the script started could be reading the quiet one. Never throws.
+    #>
+    param([string]$LogDir)
+
+    $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
+    if ($c.Count -eq 0) { return $null }
+    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
 }
 #endregion ClaudeEnv
 
@@ -2920,17 +2940,12 @@ if ($Quiet) {
 
     # Check 2: VM log active within 120s (Code may be thinking)
     #
-    # Discovery already ranked the VM logs by recency. The list this replaces
-    # led with C:\ProgramData\Claude\Logs\coworkd.log, on a hardcoded drive
-    # letter, in a tree that does not exist.
+    # Every VM log in the app's log folder, read now (Get-ClaudeVmLogAge). The
+    # list before discovery led with C:\ProgramData\Claude\Logs\coworkd.log, on
+    # a hardcoded drive letter, in a tree that does not exist.
     if (-not $isActive) {
-        $safetyVmLog = $script:ClaudeEnv.VmLogFile
-        if ($safetyVmLog -and (Test-Path $safetyVmLog)) {
-            try {
-                $ageSec = ((Get-Date) - (Get-Item $safetyVmLog).LastWriteTime).TotalSeconds
-                if ($ageSec -lt 120) { $isActive = $true }
-            } catch { $null = $_ }
-        }
+        $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeEnv.LogDir
+        if ($null -ne $ageSec -and $ageSec -lt 120) { $isActive = $true }
     }
 
     # Check 3: User input within 3 minutes (interactive sessions only)
@@ -3971,7 +3986,8 @@ if ($SkipLaunch) {
     # STEP 9 -- Wait for Cowork workspace readiness (now Step 9/10)
     # ====================================================================
     # Detection strategy (in order of reliability):
-    #   A. Log file: cowork_vm_node.log -- "Startup complete" or "Keepalive"
+    #   A. VM logs: cowork_vm_node.log -- "Startup complete" or "Keepalive";
+    #      coworkd.log -- "connected, waiting for commands"
     #   B. Hyper-V VM state: Get-VM "claudevm" shows Running + heartbeat
     #   C. Log file: step markers like "guest_vsock_connect completed"
     #   D. File size stability fallback (last resort)
@@ -3982,75 +3998,89 @@ if ($SkipLaunch) {
 
     $vmReady = $false
 
-    # Discovery already selected the newest VM-relevant log at startup, and it
-    # records each candidate's age, so a stale file is reported rather than
-    # silently preferred.
+    # Every VM log in the app's log folder is read, each from where it stood
+    # when the wait began. App 6.18355 writes a boot to two of them in the
+    # same second: "[VM:start] Startup complete" and "[Keepalive] Starting"
+    # to cowork_vm_node.log, "[coworkd] connected, waiting for commands" to
+    # coworkd.log. This used to read only the log that was newest when the
+    # script started, which on 6.18355 is usually coworkd.log, and none of the
+    # markers below matched a boot there. A Smart run could then wait out its
+    # deadline on a VM that had come up, and escalate to Deep, which deletes
+    # the VM cache.
     #
-    # The list this replaces led with C:\ProgramData\Claude\Logs\coworkd.log.
+    # The list before discovery led with C:\ProgramData\Claude\Logs\coworkd.log.
     # That tree does not exist on any current build, the drive letter was
     # hardcoded, and coworkd.log itself was last written in March.
-    $vmLogFile  = $script:ClaudeEnv.VmLogFile
-    $vmCandList = @($script:ClaudeEnv.VmLogCandidates)
-    if ($vmLogFile -and $vmCandList.Count -gt 0) {
-        Log "Using log file: $vmLogFile (last written $($vmCandList[0].AgeHours)h ago)" -Colour DarkGray -Indent
+    $vmLogDir   = $script:ClaudeEnv.LogDir
+    $vmCandList = @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)
+    if ($vmCandList.Count -gt 0) {
         foreach ($cand in $vmCandList) {
-            if ($cand.Name -ne $vmCandList[0].Name -and $cand.AgeHours -gt 24) {
-                Log "Ignoring stale candidate $($cand.Name) ($($cand.AgeHours)h old)" -Colour DarkGray -Indent
-            }
+            Log "Reading VM log: $($cand.Path) (last written $($cand.AgeHours)h ago)" -Colour DarkGray -Indent
         }
     } else {
         Log "No VM log file found; readiness will rely on guest and HCS signals" -Colour DarkYellow -Indent
     }
 
-    # Safe size read for the chosen VM log. Returns 0 when no log was found,
-    # or when the file vanished between the existence test and the read, which
-    # would otherwise be a property access on $null under StrictMode.
-    function Get-VmLogSize {
-        if (-not $vmLogFile) { return [long]0 }
-        $item = Get-Item $vmLogFile -ErrorAction SilentlyContinue
-        if (-not $item) { return [long]0 }
-        return [long]$item.Length
+    # Where each VM log stands now, by path. A log that is missing here and
+    # appears later is read from its start. Never throws: the candidate list
+    # is built that way.
+    function Get-VmLogSizes {
+        $sizes = @{}
+        foreach ($cand in @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)) {
+            $sizes[$cand.Path] = [long]$cand.Length
+        }
+        return $sizes
     }
 
-    # Record the log file size at the START so we only check new entries
-    $logBaselineSize = Get-VmLogSize
+    # Record where each log stands at the START so we only check new entries
+    $logBaseline = Get-VmLogSizes
 
-    # Helper: check recent log entries for boot completion markers
+    # Helper: check the entries written to any VM log since the baseline for
+    # boot completion markers
     function Test-VmLogReady {
-        param([long]$Baseline)
-        # $vmLogFile is $null whenever no candidate log existed. Test-Path $null
-        # throws, and this call site sits outside the try below, so the throw
-        # unwound to the outer catch and abandoned every remaining step.
-        if (-not $vmLogFile -or -not (Test-Path $vmLogFile)) { return $null }
-        try {
-            $fi = Get-Item $vmLogFile -ErrorAction Stop
-            if ($fi.Length -le $Baseline) { return $null }
-            # Read only the new portion of the log
-            $stream = $null
-            $reader = $null
+        param([hashtable]$Baseline)
+        $newContent = ''
+        foreach ($cand in @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)) {
             try {
-                $stream = New-Object System.IO.FileStream(
-                    $vmLogFile, [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                $stream.Position = $Baseline
-                $reader = New-Object System.IO.StreamReader($stream)
-                $newContent = $reader.ReadToEnd()
-            } finally {
-                if ($reader) { try { $reader.Close() } catch { $null = $_ } }
-                if ($stream) { try { $stream.Close() } catch { $null = $_ } }
-            }
-            # Check for completion markers (most definitive first)
-            # Old markers (cowork_vm_node.log)
-            if ($newContent -match "Startup complete") { return "startup-complete" }
-            if ($newContent -match "\[Keepalive\]") { return "keepalive" }
-            if ($newContent -match "guest_vsock_connect completed") { return "vsock-connected" }
-            if ($newContent -match "sdk_install completed") { return "sdk-installed" }
-            # New markers (coworkd.log in ProgramData, v5.1.0)
-            if ($newContent -match "\[process:[0-9a-f-]+\] started PID") { return "process-started" }
-            if ($newContent -match "\[coworkd\] mounted .+ at /sessions/") { return "mounts-ready" }
-            if ($newContent -match "full egress mode enabled") { return "egress-ready" }
-            return $null
-        } catch { return $null }
+                $start = [long]0
+                if ($Baseline -and $Baseline.ContainsKey($cand.Path)) {
+                    $start = [long]$Baseline[$cand.Path]
+                }
+                # Shorter than at the baseline means the log was rotated, and
+                # everything in the new file is new.
+                if ([long]$cand.Length -lt $start) { $start = [long]0 }
+                if ([long]$cand.Length -le $start) { continue }
+                # Read only the new portion of the log
+                $stream = $null
+                $reader = $null
+                try {
+                    $stream = New-Object System.IO.FileStream(
+                        $cand.Path, [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                    $stream.Position = $start
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    $newContent += $reader.ReadToEnd() + "`n"
+                } finally {
+                    if ($reader) { try { $reader.Close() } catch { $null = $_ } }
+                    if ($stream) { try { $stream.Close() } catch { $null = $_ } }
+                }
+            } catch { $null = $_ }
+        }
+        if (-not $newContent) { return $null }
+        # Check for completion markers (most definitive first)
+        # cowork_vm_node.log
+        if ($newContent -match "Startup complete") { return "startup-complete" }
+        # coworkd.log's line for the same boot, in the same second
+        if ($newContent -match "\[coworkd\] connected, waiting for commands") { return "startup-complete" }
+        if ($newContent -match "\[Keepalive\]") { return "keepalive" }
+        if ($newContent -match "guest_vsock_connect completed") { return "vsock-connected" }
+        if ($newContent -match "sdk_install completed") { return "sdk-installed" }
+        # coworkd.log. The id is "oneshot-<uuid>" on 6.18355, which the
+        # hex-only pattern this used to be never matched.
+        if ($newContent -match "\[process:[^\]]+\] started PID") { return "process-started" }
+        if ($newContent -match "\[coworkd\] mounted .+ at /sessions/") { return "mounts-ready" }
+        if ($newContent -match "full egress mode enabled") { return "egress-ready" }
+        return $null
     }
 
     # Helper: check HCS compute system state via hcsdiag.
@@ -4193,7 +4223,7 @@ if ($SkipLaunch) {
                 # Guest reports connected but VM log hasn't caught up yet --
                 # give it a few more seconds then accept
                 Start-Sleep -Seconds 5
-                $logStatus = Test-VmLogReady -Baseline $logBaselineSize
+                $logStatus = Test-VmLogReady -Baseline $logBaseline
                 if ($logStatus) {
                     $vmReady = $true
                     Log "Workspace ready (guest connected + log: $logStatus)" -Colour Green -Indent
@@ -4215,9 +4245,7 @@ if ($SkipLaunch) {
                 Start-Service -Name $ServiceName -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 5
                 # Reset baseline so we check fresh log entries
-                if ($vmLogFile) {
-                    $logBaselineSize = Get-VmLogSize
-                }
+                $logBaseline = Get-VmLogSizes
                 Log "Service restarted, continuing to wait..." -Colour DarkGray -Indent
             } elseif ($guestState -eq "guest-error" -and $vmElapsed -ge 60) {
                 Log "[!] Guest connection errors detected in cowork-service.log" -Colour DarkYellow -Indent
@@ -4226,7 +4254,7 @@ if ($SkipLaunch) {
 
         # No-progress detector: if 60s in and nothing happening, escalate (v5.0.0)
         if ($vmElapsed -ge 60 -and -not $vmReady) {
-            $hasLogActivity = ($null -ne (Test-VmLogReady -Baseline $logBaselineSize))
+            $hasLogActivity = ($null -ne (Test-VmLogReady -Baseline $logBaseline))
             $hasGuestActivity = ($guestState -and $guestState -ne "no-polling")
             $hasHcsVm = $false
             try {
@@ -4253,9 +4281,7 @@ if ($SkipLaunch) {
                     Start-Sleep -Seconds 5
                     $null = Start-ClaudeDesktop
                     # Reset log baseline and timers
-                    if ($vmLogFile) {
-                        $logBaselineSize = Get-VmLogSize
-                    }
+                    $logBaseline = Get-VmLogSizes
                     # Don't reset vmElapsed -- let the outer timeout still apply
                     Log "Waiting for workspace after relaunch..." -Colour DarkGray -Indent
                     continue
@@ -4264,7 +4290,7 @@ if ($SkipLaunch) {
         }
 
         # A. Check log file for boot completion (new entries since baseline)
-        $logStatus = Test-VmLogReady -Baseline $logBaselineSize
+        $logStatus = Test-VmLogReady -Baseline $logBaseline
         if ($logStatus -in @("startup-complete", "keepalive", "process-started", "egress-ready")) {
             $vmReady = $true
             Log "Workspace ready (log: $logStatus)" -Colour Green -Indent
@@ -4272,33 +4298,38 @@ if ($SkipLaunch) {
         }
 
         # A2. Fallback: workspace may already be running (baseline captured after boot).
-        #     Check the tail of the log for recent boot markers regardless of baseline.
-        if (-not $logStatus -and $vmElapsed -ge 30 -and $vmLogFile -and (Test-Path $vmLogFile)) {
-            try {
-                $fi = Get-Item $vmLogFile -ErrorAction Stop
-                $recentlyWritten = ($fi.LastWriteTime -gt (Get-Date).AddMinutes(-3))
-                if ($recentlyWritten -and $fi.Length -gt 0) {
-                    $tailSize = [math]::Min($fi.Length, 8192)
+        #     Check the tail of each VM log written in the last 3 minutes for
+        #     boot markers, regardless of baseline.
+        if (-not $logStatus -and $vmElapsed -ge 30) {
+            foreach ($cand in @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)) {
+                try {
+                    $recentlyWritten = ($cand.LastWriteTime -gt (Get-Date).AddMinutes(-3))
+                    if (-not $recentlyWritten -or $cand.Length -le 0) { continue }
+                    $tailSize = [math]::Min([long]$cand.Length, 8192)
+                    $tailContent = ''
                     $stream = $null
                     $reader = $null
                     try {
                         $stream = New-Object System.IO.FileStream(
-                            $vmLogFile, [System.IO.FileMode]::Open,
+                            $cand.Path, [System.IO.FileMode]::Open,
                             [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                        $stream.Position = $fi.Length - $tailSize
+                        $stream.Position = [long]$cand.Length - $tailSize
                         $reader = New-Object System.IO.StreamReader($stream)
                         $tailContent = $reader.ReadToEnd()
                     } finally {
                         if ($reader) { try { $reader.Close() } catch { $null = $_ } }
                         if ($stream) { try { $stream.Close() } catch { $null = $_ } }
                     }
-                    if ($tailContent -match "Startup complete|\[Keepalive\]|started PID|full egress mode") {
+                    if ($tailContent -match "Startup complete|\[Keepalive\]|connected, waiting for commands|started PID|full egress mode") {
                         $vmReady = $true
-                        Log "Workspace ready (log tail: recently active with boot markers)" -Colour Green -Indent
                         break
                     }
-                }
-            } catch { $null = $_ }
+                } catch { $null = $_ }
+            }
+            if ($vmReady) {
+                Log "Workspace ready (log tail: recently active with boot markers)" -Colour Green -Indent
+                break
+            }
         }
 
         # B. Note once whether an HCS compute system exists at all.
@@ -4344,7 +4375,7 @@ if ($SkipLaunch) {
 
     if (-not $vmReady) {
         # Final check: if log has vsock-connected or sdk-installed, partially ready
-        $finalLog = Test-VmLogReady -Baseline $logBaselineSize
+        $finalLog = Test-VmLogReady -Baseline $logBaseline
         if ($finalLog) {
             Log "Workspace partially ready (log: $finalLog), may still be loading" -Colour Yellow -Indent
         } else {
@@ -4357,8 +4388,8 @@ if ($SkipLaunch) {
 # -- Smart mode: escalate to Deep if workspace didn't come up (v5.0.0) --
 if (-not $vmReady -and -not $SkipLaunch -and $script:IsAdmin -and
     $script:SelectedMode -eq "Smart" -and -not $script:DeepEscalated) {
-    # -SkipLaunch never enters the Step 9 branch, so $vmLogFile and
-    # $logBaselineSize below only exist when that branch ran. Without this
+    # -SkipLaunch never enters the Step 9 branch, so $vmLogDir and
+    # $logBaseline below only exist when that branch ran. Without this
     # guard, -SkipLaunch purged 13.5 GB and then died under StrictMode with
     # the cache already gone.
     $script:DeepEscalated = $true
@@ -4414,16 +4445,14 @@ if (-not $vmReady -and -not $SkipLaunch -and $script:IsAdmin -and
     $escalateElapsed = 0
     if ($relaunched) {
         Log "Waiting for workspace after deep escalation..." -Colour Yellow -Indent
-        if ($vmLogFile) {
-            $logBaselineSize = Get-VmLogSize
-        }
+        $logBaseline = Get-VmLogSizes
     } else {
         Log "Nothing was relaunched, so there is nothing to wait for" -Colour DarkYellow -Indent
     }
     while ($relaunched -and $escalateElapsed -lt $escalateTimeout) {
         Start-Sleep -Seconds 5
         $escalateElapsed += 5
-        $logStatus = Test-VmLogReady -Baseline $logBaselineSize
+        $logStatus = Test-VmLogReady -Baseline $logBaseline
         if ($logStatus -in @("startup-complete", "keepalive", "process-started", "egress-ready")) {
             $vmReady = $true
             Log "Workspace ready after deep escalation ($logStatus)" -Colour Green -Indent
@@ -4458,14 +4487,14 @@ if (-not $vmReady -and -not $SkipLaunch) {
             # Reset the baseline after the restart. Without this the loop below
             # re-reads content written before this retry began and treats it as
             # evidence that the retry worked.
-            $logBaselineSize = Get-VmLogSize
+            $logBaseline = Get-VmLogSizes
 
             # Wait up to 60s for workspace
             $retryElapsed = 0
             while ($retryElapsed -lt 60) {
                 Start-Sleep -Seconds 5
                 $retryElapsed += 5
-                $retryStatus = Test-VmLogReady -Baseline $logBaselineSize
+                $retryStatus = Test-VmLogReady -Baseline $logBaseline
                 # The same four definitive markers the main loop requires. This
                 # used to accept ANY non-null marker, so a partial signal such
                 # as sdk-installed reported a failed fix as a success and

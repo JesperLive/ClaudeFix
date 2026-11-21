@@ -15,9 +15,11 @@
     runs the shipped functions against it: the candidate list, the choice
     Resolve-ClaudeDataPaths makes from it, Get-ClaudeEnvironment end to end,
     the Code-session guard, and Watch's Sync-ClaudeDataPaths following a move
-    and refusing a fallback. Watch's functions are pulled out of
-    Watch-ClaudeHealth.ps1 with the language parser, so the code under test is
-    the shipped code, not a copy.
+    and refusing a fallback. Then the VM logs: their age, Watch's Cowork
+    guard, and Fix's wait for a booted VM, each reading every VM log in its
+    own format. Watch's and Fix's functions are pulled out of their scripts
+    with the language parser, so the code under test is the shipped code, not
+    a copy.
 
     Exits 0 when every case passes, 1 otherwise.
 #>
@@ -56,7 +58,7 @@ function Get-FunctionSource {
 
 . (Join-Path $PSScriptRoot 'ClaudeEnv.region.ps1')
 $watchPath = Join-Path $Root 'Watch-ClaudeHealth.ps1'
-foreach ($fn in @('Test-ClaudeCodeActive', 'Sync-ClaudeDataPaths', 'Get-StealthMarkerPath')) {
+foreach ($fn in @('Test-ClaudeCodeActive', 'Sync-ClaudeDataPaths', 'Get-StealthMarkerPath', 'Test-CoworkSessionActive')) {
     . ([scriptblock]::Create((Get-FunctionSource $watchPath $fn)))
 }
 
@@ -343,6 +345,150 @@ try {
     Sync-ClaudeDataPaths -Force
     Assert-Case "a fallback answer is not followed" (
         $script:ClaudeEnv.DataRoot -eq $dataRoot -and $script:ClaudeLogDir -eq (Join-Path $L 'Claude\logs'))
+
+    # -----------------------------------------------------------------
+    Write-Host ""
+    Write-Host "--- every VM log is read, each by its own format"
+
+    # Measured 2026-11-21 on app 6.18355: a boot is written to two logs in the
+    # same second. cowork_vm_node.log gets "[VM:start] Startup complete" and
+    # "[Keepalive] Starting" with dashed dates; coworkd.log gets "[coworkd]
+    # connected, waiting for commands" with slashed dates, plus a clock line
+    # every few hours, and is usually the newer of the two. Until this was
+    # fixed each check read the one log that was newest when the script
+    # started, which was coworkd.log, and found none of its markers there.
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    function Get-NodeStamp { param([double]$SecondsAgo) (Get-Date).AddSeconds(-$SecondsAgo).ToString('yyyy-MM-dd HH:mm:ss', $inv) }
+    function Get-CoworkdStamp { param([double]$SecondsAgo) (Get-Date).AddSeconds(-$SecondsAgo).ToString('yyyy/MM/dd HH:mm:ss', $inv) }
+    function Add-LogLine { param([string]$Path, [string]$Line) [System.IO.File]::AppendAllText($Path, $Line + "`n") }
+    function Set-WriteTime { param([string]$Path, [double]$SecondsAgo) (Get-Item -LiteralPath $Path).LastWriteTime = (Get-Date).AddSeconds(-$SecondsAgo) }
+
+    Reset-Fixture 'vmlogs'
+    $vmDir   = Join-Path $env:LOCALAPPDATA 'Claude\logs'
+    $nodeLog = Join-Path $vmDir 'cowork_vm_node.log'
+    $cwdLog  = Join-Path $vmDir 'coworkd.log'
+    Assert-Case "Get-ClaudeVmLogAge: no folder, no age" ($null -eq (Get-ClaudeVmLogAge -LogDir $vmDir))
+    New-FixtureFile (Join-Path $vmDir 'main.log') 1
+    Assert-Case "Get-ClaudeVmLogAge: main.log alone is no VM log" ($null -eq (Get-ClaudeVmLogAge -LogDir $vmDir))
+
+    Add-LogLine $nodeLog "$(Get-NodeStamp 1800) [info] [Keepalive] Starting"
+    Set-WriteTime $nodeLog 1800
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 30) [coworkd] connected, waiting for commands"
+    Set-WriteTime $cwdLog 30
+    $age = Get-ClaudeVmLogAge -LogDir $vmDir
+    Assert-Case "Get-ClaudeVmLogAge: coworkd.log written 30 s ago counts" ($null -ne $age -and $age -lt 120) "got $age"
+    Set-WriteTime $cwdLog 1800
+    Set-WriteTime $nodeLog 30
+    $age = Get-ClaudeVmLogAge -LogDir $vmDir
+    Assert-Case "Get-ClaudeVmLogAge: so does the node log, read now rather than at start" ($null -ne $age -and $age -lt 120) "got $age"
+    Set-WriteTime $nodeLog 1800
+    $age = Get-ClaudeVmLogAge -LogDir $vmDir
+    Assert-Case "Get-ClaudeVmLogAge: both 30 min old" ($null -ne $age -and $age -gt 1700) "got $age"
+
+    # Watch's Cowork guard. The old code read $script:ClaudeEnv.VmLogFile,
+    # which on 6.18355 is coworkd.log, so it is pointed there here.
+    $script:ClaudeLogDir = $vmDir
+    $script:ClaudeEnv = [pscustomobject]@{ PackageFamilyName = 'Claude_testpub'; VmLogFile = $cwdLog }
+    Add-LogLine $nodeLog "$(Get-NodeStamp 30) [info] [Keepalive] Ping ok"
+    Set-WriteTime $nodeLog 30
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 5) [process:oneshot-0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d] started PID 4242"
+    Set-WriteTime $cwdLog 5
+    Assert-Case "Cowork guard: a [Keepalive] 30 s ago in the node log, coworkd.log newer: active" (Test-CoworkSessionActive)
+    Add-LogLine $nodeLog "$(Get-NodeStamp 600) [info] [startVM] old entry written late"
+    Set-WriteTime $nodeLog 1
+    Assert-Case "Cowork guard: the newest tagged line decides, and it is 10 min old: not active" (-not (Test-CoworkSessionActive))
+    Add-LogLine $nodeLog "$(Get-NodeStamp 60) [info] [vmOneShot] spawn"
+    Assert-Case "Cowork guard: a [vmOneShot] 60 s ago: active" (Test-CoworkSessionActive)
+    Remove-Item -LiteralPath $nodeLog -Force
+    Assert-Case "Cowork guard: coworkd.log alone, however fresh, is not parsed: not active" (-not (Test-CoworkSessionActive))
+    $script:ClaudeLogDir = $null
+    Assert-Case "Cowork guard: no log folder: not active" (-not (Test-CoworkSessionActive))
+
+    # Watch names a VM log that appears after it started.
+    Reset-Fixture 'vmlater'
+    $L = $env:LOCALAPPDATA
+    $ClaudeAppData = Join-Path $env:APPDATA 'Claude'
+    New-FixtureFile (Join-Path $L 'Claude-Data\claude_testpub\Preferences') 1
+    New-FixtureFile (Join-Path $L 'Claude\logs\main.log') 1
+    $start = Resolve-ClaudeDataPaths -PackageFamilyName 'Claude_testpub' -AppDataDir $ClaudeAppData
+    $script:ClaudeEnv = [ordered]@{
+        PackageFamilyName = 'Claude_testpub'
+        VmLogFile         = $null
+        VmLogCandidates   = @()
+    }
+    foreach ($k in @('DataRoot', 'DataRootSource', 'LogDir', 'LogDirSource', 'VmCachePath', 'BundlePath',
+                     'SessionsDir', 'CodeSessionsDir', 'DataRootCandidates', 'LogDirCandidates')) {
+        $script:ClaudeEnv[$k] = $start.$k
+    }
+    $script:ClaudeLogDir      = $start.LogDir
+    $script:StealthMarkerPath = Get-StealthMarkerPath
+    Sync-ClaudeDataPaths -Force
+    Assert-Case "no VM log yet: none named, nothing logged" (
+        $null -eq $script:ClaudeEnv.VmLogFile -and @($script:WatchLogLines).Count -eq 0) "got $($script:ClaudeEnv.VmLogFile) | $($script:WatchLogLines -join ' | ')"
+    $later = Join-Path $L 'Claude\logs\coworkd.log'
+    Add-LogLine $later "$(Get-CoworkdStamp 1) [coworkd] connected, waiting for commands"
+    Sync-ClaudeDataPaths -Force
+    Assert-Case "a VM log that appears later is named" ($script:ClaudeEnv.VmLogFile -eq $later) "got $($script:ClaudeEnv.VmLogFile)"
+    Assert-Case "and that is logged once" (
+        (Test-StartsWith $script:WatchLogLines "VM log found: $later") -and @($script:WatchLogLines).Count -eq 1) "got $($script:WatchLogLines -join ' | ')"
+    Add-LogLine (Join-Path $L 'Claude\logs\cowork_vm_node.log') "$(Get-NodeStamp 0) [info] [Keepalive] Starting"
+    Sync-ClaudeDataPaths -Force
+    Assert-Case "a second log in the same folder is no move" (
+        $script:ClaudeEnv.VmLogFile -eq $later -and @($script:WatchLogLines).Count -eq 1) "got $($script:WatchLogLines -join ' | ')"
+
+    # Fix's wait for the VM, which decides whether a Smart repair escalates to
+    # Deep, and Deep deletes the VM cache.
+    $fixPath = Join-Path $Root 'Fix-ClaudeDesktop.ps1'
+    foreach ($fn in @('Get-VmLogSizes', 'Test-VmLogReady')) {
+        . ([scriptblock]::Create((Get-FunctionSource $fixPath $fn)))
+    }
+    Reset-Fixture 'vmready'
+    $vmLogDir = Join-Path $env:LOCALAPPDATA 'Claude\logs'
+    $nodeLog  = Join-Path $vmLogDir 'cowork_vm_node.log'
+    $cwdLog   = Join-Path $vmLogDir 'coworkd.log'
+    New-Item -ItemType Directory -Path $vmLogDir -Force | Out-Null
+    # The previous boot, already in both logs when the wait begins.
+    Add-LogLine $nodeLog "$(Get-NodeStamp 7200) [info] [VM:start] Startup complete"
+    Add-LogLine $nodeLog "$(Get-NodeStamp 7200) [info] [Keepalive] Starting"
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 7200) [coworkd] connected, waiting for commands"
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 7100) [process:oneshot-11111111-2222-4333-8444-555555555555] started PID 17"
+    $b = Get-VmLogSizes
+    Assert-Case "Fix: the baseline holds both logs" ($b.Count -eq 2 -and $b.ContainsKey($nodeLog) -and $b.ContainsKey($cwdLog))
+    Assert-Case "Fix: the previous boot's lines are not this boot" ($null -eq (Test-VmLogReady -Baseline $b))
+
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 0) [coworkd] connected, waiting for commands"
+    $r = Test-VmLogReady -Baseline $b
+    Assert-Case "Fix: coworkd's 'connected, waiting for commands' is a finished boot" ($r -eq 'startup-complete') "got $r"
+
+    $b = Get-VmLogSizes
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 0) [process:oneshot-0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d] started PID 4242"
+    $r = Test-VmLogReady -Baseline $b
+    Assert-Case "Fix: a 'process:oneshot-<uuid>' start is seen" ($r -eq 'process-started') "got $r"
+
+    $b = Get-VmLogSizes
+    Add-LogLine $nodeLog "$(Get-NodeStamp 0) [info] [VM:start] Startup complete"
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 0) [coworkd] timesync host=2026-11-21T10:00:00Z"
+    Set-WriteTime $nodeLog 5
+    Set-WriteTime $cwdLog 0
+    $r = Test-VmLogReady -Baseline $b
+    Assert-Case "Fix: the node log's Startup complete is seen while coworkd.log is the newer" ($r -eq 'startup-complete') "got $r"
+
+    $b = Get-VmLogSizes
+    [System.IO.File]::WriteAllText($nodeLog, "$(Get-NodeStamp 0) [info] [Keepalive] Starting`n")
+    $r = Test-VmLogReady -Baseline $b
+    Assert-Case "Fix: a log shorter than at the baseline was rotated and is read from its start" ($r -eq 'keepalive') "got $r"
+
+    Remove-Item -LiteralPath $cwdLog -Force
+    $b = Get-VmLogSizes
+    Assert-Case "Fix: a missing log is not in the baseline" ($b.Count -eq 1 -and -not $b.ContainsKey($cwdLog))
+    Add-LogLine $cwdLog "$(Get-CoworkdStamp 0) [coworkd] connected, waiting for commands"
+    $r = Test-VmLogReady -Baseline $b
+    Assert-Case "Fix: a log that appears during the wait is read from its start" ($r -eq 'startup-complete') "got $r"
+    $b = Get-VmLogSizes
+    Assert-Case "Fix: nothing written since the baseline: not ready" ($null -eq (Test-VmLogReady -Baseline $b))
+    Remove-Item -LiteralPath $vmLogDir -Recurse -Force
+    Assert-Case "Fix: the log folder gone: an empty baseline, not ready, no throw" (
+        (Get-VmLogSizes).Count -eq 0 -and $null -eq (Test-VmLogReady -Baseline $b))
 } finally {
     $env:LOCALAPPDATA = $savedLocal
     $env:APPDATA      = $savedRoaming

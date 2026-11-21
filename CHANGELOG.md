@@ -75,6 +75,29 @@ run the scripts straight from this folder, so pulling is deploying.
   `claude` process, is gone: it only ran when the app was not running, so it
   could only find the CLI. Run Prevent again to regenerate both.
 
+- Every VM log is read, each in its own format.
+
+  App 6.18355 writes a VM boot to two logs in the same second:
+  `cowork_vm_node.log` gets "Startup complete" and "[Keepalive] Starting",
+  `coworkd.log` gets "connected, waiting for commands", with slashes in its
+  dates. The checks read only the VM log that was newest when the script
+  started, which is usually `coworkd.log`, and looked in it for the node
+  log's markers. Fix's wait for the VM after a restart therefore saw none of
+  its readiness markers, and a Smart repair could wait out its deadline on a
+  VM that had booted and escalate to Deep, which deletes the VM cache. The
+  monitor's Cowork guard, which holds a repair back while a Cowork session
+  waits on the model, always answered "no session". The monitor's VM log
+  freshness checks kept reading the file named at startup after the other
+  log had become the newer one.
+
+  Fix now reads every VM log from where each stood when the wait began,
+  reads a log that was rotated or that appeared during the wait from its
+  start, and knows coworkd's boot line and its process starts, whose id is
+  now `oneshot-<uuid>` and never matched the old hex-only pattern. The
+  Cowork guard reads `cowork_vm_node.log` by name, and the freshness checks
+  read every VM log on each poll. Fed the same log lines, the code before
+  this fix answered "no session" and saw no boot at all.
+
 ### Changed
 
 - The health monitor looks for the app's folders again every ten minutes and
@@ -104,7 +127,8 @@ The path fix re-arms checks that pointed at empty folders:
 - The log scan reads live logs again, so a VirtioFS or HCS error there can
   start an automatic repair. New log files are read from their current end,
   so the backlog is not replayed.
-- The VM log checks have a file to read.
+- The VM log checks have files to read, and Fix's wait for the VM after a
+  restart reads every one of them (see above).
 - A deep or escalated Fix backs up and purges the real VM cache. Measured
   2026-11-21 that is about 18 GB under
   `%LOCALAPPDATA%\Claude-Data\claude_<id>\claude-code-vm`: `rootfs.vhdx`

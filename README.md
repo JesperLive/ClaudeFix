@@ -217,7 +217,7 @@ The menu is skipped when:
 | 6 | Smart cache purge: backs up session VHDXs, nukes VM cache, restores session data; cleans temp files and legacy paths |
 | 7 | Restarts CoworkVMService (admin) or defers to Claude auto-restart (non-admin); restores VHDX backups |
 | 8 | Relaunches Claude Desktop with elevated privileges via scheduled task (Method 0), falling back to MSIX shell protocol or direct exe launch |
-| 9 | Watches the newest VM log for boot completion and hcsdiag for instance state, confirms workspace is ready |
+| 9 | Watches every VM log for boot completion and hcsdiag for instance state, confirms workspace is ready |
 
 **Step 8** first attempts to relaunch Claude with elevated privileges via the `LaunchClaudeAdmin` scheduled task created by Prevent (Method 0). This gives Claude a full admin token without a UAC prompt. If the task doesn't exist or fails, it falls through to three standard methods: Method A launches MSIX installs via `shell:AppsFolder` protocol (no duplicate taskbar icons), Method B launches traditional `.exe` installs directly, and Method C uses Start Menu shortcuts as a last resort. All methods respect `-WhatIf` and each has a `$launched` guard to prevent double-launch.
 
@@ -395,12 +395,12 @@ Two corrections here, both from the 6.0.x audit. Every version before 6.0.0 call
 
 A persistent background process that starts at logon and polls every 30 seconds.
 
-1. **Claude log files**: scans the newest VM log for known error strings. The log is chosen by write time rather than by a fixed preference order, and `main.log` is deliberately excluded: it can sit frozen for a day on a perfectly healthy machine.
+1. **Claude log files**: scans every `*.log` in the app's log folder for known VirtioFS error strings, reading only what each file has gained since the last poll. A file seen for the first time is read from its current end, so old errors are not replayed.
 2. **Service status**: detects when `CoworkVMService` stops while Claude is still running (2 consecutive checks)
 3. **Windows Event Log**: checks for Claude-specific `CoworkVMService` errors and Hyper-V Worker/VMMS errors (2 consecutive checks, whole message examined, not just the first line)
 4. **WinNAT health**: reports a missing NAT rule (every 60 seconds, warning only)
 5. **Workspace storage**: checks that the VM cache is readable and its volume has room (warning only)
-6. **VM log staleness**: catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if the VM was previously active)
+6. **VM log staleness**: catches silent hangs where the VM stops writing logs (5 consecutive stale checks, 5-minute threshold, only if the VM was previously active). Every VM log is read on each poll, and `main.log` is not one: it can sit frozen for a day on a perfectly healthy machine.
 7. **Clock drift**: checks NTP drift every 5 minutes and auto-resyncs if >5 seconds (warning only)
 8. **vmcompute health**: monitors `vmcompute.exe` handle count every 60 seconds. Warning at 12000, trigger at 20000, 2 consecutive checks required
 9. **HCS state health**: watches for stale cowork-vm entries via hcsdiag and tracks 0xC037010D shutdown failure frequency. Kills stale instances, keeping the live one, and restarts vmcompute if more than 15 shutdown failures occur within 5 minutes. Guarded by active-session detection and a check for a running Fix
