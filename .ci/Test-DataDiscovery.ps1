@@ -10,8 +10,8 @@
     %LOCALAPPDATA%\Claude\logs. Test-ClaudeCodeActive therefore returned false
     with a Code session running.
 
-    Each case builds a tree under a fresh folder in %TEMP%, points LOCALAPPDATA
-    and APPDATA at it for this process only, sets write times, and runs the
+    Each case builds a tree under a fresh folder in %TEMP%, points LOCALAPPDATA,
+    APPDATA and USERPROFILE at it for this process only, sets write times, and runs the
     shipped functions against it. Test-ClaudeCodeActive is pulled out of
     Watch-ClaudeHealth.ps1 with the language parser, so the code under test is
     the shipped code, not a copy.
@@ -68,6 +68,8 @@ $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claudefix-ci-" + [g
 $savedLocal   = $env:LOCALAPPDATA
 $savedRoaming = $env:APPDATA
 $savedUdd     = $env:CLAUDE_USER_DATA_DIR
+$savedProfile = $env:USERPROFILE
+$savedCfg     = $env:CLAUDE_CONFIG_DIR
 
 function New-FixtureFile {
     param([string]$Path, [double]$MinutesAgo, [switch]$Directory)
@@ -83,9 +85,15 @@ function Reset-Fixture {
     $case = Join-Path $fixtureRoot $Name
     $env:LOCALAPPDATA = Join-Path $case 'Local'
     $env:APPDATA      = Join-Path $case 'Roaming'
+    # The guard also reads the CLI's transcripts under the user profile. On a
+    # machine where Claude Code is working, the real ones are minutes old and
+    # every "not active" case would fail, so the profile is a fixture too.
+    $env:USERPROFILE  = Join-Path $case 'Profile'
     Remove-Item Env:\CLAUDE_USER_DATA_DIR -ErrorAction SilentlyContinue
+    Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Path $env:LOCALAPPDATA -Force | Out-Null
     New-Item -ItemType Directory -Path $env:APPDATA -Force | Out-Null
+    New-Item -ItemType Directory -Path $env:USERPROFILE -Force | Out-Null
     $script:NoCodeSessionDirLogged = $false
     $script:WatchLogLines = @()
 }
@@ -146,6 +154,28 @@ try {
     New-FixtureFile (Join-Path $L 'Claude\logs\remote-control.log') 45
     Assert-Case "and inactive again once every signal is old" (-not (Test-ClaudeCodeActive))
 
+    # Claude Code's own transcripts. Measured 2026-11-21 17:25: two working
+    # project threads had written theirs that minute while the newest session
+    # file was 16 minutes old and remote-control.log 13.
+    $P = $env:USERPROFILE
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\old.jsonl') 30
+    Assert-Case "a transcript written 30 min ago: not active" (-not (Test-ClaudeCodeActive))
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live.jsonl') 2
+    Assert-Case "a transcript written 2 min ago, every app signal old: active" (Test-ClaudeCodeActive)
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live.jsonl') 30
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live\subagents\workflows\wf_1\agent-a.jsonl') 1
+    Assert-Case "a subagent transcript written 1 min ago: active" (Test-ClaudeCodeActive)
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\live\subagents\workflows\wf_1\agent-a.jsonl') 30
+    New-FixtureFile (Join-Path $P '.claude\projects\C--Dev\memory\notes.md') 1
+    New-FixtureFile (Join-Path $P '.claude\settings.json') 1
+    Assert-Case "fresh files that are not transcripts: not active" (-not (Test-ClaudeCodeActive))
+    $cfg = Join-Path $fixtureRoot 'current\custom-config'
+    New-FixtureFile (Join-Path $cfg 'projects\D--Work\s.jsonl') 1
+    Assert-Case "a transcript in a folder nothing points at: not active" (-not (Test-ClaudeCodeActive))
+    $env:CLAUDE_CONFIG_DIR = $cfg
+    Assert-Case "the same transcript under CLAUDE_CONFIG_DIR: active" (Test-ClaudeCodeActive)
+    Remove-Item Env:\CLAUDE_CONFIG_DIR
+
     # -----------------------------------------------------------------
     Write-Host ""
     Write-Host "--- the layout before 6.18355: everything in %APPDATA%\Claude"
@@ -205,7 +235,9 @@ try {
 } finally {
     $env:LOCALAPPDATA = $savedLocal
     $env:APPDATA      = $savedRoaming
+    $env:USERPROFILE  = $savedProfile
     if ($savedUdd) { $env:CLAUDE_USER_DATA_DIR = $savedUdd } else { Remove-Item Env:\CLAUDE_USER_DATA_DIR -ErrorAction SilentlyContinue }
+    if ($savedCfg) { $env:CLAUDE_CONFIG_DIR = $savedCfg } else { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
     $tempRoot = [System.IO.Path]::GetTempPath()
     if ((Split-Path $fixtureRoot -Leaf) -like 'claudefix-ci-*' -and
         $fixtureRoot.StartsWith($tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -and

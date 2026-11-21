@@ -20,7 +20,7 @@
 
     SAFETY FEATURES (v3.3+):
     - Auto-fix is BLOCKED when user is active (Claude in focus, recent input, VM busy, CPU active)
-    - Claude Code session awareness (detects active Code sessions via session files + renderer logs)
+    - Claude Code session awareness (detects active Code sessions via session files, app logs + CLI transcripts)
     - Cowork session awareness (detects active Cowork VM processes via log parsing)
     - Claude startup grace period (defers auto-fix for 120s after Claude launch)
     - Extended CPU sampling (3 samples over 3s to catch bursty API-wait patterns)
@@ -2303,6 +2303,18 @@ function Test-ClaudeCodeActive {
            recently written (10 min). The first two show LOCAL_SESSION activity
            when Code is streaming/processing; the third is written for Remote
            Control sessions, which is how project threads run on a PC.
+        3. Claude Code's own transcripts: any *.jsonl under the CLI's
+           projects folder written in the last 10 min.
+
+        WHY CHECK 3. Checks 1 and 2 are things the app writes about a session,
+        and it does not write them while the session works. Measured
+        2026-11-21 17:25, with two project threads working that minute: their
+        transcripts were written at 17:25, the newest session file at 17:09,
+        remote-control.log at 17:12 and claude.ai-web.log at 16:47. Checks 1
+        and 2 both answered no. The CLI appends to its transcript on every
+        message and tool result, and a subagent to its own file beside it.
+        A terminal session counts too: holding a repair back for one costs a
+        retry two minutes later, which is the cheap mistake.
 
         WHERE. Both checks used to read %APPDATA%\Claude only, through
         $ClaudeAppData and $ClaudeLogDir. On app 6.18355 (measured 2026-11-21)
@@ -2334,18 +2346,37 @@ function Test-ClaudeCodeActive {
             # Said once: either Code has never run here, or the app has moved
             # its data somewhere Get-ClaudeDataCandidates does not look.
             $script:NoCodeSessionDirLogged = $true
-            Write-WatchLog "Test-ClaudeCodeActive: no claude-code-sessions folder under any known data root; only the log check can see a Code session"
+            Write-WatchLog "Test-ClaudeCodeActive: no claude-code-sessions folder under any known data root; only the log and transcript checks can see a Code session"
         }
 
-        # Check 2: app log recency. Even during quiet API-wait periods,
-        # messages appear every few minutes. A folder whose newest log is older
-        # than the window cannot hold a recent one, so it is skipped unread.
+        # Check 2: app log recency. These are written as the app shows a
+        # session, which can be minutes apart while the session works; check 3
+        # covers the gaps. A folder whose newest log is older than the window
+        # cannot hold a recent one, so it is skipped unread.
         foreach ($ld in @($cands.LogDirs)) {
             if (-not $ld.Newest -or ($now - $ld.Newest).TotalMinutes -ge 10) { continue }
             foreach ($pattern in @('unknown-window*.log', 'claude.ai-web*.log', 'remote-control*.log')) {
                 foreach ($rLog in @(Get-ChildItem -LiteralPath $ld.Path -Filter $pattern -File -ErrorAction SilentlyContinue)) {
                     if (($now - $rLog.LastWriteTime).TotalMinutes -lt 10) { return $true }
                 }
+            }
+        }
+
+        # Check 3: the CLI's transcripts, <config dir>\projects\<project>\
+        # <session>.jsonl and <session>\subagents\**\*.jsonl. The config dir
+        # is CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude; the
+        # watchdog task runs as the user, so that is the user's. Measured
+        # 2026-11-21: 3,904 files, listed in 160 ms. This runs only when a
+        # repair is about to start, never on the poll.
+        $cfgDir = $env:CLAUDE_CONFIG_DIR
+        if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
+        if ($cfgDir) {
+            $projects = Join-Path $cfgDir "projects"
+            if (Test-Path -LiteralPath $projects -PathType Container) {
+                $recentTranscript = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
+                    Where-Object { ($now - $_.LastWriteTime).TotalMinutes -lt 10 } |
+                    Select-Object -First 1
+                if ($recentTranscript) { return $true }
             }
         }
     } catch {
@@ -2369,7 +2400,7 @@ function Test-UserActivity {
         2. User input within 3 minutes + Claude running
         3. VM log active within 120s (covers Code thinking phases)
         4. CPU sampling -- any Claude process burning >100ms CPU in 500ms
-        5. Active Claude Code session (session files or renderer logs)
+        5. Active Claude Code session (session files, app logs or CLI transcripts)
         6. Active Cowork session (created but not yet cleaned up in VM log)
 
         SESSION 0 (SYSTEM scheduled tasks):
@@ -2471,7 +2502,8 @@ function Test-UserActivity {
         # Check 5: Active Claude Code session
         # Code runs inside Claude Desktop but doesn't use the VM.
         # During API-wait periods, CPU can be near zero for minutes.
-        # Session files and renderer logs are more reliable indicators.
+        # Its transcripts, session files and app logs are more reliable
+        # indicators.
         if (Test-ClaudeCodeActive) { return $true }
 
         # Check 6: Active Cowork session (API-wait safe)
