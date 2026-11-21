@@ -1151,6 +1151,38 @@ public static class Win32Window {
 }
 '@
 
+# -- Stop the desktop app (shared function) ---------------------------
+function Stop-ClaudeDesktopApp {
+    <#
+    .SYNOPSIS
+        Stops the Claude Desktop app's processes and no other process named
+        claude, says how many others it left alone, and returns how many it
+        stopped.
+    .DESCRIPTION
+        "claude" is not a unique process name: the Claude Code CLI runs under
+        it too, for the app's project threads and for terminal sessions.
+        Get-ClaudeProcessInventory tells the app apart. The two escalations
+        after a relaunch kill through here; by then the relaunched app may
+        have started new CLI processes, and the log says how many were spared.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    $inventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+    $appProcs  = @($inventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
+    $spared    = @($inventory | Where-Object { -not $_.IsDesktop }).Count
+    $stopped   = 0
+    if ($appProcs.Count -gt 0 -and $PSCmdlet.ShouldProcess("$($appProcs.Count) Claude process(es)", "Stop")) {
+        $appProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+        $stopped = $appProcs.Count
+    }
+    if ($spared -gt 0) {
+        Log "Left $spared other process(es) named claude alone (Claude Code CLI, or not identifiable as the app)" `
+            -Colour DarkGray -Indent
+    }
+    return $stopped
+}
+
 # -- Find Claude.exe (shared function) -------------------------------
 function Find-ClaudeExe {
     <#
@@ -1182,12 +1214,14 @@ function Find-ClaudeExe {
         return $script:CapturedClaudeExe
     }
 
-    # 1. Cached path from a previous run. The claude-code filter matters here
-    #    too: a cache written by an older build may hold the CLI path.
+    # 1. Cached path from a previous run. The CLI filter matters here too: a
+    #    cache written before 6.2.0 may hold a CLI path, because the old
+    #    Step 1 capture took the first process named claude and only knew the
+    #    claude-code folder, not the terminal install in .local\bin.
     if (Test-Path $ExePathCache) {
         try {
             $cached = (Get-Content $ExePathCache -Raw -ErrorAction Stop).Trim()
-            if ($cached -and $cached -notmatch '[\\/]claude-code[\\/]' -and (Test-Path $cached)) {
+            if ($cached -and -not (Test-ClaudeCodeCliPath $cached) -and (Test-Path $cached)) {
                 Log "Found (cached): $cached" -Colour DarkGray -Indent
                 return $cached
             }
@@ -1208,7 +1242,7 @@ function Find-ClaudeExe {
                     $appPath = Join-Path $props.Path "Claude.exe"
                 }
             }
-            if ($appPath -and (Test-Path $appPath)) {
+            if ($appPath -and -not (Test-ClaudeCodeCliPath $appPath) -and (Test-Path $appPath)) {
                 Log "Found (App Paths): $appPath" -Colour DarkGray -Indent
                 return $appPath
             }
@@ -1230,7 +1264,7 @@ function Find-ClaudeExe {
             if (-not $lnk) { continue }
             $shell  = New-Object -ComObject WScript.Shell
             $target = $shell.CreateShortcut($lnk.FullName).TargetPath
-            if ($target -and $target -notmatch '[\\/]claude-code[\\/]' -and (Test-Path $target)) {
+            if ($target -and -not (Test-ClaudeCodeCliPath $target) -and (Test-Path $target)) {
                 Log "Found (Start Menu shortcut): $target" -Colour DarkGray -Indent
                 return $target
             }
@@ -3287,8 +3321,14 @@ Log "[4/10] Checking for orphan processes..." -Colour Yellow
 
 # The app's own processes and the service only. A Claude Code CLI process is not
 # an orphan of the app: it belongs to a project thread or a terminal session.
-$remaining = @(@(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv) +
+$orphanInventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+$orphanSpared    = @($orphanInventory | Where-Object { -not $_.IsDesktop }).Count
+$remaining = @(@($orphanInventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process }) +
                @(Get-Process -Name $ServiceExe -ErrorAction SilentlyContinue))
+if ($orphanSpared -gt 0) {
+    Log "Leaving $orphanSpared other process(es) named claude alone (Claude Code CLI, or not identifiable as the app)" `
+        -Colour DarkGray -Indent
+}
 if ($remaining.Count -gt 0) {
     if ($PSCmdlet.ShouldProcess("$($remaining.Count) orphan process(es)", "Force-kill")) {
         foreach ($proc in $remaining) {
@@ -4271,7 +4311,7 @@ if ($SkipLaunch) {
                     Log "[!] No progress after ${vmElapsed}s, no log activity, no guest polling" -Colour Red -Indent
                     Log "Escalating: killing Claude, cleaning HCS, relaunching..." -Colour Yellow -Indent
                     # Kill the app, not the Claude Code CLI processes beside it
-                    Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv | Stop-Process -Force
+                    $null = Stop-ClaudeDesktopApp
                     Start-Sleep -Seconds 2
                     # Clean HCS
                     try { Close-StaleHcsVms -Action kill | Out-Null } catch { $null = $_ }
@@ -4397,7 +4437,7 @@ if (-not $vmReady -and -not $SkipLaunch -and $script:IsAdmin -and
     Log "" -Colour White
     Log "Smart mode: workspace not ready after quick fix, escalating to Deep" -Colour Yellow
     # Phase 0: Kill the app (not the Claude Code CLI) + HCS cleanup
-    Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv | Stop-Process -Force
+    $null = Stop-ClaudeDesktopApp
     Start-Sleep -Seconds 2
     try { Close-StaleHcsVms -Action kill | Out-Null } catch { $null = $_ }
     # Phase 1: stop the service

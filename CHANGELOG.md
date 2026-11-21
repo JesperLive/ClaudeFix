@@ -28,6 +28,15 @@ run the scripts straight from this folder, so pulling is deploying.
   The launch check, the remaining-process check and the closing summary count
   the app only, so a surviving CLI no longer reads as a successful launch.
 
+- A relaunch starts the app, not the terminal CLI.
+
+  The old Step 1 cached the exe of the first process named `claude`, and the
+  cache check only knew the CLI by its `claude-code` folder, so a cache
+  written while a terminal CLI ran first could hold `.local\bin\claude.exe`
+  and every relaunch would start the CLI. The cached path, the App Paths key
+  and the Start Menu shortcut are now each refused when they name the CLI by
+  folder or by product name, and a refused cache is deleted.
+
 - The health monitor sees the app quit while a CLI is running.
 
   With every `claude` counted, a live CLI kept "Claude is running" true after
@@ -126,6 +135,14 @@ run the scripts straight from this folder, so pulling is deploying.
   each was found, the VM-cache, bundle and session folders under the data
   root, and the candidates passed over. `Import-ClaudeEnvironment` refuses a
   version 1 file.
+
+- CI: the kill check parses the three scripts and the scripts they generate,
+  instead of matching one line at a time, and follows a process lookup through
+  a variable or a foreach. Run on 0aa8d07 it finds all six broad kills, where
+  the line check found the two escalations only, and it proves itself against
+  copies of those kills on every run. The launcher check builds the "Claude
+  (no GPU)" launcher from Prevent's own source and runs its process filter
+  against fake processes, instead of testing a hand copy that had drifted.
 
 ### Repairs that could not run before can run now
 
