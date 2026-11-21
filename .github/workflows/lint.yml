@@ -70,6 +70,10 @@ jobs:
         shell: powershell
         run: .\.ci\Test-DataDiscovery.ps1
 
+      - name: Only VM error lines start a repair
+        shell: powershell
+        run: .\.ci\Test-LogTriggers.ps1
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: |

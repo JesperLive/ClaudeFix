@@ -395,7 +395,7 @@ Two corrections here, both from the 6.0.x audit. Every version before 6.0.0 call
 
 A persistent background process that starts at logon and polls every 30 seconds.
 
-1. **Claude log files**: scans every `*.log` in the app's log folder for known VirtioFS error strings, reading only what each file has gained since the last poll. A file seen for the first time is read from its current end, so old errors are not replayed.
+1. **Claude log files**: scans the app's VM log (`cowork_vm_node*.log`) and main log (`main*.log`) for a VirtioFS mount or HCS failure signature inside an entry the app logged at `[error]`, reading only what each file has gained since the last poll. A file seen for the first time is read from its current end, so old errors are not replayed. Lines at `[info]` or `[warn]`, lines from `[remote-bash]` (remote sessions' commands), and the browser, web and MCP logs never trigger a repair: app 6.18355 logs a harmless `RPC error -1` at `[info] [remote-bash]` when a remote session's probe finds its worker already running.
 2. **Service status**: detects when `CoworkVMService` stops while Claude is still running (2 consecutive checks)
 3. **Windows Event Log**: checks for Claude-specific `CoworkVMService` errors and Hyper-V Worker/VMMS errors (2 consecutive checks, whole message examined, not just the first line)
 4. **WinNAT health**: reports a missing NAT rule (every 60 seconds, warning only)
@@ -432,7 +432,7 @@ The entire toolkit is designed to **never interrupt active work**, whether you'r
 - **Fix script activity guard**: `Fix-ClaudeDesktop.ps1` itself now checks for active use when called with `-Quiet` (by the monitor or boot task). Three checks: CPU sampling, VM log, user input. Blocks and exits if anything is active. Manual runs (no `-Quiet`) always proceed
 - **BootPrep mode** (v4.8.4): the logon task now uses non-destructive `-BootPrep` mode with a 45-second delay instead of the previous 180-second full fix. It unconditionally restarts `vmcompute` for a clean HCS state without killing Claude, stopping services, or purging cache. If Claude is already running with an active workspace, it exits silently
 - **Startup grace period**: all heuristic checks (log scanning, event log, staleness) are skipped for the first 180 seconds after the monitor starts, preventing false triggers from pre-existing events
-- **Consecutive-check gates**: every heuristic trigger requires multiple consecutive failures before firing (service: 2, event log: 2, guest-connect: 3, staleness: 5). Only the log-file pattern check (actual VirtioFS error strings) triggers immediately
+- **Consecutive-check gates**: every heuristic trigger requires multiple consecutive failures before firing (service: 2, event log: 2, guest-connect: 3, staleness: 5). Only the log-file check (a VM failure signature in an `[error]` entry) triggers immediately
 - **Tightened event log matching**: Hyper-V VMMS events must mention "claude" or "cowork" (no generic "failed"/"unexpected" matching). Worker events: Critical/Error only
 - **VM log staleness requires prior activity**: only triggers if the VM log was previously active this session, preventing false positives in Chat mode
 - **5-minute cooldown**: between auto-fixes

@@ -65,7 +65,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.2.0
+    Version : 6.2.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -983,7 +983,7 @@ function Get-ClaudeVmLogAge {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.2.0"
+$ToolkitVersion  = "6.2.1"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName

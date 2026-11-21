@@ -40,7 +40,7 @@
     Reverts all changes made by this script.
 
 .NOTES
-    Version : 6.2.0
+    Version : 6.2.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -945,7 +945,7 @@ function Get-ClaudeVmLogAge {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.2.0"
+$ToolkitVersion   = "6.2.1"
 $TaskName         = "ClaudeCoworkWatchdog"
 $BootTaskName     = "ClaudeCoworkBootFix"
 $TaskPath         = "\Claude\"
