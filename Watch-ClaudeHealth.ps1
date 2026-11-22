@@ -12,15 +12,22 @@
       or HCS failure signature
     - CoworkVMService status (stopped while Claude is running)
     - Windows Event Log for service, Hyper-V, and HCS Compute errors/warnings
-    - WinNAT rules (VM network connectivity)
-    - Hyper-V Integration Services heartbeat
     - VM log staleness (hung VM detection)
     - vmcompute handle leak detection (HCS service health)
-    - cowork-service.log for isGuestConnected RPC timeout patterns
-    - Host clock drift (NTP/time sync)
+    - Host clock drift (NTP/time sync). A clock check that fails part-way,
+      as when w32tm cannot be started or answers with an error and no
+      offset, is logged as a TIME WARNING naming the error, and a
+      measurement that does not answer within 15s as skipped, each at most
+      once an hour for the same error (v6.3.0+)
+    - A check or a read that fails, such as an Event Log read, the free
+      space of the VM's volume or the list of VM worker processes, is
+      logged naming the check and the error, at most once an hour for the
+      same error and for 3 errors of one check (v6.3.0+)
 
     SAFETY FEATURES (v3.3+):
-    - Auto-fix is BLOCKED when user is active (Claude in focus, recent input, VM busy, CPU active)
+    - Auto-fix is BLOCKED when user is active (Claude in focus, recent input, VM busy, CPU active),
+      and, before the 30-second warning, for a Claude Code session the app started or a Code
+      transcript written in the last 35 minutes, which Fix's own gate holds a run back for (v6.3.0+)
     - Claude Code session awareness (detects active Code sessions via session files, app logs + CLI transcripts)
     - Cowork session awareness (detects active Cowork VM processes via log parsing)
     - Claude startup grace period (defers auto-fix for 120s after Claude launch)
@@ -31,6 +38,24 @@
     - Consecutive-check requirements on all heuristic triggers
     - Event log matching tightened to Claude-specific messages only
     - Cooldown between fixes (default 5 min)
+    - A repair for a log error or an Event Log error that Fix held back (exit
+      3), that was BLOCKED or DEFERRED, or that fired during the wait a hold
+      leaves, is tried again once the hold has cleared: with the 30-second
+      warning at most 3 times, for up to 4 hours, and not after an app
+      restart or a Fix run that started the repair. A Fix run that stopped
+      before the repair, such as a Diagnostic run, a Cancel or a No at
+      "Proceed?", does not end it, and while a Fix run holds Fix's lock the
+      repair waits for it to end. A log error or Event Log error that fires
+      while a repair is pending takes it over, and its 4 hours start again
+      from then (v6.3.0+)
+    - Each run Fix holds back in a row doubles the wait before the next
+      repair: 2, 4, 8, 16, 32, then 60 minutes, until a run Fix does not hold
+      back, a Fix run by hand that started the repair, which also ends the
+      wait 5 minutes after it at the latest, or a hold 4 hours or more after
+      the one before. BLOCKED and COOLDOWN lines for the same
+      reason, and SKIPPED lines while a Fix run holds Fix's lock, are written
+      at most once every 10 minutes; with a repair pending, SKIPPED is
+      written once for each such run (v6.3.0+)
     - VM log window extended to 120s (covers Code thinking phases)
 
     When a failure is detected AND the user is idle, automatically runs
@@ -73,7 +98,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 6.2.1
+    Version : 6.3.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -689,6 +714,80 @@ function Get-ClaudeDesktopProcess {
              Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
 }
 
+function Get-ClaudeAppCliProcess {
+    <#
+    .SYNOPSIS
+        The Claude Code CLI processes the desktop app started, one for each
+        project thread or Code session it runs.
+    .DESCRIPTION
+        Measured 2026-11-21 on app 6.18355: four CLI processes, each a child
+        of the app's main process, and one terminal CLI whose parent was
+        python.exe. A repair stops the app, and the sessions it started stop
+        with it, busy or waiting. A session waiting on a long command uses no
+        CPU and writes nothing, so a check of CPU, logs or transcripts can
+        miss it. Its process is there to be seen.
+
+        A CLI counts when its parent is any desktop process, so which of the
+        app's processes started it does not matter. A terminal CLI is not
+        counted: a repair does not end it.
+
+        Throws when the parent ids cannot be read, so a caller deciding
+        whether a repair may run can fail closed.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+
+    $inventory = @(Get-ClaudeProcessInventory -Environment $Environment)
+    $cli = @($inventory | Where-Object { $_.Kind -eq 'cli' })
+    if ($cli.Count -eq 0) { return @() }
+    $desktop = @{}
+    foreach ($e in $inventory) { if ($e.IsDesktop) { $desktop[[int]$e.Id] = $true } }
+    if ($desktop.Count -eq 0) { return @() }
+    $parentOf = @{}
+    foreach ($w in @(Get-CimInstance Win32_Process -Filter "Name='$($Environment.ProcessName).exe'" -ErrorAction Stop)) {
+        $parentOf[[int]$w.ProcessId] = [int]$w.ParentProcessId
+    }
+    return @($cli | Where-Object { $parentOf.ContainsKey([int]$_.Id) -and $desktop.ContainsKey($parentOf[[int]$_.Id]) })
+}
+
+function Test-ClaudeCodeTranscriptRecent {
+    <#
+    .SYNOPSIS
+        Whether any Claude Code transcript was written in the last $Minutes
+        minutes.
+    .DESCRIPTION
+        <config dir>\projects\<project>\<session>.jsonl, and a subagent's
+        <session>\subagents\**\*.jsonl beside it. The config dir is
+        CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude. The CLI
+        appends on every message and tool result. Measured 2026-11-21: 3,904
+        files, listed in 160 ms.
+
+        The monitor and Fix -Quiet both ask with 35 minutes. A tool call
+        writes nothing here until it returns, and a foreground command may
+        run for 30 minutes: measured 2026-11-21, three Bash calls of 25
+        minutes each in a row in one project thread, nothing written during
+        the first two.
+
+        Ages are taken in UTC. Local time jumps an hour at a daylight-saving
+        change, and until 6.3.0 a transcript written 20 minutes before the
+        spring change read as 80 minutes old, so an unattended repair could
+        start while a session was working.
+    #>
+    param([int]$Minutes = 35)
+
+    $cfgDir = $env:CLAUDE_CONFIG_DIR
+    if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
+    if (-not $cfgDir) { return $false }
+    $projects = Join-Path $cfgDir "projects"
+    if (-not (Test-Path -LiteralPath $projects -PathType Container)) { return $false }
+    $now = [datetime]::UtcNow
+    $recent = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { ($now - $_.LastWriteTimeUtc).TotalMinutes -lt $Minutes } |
+        Select-Object -First 1
+    return [bool]$recent
+}
+
 function Get-ClaudeDataCandidates {
     <#
     .SYNOPSIS
@@ -910,15 +1009,16 @@ function Get-ClaudeVmLogCandidates {
                         Name          = $n
                         Path          = $fi.FullName
                         LastWriteTime = $fi.LastWriteTime
+                        LastWriteTimeUtc = $fi.LastWriteTimeUtc
                         AgeHours      = [math]::Round( `
-                            ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
+                            ([datetime]::UtcNow - $fi.LastWriteTimeUtc).TotalHours, 2)
                         Length        = $fi.Length
                     }
                 }
             }
         } catch { $null = $_ }
     }
-    return @($cands | Sort-Object LastWriteTime -Descending)
+    return @($cands | Sort-Object LastWriteTimeUtc -Descending)
 }
 
 function Get-ClaudeVmLogAge {
@@ -933,12 +1033,146 @@ function Get-ClaudeVmLogAge {
         the VM (each command again, and a clock line every few hours). A
         freshness test that read only the log that happened to be newest when
         the script started could be reading the quiet one. Never throws.
+        Measured in UTC, so a daylight-saving change does not move it an hour.
     #>
     param([string]$LogDir)
 
     $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
     if ($c.Count -eq 0) { return $null }
-    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
+    return ([datetime]::UtcNow - $c[0].LastWriteTimeUtc).TotalSeconds
+}
+
+function Get-CoworkWorkerProcessIds {
+    <#
+    .SYNOPSIS
+        The process ids of the vmwp.exe workers that run the Cowork VM.
+    .DESCRIPTION
+        Every Hyper-V VM, and every WSL2 or Windows Sandbox utility VM, has a
+        vmwp.exe of its own. A worker's first command-line argument is the
+        GUID of the compute system it runs:
+
+            "C:\Windows\System32\vmwp.exe" ECDA1B8B-...-0A4035733BF3 0x330
+
+        Matching that against the GUIDs Get-CoworkHcsGuids reads out of
+        "hcsdiag list" picks the Cowork VM's worker and nothing else. Until
+        6.3.0 Prevent and the monitor raised the priority of every vmwp.exe
+        on the machine.
+
+        Takes the list text and the worker objects (anything with ProcessId
+        and CommandLine, as Win32_Process gives) rather than querying either,
+        so it can be tested without Hyper-V.
+    #>
+    param([string]$ListOutput, [object[]]$Workers)
+
+    $guids = @(Get-CoworkHcsGuids -ListOutput $ListOutput)
+    if ($guids.Count -eq 0) { return @() }
+    $ids = @()
+    foreach ($w in @($Workers)) {
+        if ($null -eq $w) { continue }
+        $g = Get-VmWorkerGuid -CommandLine ([string]$w.CommandLine)
+        if ($g -and $guids -contains $g) { $ids += [int]$w.ProcessId }
+    }
+    return @($ids)
+}
+
+function Get-VmWorkerGuid {
+    <#
+    .SYNOPSIS
+        The GUID of the compute system a vmwp.exe runs, read from its command
+        line, or $null when the line holds none.
+    .DESCRIPTION
+        The worker takes that GUID as its first argument:
+
+            "C:\Windows\System32\vmwp.exe" ECDA1B8B-...-0A4035733BF3 0x330
+
+        Only the first argument is read. Until 6.3.0 Fix took the first GUID
+        anywhere on the line.
+    #>
+    param([string]$CommandLine)
+
+    if ($CommandLine -match '^\s*(?:"[^"]*"|\S+)\s+\{?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Get-CoworkHcsSurvivors {
+    <#
+    .SYNOPSIS
+        Which of the given Cowork compute systems "hcsdiag list" still shows,
+        or $null when the list could not be read.
+    .DESCRIPTION
+        A kill that returned is no proof the compute system is gone. Until
+        6.3.0 Fix counted every kill it sent as done, and the monitor logged
+        "killed" for each one, whether hcsdiag had removed anything or not.
+
+        $List is a script block that returns the list text when hcsdiag
+        answered, and nothing (or $null) when it did not: a timeout or an
+        exit code other than 0. Each script keeps its own way of running
+        hcsdiag: Fix and the monitor through a job with a timeout, Prevent
+        directly. The list is read up to $Attempts times, $DelaySeconds
+        apart, because a compute system can take a moment to leave it.
+
+        An empty answer is an answer: "hcsdiag list" prints nothing at all
+        when no compute system is left, which is what a kill of the only one
+        leaves. Until 6.3.0 that read as "did not answer", so every kill of a
+        lone Cowork VM was reported as unconfirmed.
+
+        Returns an array, empty when every one is gone. The leading comma
+        keeps an empty array from reaching the caller as $null, which here
+        means "not known": the first read did not answer. A later read that
+        does not answer keeps what the read before it showed, so a kill that
+        read confirmed is not thrown away; the ones returned were still
+        listed when the list was last read.
+    #>
+    param([string[]]$Guids, [scriptblock]$List, [int]$Attempts = 2, [int]$DelaySeconds = 2)
+
+    $left = @($Guids)
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        if ($i -gt 0) { Start-Sleep -Seconds $DelaySeconds }
+        $out = & $List
+        if ($null -eq $out) {
+            if ($i -eq 0) { return $null }
+            break
+        }
+        # Joined with newlines: [string] on an array joins with spaces, and the
+        # parser reads the list one line at a time.
+        $text = @($out) -join "`n"
+        $listed = @(Get-CoworkHcsGuids -ListOutput $text)
+        $left = @($left | Where-Object { $listed -contains $_ })
+        if ($left.Count -eq 0) { break }
+    }
+    return ,$left
+}
+
+function Get-W32tmOffsetSeconds {
+    <#
+    .SYNOPSIS
+        The clock offset in seconds from what "w32tm /stripchart /dataonly"
+        prints, or $null when the text holds none.
+    .DESCRIPTION
+        Each sample line ends in the offset:
+
+            20:22:22, -00.0684055s
+
+        w32tm writes the number in the system locale, so a machine set to
+        Dutch or German prints "-00,0684055s". The pattern every copy of this
+        check used, a dot only, never matched there, and the drift check read
+        "could not measure" on every such machine. Both separators are taken,
+        and the number is parsed with the invariant culture so the result does
+        not depend on the locale either. Error lines ("error: 0x800705B4")
+        carry no offset and are skipped; the last sample wins.
+    #>
+    param([string]$Text)
+
+    if (-not $Text) { return $null }
+    $value = $null
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '([+-]?\d+[.,]\d+)s\s*$') {
+            $value = [double]::Parse(($Matches[1] -replace ',', '.'), [Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return $value
 }
 #endregion ClaudeEnv
 
@@ -949,12 +1183,44 @@ function Get-ClaudeVmLogAge {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -----------------------------------------------------------
-$ToolkitVersion = "6.2.1"
+$ToolkitVersion = "6.3.0"
 $ServiceName    = $script:ClaudeEnv.ServiceName
 $ProcessName    = $script:ClaudeEnv.ProcessName
-# This toolkit's folder, %APPDATA%\Claude: watch-logs, watch-state.json and
-# the dynamic-memory flag live here whatever the app does with its own data.
+# This toolkit's folder, %APPDATA%\Claude: watch-logs and watch-state.json
+# live here whatever the app does with its own data.
 $ClaudeAppData  = $script:ClaudeEnv.AppDataDir
+
+# Fix's exit code for a run it held back before it stopped the app or the
+# service: another Fix run held the lock; or Fix's -Quiet gate at its start
+# found Claude or the PC in use (a Claude Code session or a recent transcript,
+# claude using CPU, a recent VM log, or keyboard or mouse input in the last 3
+# minutes); or, right before Step 1's kill, Fix found a Claude Code session or
+# could not rule one out. It must match $script:BlockedExitCode
+# in Fix-ClaudeDesktop.ps1, which a test checks. Such a run is not counted as
+# an attempt at a repair, and a repair for a one-shot trigger is kept pending
+# and tried again once the hold has cleared, as is one for a one-shot trigger
+# that fires during the wait the hold leaves: see Invoke-HeldBackRetry. Each
+# run Fix holds back in a row doubles the wait before the next repair, from 2
+# minutes up to 60, until a run it does not hold back, a Fix run by hand that
+# started the repair, or a hold 4 hours or more after the one before: see
+# Invoke-AutoFix.
+# Until 6.3.0 Fix exited 0 for it, so it was logged as COMPLETE, counted
+# toward the "failed 3 times" escalation, and what had been detected was
+# dropped.
+$FixHeldBackExitCode = 3
+
+# Fix's exit code for a run that stopped part-way: Steps 1 and 2 had run, so
+# the app and the service were stopped if they were running, and then, before
+# Step 4 or an escalation would stop the app again, Fix found a Claude Code
+# session or could not rule one out. If this run stopped the service, Fix
+# tries to start it again before it exits, and logs a warning if that start
+# fails. It must match
+# $script:StoppedPartWayExitCode in Fix-ClaudeDesktop.ps1, which a test checks.
+# The run changed things, so unlike a held-back run it is an attempt at a
+# repair: it counts toward the escalation, what was detected is reset, the
+# normal cooldown applies, and the longer wait that runs Fix held back in a
+# row build up starts again from 2 minutes.
+$FixStoppedPartWayExitCode = 4
 
 # The app's freshest logs folder, from Resolve-ClaudeDataPaths. Until 6.2.0
 # this was %APPDATA%\Claude\logs, which app 6.18355 no longer writes: its logs
@@ -967,6 +1233,17 @@ if (-not $ClaudeAppData -or -not $ClaudeLogDir) {
     exit 1
 }
 $WatchLogDir    = Join-Path $ClaudeAppData "watch-logs"
+# Fix-ClaudeDesktop's own log folder, its $LogDir. A Fix log there newer than
+# the latest hold of a pending repair, and holding $FixRepairLine, is a Fix
+# run since that started the repair, which ends the pending one: see
+# Get-FixRunAfter.
+$FixLogDir      = Join-Path $ClaudeAppData "fix-logs"
+# The line Fix logs once a run is past every check that holds it back and
+# has begun the repair. A Fix log without it is a run that changed nothing,
+# such as a Diagnostic run, a Cancel or a No at "Proceed?", and does not end
+# a pending repair. It must match $script:RepairUnderWayLine in
+# Fix-ClaudeDesktop.ps1, which a test checks.
+$FixRepairLine  = 'Repair under way: this run is past every check that holds it back'
 
 # -- Stealth-update marker -----------------------------------------------
 # The app writes this file immediately before it quits itself to install a
@@ -1053,10 +1330,13 @@ $LogTriggerFilePattern = '^(cowork_vm_node|main)\d*\.log$'
 # In Session 0 (SYSTEM scheduled tasks), they return zero/stale data.
 # We detect this and fall back to process-only heuristics.
 $script:IsInteractiveSession = $false
+# Why the session could not be read, logged below the banner, once the log
+# exists; $null when it was read.
+$script:SessionReadError = $null
 try {
     $sessionId = (Get-Process -Id $PID -ErrorAction Stop).SessionId
     $script:IsInteractiveSession = ($sessionId -gt 0)
-} catch { $null = $_ }
+} catch { $script:SessionReadError = $_ }
 
 # Set once the Add-Type below is confirmed to have produced a usable type.
 $script:Win32ActivityLoaded = $false
@@ -1119,12 +1399,17 @@ if (-not (Test-Path $fixScript)) {
 # -- Logging -------------------------------------------------------------
 if (-not (Test-Path $WatchLogDir)) { New-Item $WatchLogDir -ItemType Directory -Force | Out-Null }
 
-# Clean old watch logs (>30 days)
+# Clean old watch logs (>30 days). Measured in UTC, like every age this
+# monitor keeps: local time jumps an hour when summer time starts or ends.
 try {
     Get-ChildItem $WatchLogDir -Filter "watch_*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+        Where-Object { $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-30) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
-} catch { $null = $_ }
+} catch {
+    # Housekeeping, before there is a log to say it in: an old log left
+    # now is tried again at the next start or rollover, and no check reads it.
+    $null = $_
+}
 
 $script:WatchLogFile = Join-Path $WatchLogDir ("watch_{0:yyyyMMdd}.log" -f (Get-Date))
 
@@ -1145,7 +1430,11 @@ function Write-WatchLog {
         # BOM on Windows PowerShell 5.1.
         [System.IO.File]::AppendAllText($script:WatchLogFile, $line + "`r`n", `
             (New-Object System.Text.UTF8Encoding($false)))
-    } catch { $null = $_ }
+    } catch {
+        # The log cannot say that it cannot be written. The line still goes
+        # to the console below when there is one, and each line is tried.
+        $null = $_
+    }
     if (-not $Quiet) { Write-Host $line -ForegroundColor DarkGray }
 }
 
@@ -1164,9 +1453,13 @@ function Update-LogFile {
         # again. Doing it on rollover is the only point at which it recurs.
         try {
             Get-ChildItem $WatchLogDir -Filter "watch_*.log" -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+                Where-Object { $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-30) } |
                 Remove-Item -Force -ErrorAction SilentlyContinue
-        } catch { $null = $_ }
+        } catch {
+            # Housekeeping: an old log left now is tried again at the next
+            # rollover, and no check reads it.
+            $null = $_
+        }
     }
 }
 
@@ -1185,29 +1478,57 @@ if (-not (Test-Path $fixScript)) {
 function Invoke-HcsDiag {
     <#
     .SYNOPSIS
-        Runs hcsdiag.exe with a timeout. Returns output string or $null on timeout.
+        Runs hcsdiag.exe with a timeout. Returns its output when it exited 0,
+        '' when it exited 0 and printed nothing, and $null when it exited with
+        any other code, timed out or is not installed.
+    .DESCRIPTION
+        The same contract as Fix's copy. Until 6.3.0 the exit code was thrown
+        away: an error hcsdiag printed came back as if it were the list, so
+        the check after a kill read the error, found no compute system in it
+        and logged the kill as done. The exit code is read inside the job,
+        where hcsdiag runs.
+
+        A non-zero exit is logged once, and again only when what hcsdiag says
+        changes or it has answered in between: this runs on every poll, and a
+        host where it keeps failing would fill the log with the same line.
+
+        -HcsdiagPath is there for the tests, which point it at a stand-in.
     #>
     param(
         [string[]]$Arguments,
-        [int]$TimeoutSeconds = 15
+        [int]$TimeoutSeconds = 15,
+        [string]$HcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
     )
-    $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
-    if (-not (Test-Path $hcsdiagPath)) { return $null }
+    if (-not (Test-Path -LiteralPath $HcsdiagPath)) { return $null }
     $job = Start-Job -ScriptBlock {
         param($p, $a)
-        & $p @a 2>&1 | Out-String
-    } -ArgumentList $hcsdiagPath, $Arguments
+        $text = & $p @a 2>&1 | Out-String
+        [pscustomobject]@{ Text = $text; ExitCode = $LASTEXITCODE }
+    } -ArgumentList $HcsdiagPath, $Arguments
     $completed = Wait-Job $job -Timeout $TimeoutSeconds
-    if ($completed) {
-        $result = Receive-Job $job
-        Remove-Job $job -Force
-        return $result
-    } else {
+    if (-not $completed) {
         Stop-Job $job -ErrorAction SilentlyContinue
         Remove-Job $job -Force -ErrorAction SilentlyContinue
         Write-WatchLog "hcsdiag timed out after ${TimeoutSeconds}s (args: $($Arguments -join ' '))"
         return $null
     }
+    $result = @(Receive-Job $job -ErrorAction SilentlyContinue) |
+        Where-Object { $null -ne $_ -and $_.PSObject.Properties['ExitCode'] } | Select-Object -Last 1
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    if ($null -eq $result) { return $null }
+    if ($result.ExitCode -ne 0) {
+        $firstLine = @(([string]$result.Text) -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+        $said = if ($firstLine) { ": $($firstLine.Trim())" } else { '' }
+        # The verb only, so a kill of each GUID in turn is one note, not one each.
+        $note = "hcsdiag $(@($Arguments)[0]) exited $($result.ExitCode)$said"
+        if ($note -ne $script:LastHcsDiagNote) {
+            Write-WatchLog $note
+            $script:LastHcsDiagNote = $note
+        }
+        return $null
+    }
+    $script:LastHcsDiagNote = $null
+    return [string]$result.Text
 }
 
 function Get-HcsListCached {
@@ -1229,7 +1550,9 @@ function Get-HcsListCached {
     #>
     param([int]$MaxAgeSeconds = 25)
 
-    $now = Get-Date
+    # UTC, so a change of the clock to or from summer time does not make the
+    # cache look an hour old or an hour from now.
+    $now = [datetime]::UtcNow
     if (($now - $script:LastHcsListTime).TotalSeconds -lt $MaxAgeSeconds) {
         return $script:LastHcsListText
     }
@@ -1239,26 +1562,71 @@ function Get-HcsListCached {
 }
 
 # -- State ---------------------------------------------------------------
-$script:StartTime            = Get-Date
+# Every time below is UTC. Local time jumps an hour when summer time starts or
+# ends, and for that hour a cooldown, a rate limit or the count of fixes in the
+# last 30 minutes, measured in local time, read an hour too long or too short.
+# Until 6.3.0 they were local.
+$script:StartTime            = [datetime]::UtcNow
 $script:LastHcsListTime      = [datetime]::MinValue
 $script:LastHcsListText      = $null
+# The last non-zero exit Invoke-HcsDiag logged, so it is not logged every poll.
+$script:LastHcsDiagNote      = $null
 $script:LastFixTime          = [datetime]::MinValue
 $script:LogBaselines         = @{}   # Track file sizes per log file
 $script:FixCount             = 0
-$script:LastNatCheckTime     = [datetime]::MinValue
 $script:LastTimeSyncCheck    = [datetime]::MinValue
-$script:LastHeartbeatStatus  = $null
-$script:HeartbeatFailCount   = 0     # Consecutive heartbeat failures
+# UTC time before which Test-TimeSyncHealth forces no resync, set when one
+# failed or did not bring the clock back. MinValue: no hold.
+$script:ResyncBackoffUntil   = [datetime]::MinValue
+# When each error a check failed with was last logged, by the check and the
+# error's message, UTC (Test-CheckErrorDue). In memory only.
+$script:CheckErrorsSaid      = @{}
 $script:VmLogStaleCount      = 0     # Consecutive stale checks
 $script:VmLogEverActive      = $false  # Has VM log ever been active this session?
 $script:ServiceDownCount     = 0     # Consecutive service-down checks
 $script:EventLogHitCount     = 0     # Consecutive event log hits
 $script:LastVmcomputeCheck   = [datetime]::MinValue
 $script:VmcomputeLeakCount   = 0     # Consecutive vmcompute handle leak checks
-$script:GuestFailCount       = 0     # Consecutive guest connection failures
 $script:LastHcsStateLogTime  = [datetime]::MinValue
 $script:LastShutdownFailLogTime = [datetime]::MinValue
 $script:FixHistory           = New-Object System.Collections.ArrayList
+# A repair held back for a one-shot trigger (Fix's exit 3, BLOCKED or
+# DEFERRED in Invoke-AutoFix, or the wait one of them leaves), which
+# Invoke-HeldBackRetry tries again once the hold has cleared: the reason it
+# was triggered for, when its 4 hours started (its first hold, or the latest
+# one-shot trigger that took it over), when it was last held back, how many
+# times Fix held it back after the 30-second warning, and how many of those
+# were retries, all persisted; when the hold is next asked about, and when
+# the last "still waiting" line was written, in memory only. $null, MinValue
+# and 0: none.
+$script:PendingFixReason     = $null
+$script:PendingFixSince      = [datetime]::MinValue
+$script:PendingFixHeldAt     = [datetime]::MinValue
+$script:PendingFixTries      = 0
+$script:PendingFixRetriesHeld = 0
+$script:PendingFixNextCheck  = [datetime]::MinValue
+$script:PendingFixWaitLogged = [datetime]::MinValue
+# In memory only, for the repair pending now: whether the line that a Fix
+# run holds Fix's lock has been written while it holds it
+# (Write-FixRunningSkip). $false: not yet.
+$script:PendingFixLockLogged  = $false
+# How many runs in a row Fix has held back (exit 3), and when it held back
+# the latest, UTC, both persisted. Each one doubles the wait before the next
+# repair (Get-HeldBackRetryWait); a run Fix does not hold back, a Fix log
+# since the latest that started the repair (a run by hand), or a hold 4
+# hours or more after the one before, starts the count again. 0 and
+# MinValue: none.
+$script:FixHeldInARow         = 0
+$script:FixHeldLastTime       = [datetime]::MinValue
+# Whether the cooldown in $script:LastFixTime was left by a hold, BLOCKED,
+# DEFERRED or Fix's exit 3, rather than by a repair that ran (this monitor's,
+# or a Fix run by hand after runs Fix held back), an escalation or a cancel.
+# Persisted with it. A one-shot trigger that fires in a cooldown a hold left
+# is kept as a held-back repair (Invoke-AutoFix). $false: not.
+$script:CooldownFromHold      = $false
+# When each line Test-LineDue keeps from repeating was last written, by key,
+# UTC. In memory only.
+$script:RepeatLinesSaid       = @{}
 # Epoch ms of the last stealth marker this monitor made a decision about, 0 for
 # none. Persisted, because the whole point of it is to survive the restart that
 # a failed launch attempt could otherwise turn into a 30-second relaunch loop.
@@ -1275,16 +1643,44 @@ $script:StealthNoAumidLogged = $false
 # Test-ClaudeCodeActive says once when it finds no claude-code-sessions folder.
 $script:NoCodeSessionDirLogged = $false
 # When Sync-ClaudeDataPaths next looks for the app's folders again.
-$script:NextDataPathSync = (Get-Date).AddMinutes(10)
+$script:NextDataPathSync = [datetime]::UtcNow.AddMinutes(10)
 $script:StatePath           = Join-Path $WatchLogDir "watch-state.json"
 # Seeded from the current state so the first poll does not report a transition
 # that did not happen. The app only, as in the main loop.
 $script:ClaudeWasRunning     = (@(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0)
 
+function ConvertFrom-WatchStateTime {
+    <#
+    .SYNOPSIS
+        A time read back from watch-state.json, as UTC.
+    .DESCRIPTION
+        From 6.3.0 the file holds UTC times, written with ToString('o'), which
+        ends them in Z. A file an older version wrote holds local times, with
+        the offset they had then. Read with RoundtripKind a Z time comes back
+        as UTC, and any other is read as local and converted, so a file from
+        before the update does not move the cooldown or the escalation's
+        window by the UTC offset. MinValue, which has no offset, stays
+        MinValue. Windows PowerShell's ConvertFrom-Json hands the times back
+        as strings; PowerShell 7's makes them DateTime already, and those are
+        converted the same way.
+    #>
+    param($Value)
+    if ($Value -is [datetime]) {
+        $t = $Value
+    } else {
+        $t = [datetime]::Parse([string]$Value, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind)
+    }
+    if ($t.Ticks -eq 0) { return [datetime]::MinValue }
+    if ($t.Kind -ne [System.DateTimeKind]::Utc) { $t = $t.ToUniversalTime() }
+    return $t
+}
+
 function Import-WatchState {
     <#
     .SYNOPSIS
-        Restores cooldown and fix history from disk.
+        Restores the cooldown, the fix history, a held-back repair and the
+        runs Fix held back in a row from disk.
     .DESCRIPTION
         All of this state used to live only in memory. On restart, and this is
         a scheduled task that restarts on logon and after any crash, the
@@ -1299,6 +1695,9 @@ function Import-WatchState {
         persisted, because the file is the authority. Without that, a machine
         that boots with an already-hung VM never sets the flag and therefore
         never runs staleness detection at all.
+
+        The times are UTC, whatever version wrote the file: see
+        ConvertFrom-WatchStateTime.
     #>
     try {
         if (Test-Path $script:StatePath) {
@@ -1306,8 +1705,7 @@ function Import-WatchState {
             if ($raw) {
                 $st = $raw | ConvertFrom-Json -ErrorAction Stop
                 if ($st.LastFixTime) {
-                    $script:LastFixTime = [datetime]::Parse($st.LastFixTime,
-                        [System.Globalization.CultureInfo]::InvariantCulture)
+                    $script:LastFixTime = ConvertFrom-WatchStateTime -Value $st.LastFixTime
                 }
                 if ($st.FixCount) { $script:FixCount = [int]$st.FixCount }
                 # Probed through PSObject.Properties, not read directly. Every
@@ -1322,27 +1720,97 @@ function Import-WatchState {
                 }
                 foreach ($h in @($st.FixHistory)) {
                     if (-not $h) { continue }
-                    $null = $script:FixHistory.Add([datetime]::Parse($h,
-                        [System.Globalization.CultureInfo]::InvariantCulture))
+                    $null = $script:FixHistory.Add((ConvertFrom-WatchStateTime -Value $h))
+                }
+                # Probed like LastStealthMarkerTs: a file written before 6.3.0
+                # has neither field, and loads as no repair pending. In a try
+                # of its own, so a bad value loses only this.
+                $script:PendingFixHeldAt = [datetime]::MinValue
+                $script:PendingFixTries  = 0
+                $script:PendingFixRetriesHeld = 0
+                if ($st.PSObject.Properties['PendingFixReason'] -and $st.PSObject.Properties['PendingFixSince'] -and
+                    $st.PendingFixReason) {
+                    try {
+                        $since = ConvertFrom-WatchStateTime -Value $st.PendingFixSince
+                        if ($since -ne [datetime]::MinValue) {
+                            $script:PendingFixReason = [string]$st.PendingFixReason
+                            $script:PendingFixSince  = $since
+                        }
+                    } catch {
+                        Write-CheckError -Check 'state' -ErrorRecord $_ `
+                            -Text "STATE: The held-back repair saved in $($script:StatePath) could not be restored ({0}), so it is not tried again"
+                    }
+                    # The latest hold, the tries and the retries held back,
+                    # probed the same way and each in a try of its own. A
+                    # file written before they were kept has none of them,
+                    # and they load as none: the latest hold is then the
+                    # first, and no try is counted.
+                    if ($script:PendingFixReason) {
+                        if ($st.PSObject.Properties['PendingFixHeldAt']) {
+                            try { $script:PendingFixHeldAt = ConvertFrom-WatchStateTime -Value $st.PendingFixHeldAt }
+                            catch { $script:PendingFixHeldAt = [datetime]::MinValue }
+                        }
+                        if ($st.PSObject.Properties['PendingFixTries']) {
+                            try { $script:PendingFixTries = [math]::Max(0, [int]$st.PendingFixTries) }
+                            catch { $script:PendingFixTries = 0 }
+                        }
+                        if ($st.PSObject.Properties['PendingFixRetriesHeld']) {
+                            try { $script:PendingFixRetriesHeld = [math]::Max(0, [int]$st.PendingFixRetriesHeld) }
+                            catch { $script:PendingFixRetriesHeld = 0 }
+                        }
+                    }
+                }
+                # The runs Fix held back in a row, probed the same way and
+                # each in a try of its own. A file written before they were
+                # kept has neither, and loads as none held back.
+                $script:FixHeldInARow   = 0
+                $script:FixHeldLastTime = [datetime]::MinValue
+                if ($st.PSObject.Properties['FixHeldInARow']) {
+                    try { $script:FixHeldInARow = [math]::Max(0, [int]$st.FixHeldInARow) }
+                    catch { $script:FixHeldInARow = 0 }
+                }
+                if ($st.PSObject.Properties['FixHeldLastTime']) {
+                    try { $script:FixHeldLastTime = ConvertFrom-WatchStateTime -Value $st.FixHeldLastTime }
+                    catch { $script:FixHeldLastTime = [datetime]::MinValue }
+                }
+                # Whether the cooldown was left by a hold, probed the same
+                # way. A file written before it was kept has none, and loads
+                # as not: a one-shot trigger in that cooldown is skipped, as
+                # it was then.
+                $script:CooldownFromHold = $false
+                if ($st.PSObject.Properties['CooldownFromHold']) {
+                    try { $script:CooldownFromHold = ($st.CooldownFromHold -is [bool] -and $st.CooldownFromHold) }
+                    catch { $script:CooldownFromHold = $false }
                 }
             }
         }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'state' -ErrorRecord $_ `
+            -Text "STATE: The state saved in $($script:StatePath) could not be restored in full ({0}); what was not restored starts empty, as on a first start"
+    }
 
     # Seed from the logs themselves, not from the saved file.
     try {
         $seedAge = Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir
         if ($null -ne $seedAge -and $seedAge -lt 3600) { $script:VmLogEverActive = $true }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'VM log seed' -ErrorRecord $_ `
+            -Text "The age of the VM logs could not be read at start ({0}), so the VM log staleness check waits until it sees a VM log written to"
+    }
 }
 
 function Save-WatchState {
     <#
     .SYNOPSIS
-        Persists cooldown and fix history. Never throws; this is bookkeeping.
+        Persists the cooldown and whether a hold left it, the fix history, a
+        held-back repair and the runs Fix held back in a row. Never throws;
+        this is bookkeeping. A save that fails is logged (Write-CheckError).
+    .DESCRIPTION
+        Fields are only ever added, after the ones before them, so a monitor
+        older than a field reads the file as it always did.
     #>
     try {
-        $cutoff = (Get-Date).AddHours(-6)
+        $cutoff = [datetime]::UtcNow.AddHours(-6)
         # Trimmed on write. $script:FixHistory was appended to and never
         # trimmed, so it grew for the life of the daemon and every
         # Test-PersistentFailure call filtered a list that only got longer.
@@ -1355,11 +1823,23 @@ function Save-WatchState {
             FixCount            = $script:FixCount
             FixHistory          = @($recent | ForEach-Object { $_.ToString('o') })
             LastStealthMarkerTs = $script:LastStealthMarkerTs
+            PendingFixReason    = $script:PendingFixReason
+            PendingFixSince     = $script:PendingFixSince.ToString('o')
+            PendingFixHeldAt    = $script:PendingFixHeldAt.ToString('o')
+            PendingFixTries     = $script:PendingFixTries
+            PendingFixRetriesHeld = $script:PendingFixRetriesHeld
+            FixHeldInARow       = $script:FixHeldInARow
+            FixHeldLastTime     = $script:FixHeldLastTime.ToString('o')
+            CooldownFromHold    = [bool]$script:CooldownFromHold
         }
         [System.IO.File]::WriteAllText($script:StatePath,
             ($payload | ConvertTo-Json -Depth 3),
             (New-Object System.Text.UTF8Encoding($false)))
-    } catch { $null = $_ }
+    } catch {
+        # Still never throws: said, at most once an hour for the same error.
+        Write-CheckError -Check 'state save' -ErrorRecord $_ `
+            -Text "STATE: The state could not be saved to $($script:StatePath) ({0}); a restart would lose the cooldown, the fix history and a held-back repair"
+    }
 }
 
 # Baselines are seeded lazily by Test-LogsForErrors: any stream it has not seen
@@ -1493,7 +1973,7 @@ function Get-StealthRelaunchMarker {
         return $null
     }
 
-    $ageSeconds = ((Get-Date).ToUniversalTime() - $writtenUtc).TotalSeconds
+    $ageSeconds = ([datetime]::UtcNow - $writtenUtc).TotalSeconds
 
     # It read cleanly, so nothing is being held down any more.
     $script:LastStealthNotice = $null
@@ -1604,7 +2084,7 @@ function Test-StartupGracePeriod {
         Grace period: 180 seconds. This prevents matching pre-existing event log
         entries or stale logs from before the monitor was running.
     #>
-    return ((Get-Date) - $script:StartTime).TotalSeconds -lt 180
+    return ([datetime]::UtcNow - $script:StartTime).TotalSeconds -lt 180
 }
 
 function Test-PersistentFailure {
@@ -1613,7 +2093,8 @@ function Test-PersistentFailure {
         Returns $true if the fix has been attempted 3+ times in 30 minutes,
         indicating an unrecoverable error (e.g., HCS JSON corruption).
     #>
-    $cutoff = (Get-Date).AddMinutes(-30)
+    # UTC, as FixHistory is.
+    $cutoff = [datetime]::UtcNow.AddMinutes(-30)
     $recentFixes = @($script:FixHistory | Where-Object { $_ -gt $cutoff })
     return $recentFixes.Count -ge 3
 }
@@ -1732,6 +2213,8 @@ function Test-LogsForErrors {
                 $reader = [System.IO.StreamReader]::new($stream)
                 $newContent = $reader.ReadToEnd()
             } finally {
+                # A close that fails has nothing left to release, and what
+                # was read stands.
                 if ($reader) { try { $reader.Close() } catch { $null = $_ } }
                 if ($stream) { try { $stream.Close() } catch { $null = $_ } }
             }
@@ -1748,8 +2231,11 @@ function Test-LogsForErrors {
             if ($hit) { return $hit }
         } catch {
             # Read failed. The baseline stays put, so this window is retried on
-            # the next poll rather than silently skipped.
-            $null = $_
+            # the next poll rather than silently skipped. Said, at most once an
+            # hour for the same error: a log that can never be read is a check
+            # that never runs, and until 6.3.0 nothing said so.
+            Write-CheckError -Check 'Claude logs' -ErrorRecord $_ `
+                -Text "LOG WARNING: The Claude log $path could not be read ({0}); what it gained since the last read is read again at the next poll"
         }
     }
 
@@ -1798,6 +2284,32 @@ function Test-ServiceHealth {
     return $true
 }
 
+function Get-MatchingWinEvent {
+    <#
+    .SYNOPSIS
+        Get-WinEvent -FilterHashtable with -ErrorAction Stop, where nothing to
+        read is no error: returns the events, or nothing when none matches,
+        the log does not exist or its provider is not installed. Any other
+        error is thrown, for the check to name.
+    .DESCRIPTION
+        Get-WinEvent says there is nothing to read with an ObjectNotFound
+        error whose id starts NoMatchingEventsFound, NoMatchingLogsFound or
+        NoMatchingProvidersFound (measured on Windows PowerShell 5.1). On a
+        machine without Hyper-V, or before the Cowork service has logged
+        anything, that is the usual answer. Until 6.3.0 every read here used
+        SilentlyContinue, which hid every other error with them: a check that
+        could not read its log looked like one that found nothing.
+    #>
+    param([hashtable]$Filter, [int]$MaxEvents = 0)
+    try {
+        if ($MaxEvents -gt 0) { return @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $MaxEvents -ErrorAction Stop) }
+        return @(Get-WinEvent -FilterHashtable $Filter -ErrorAction Stop)
+    } catch {
+        if ([string]$_.FullyQualifiedErrorId -match '^NoMatching(Events|Logs|Providers)Found(,|$)') { return }
+        throw
+    }
+}
+
 function Test-EventLogErrors {
     <#
     .SYNOPSIS
@@ -1806,12 +2318,23 @@ function Test-EventLogErrors {
         - VMMS check now requires "claude" in the message (no more "failed"/"unexpected" wildcards)
         - Requires 2 consecutive hits before triggering
         - Skipped during startup grace period
+        A log that cannot be read is logged, naming the log and the error, at
+        most once an hour for the same error (Write-CheckError); a log that
+        does not exist, or has nothing in the window, is not an error
+        (Get-MatchingWinEvent).
     #>
     # Skip during startup grace period (avoids pre-existing events)
     if (Test-StartupGracePeriod) { return $null }
 
     $lookback = [math]::Max($PollInterval, 60)
-    $since = (Get-Date).AddSeconds(-$lookback)
+    # Used only as Get-WinEvent's StartTime below: the UTC time as round-trip
+    # text, which ends in Z. Measured on Windows PowerShell 5.1, on this
+    # machine's log, in summer time and across the hour the clocks went back:
+    # given a [datetime], Get-WinEvent reads it as local time whatever its
+    # Kind, so a UTC time moves the window by the UTC offset, and a local
+    # time is wrong in the hour the clocks go back, which happens twice. The
+    # text was exact in both. Until 6.3.0 this was the local time.
+    $since = [datetime]::UtcNow.AddSeconds(-$lookback).ToString('o')
     $foundIssue = $null
 
     # The four checks below examine the WHOLE event message.
@@ -1839,7 +2362,7 @@ function Test-EventLogErrors {
             Level        = 2  # Error
             StartTime    = $since
         }
-        $events = Get-WinEvent -FilterHashtable $evFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+        $events = Get-MatchingWinEvent -Filter $evFilter -MaxEvents 1
         if ($events) {
             $msg = "$($events[0].Message)"
             foreach ($pattern in $LegacyErrorPatterns) {
@@ -1849,7 +2372,10 @@ function Test-EventLogErrors {
                 }
             }
         }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'Event Log: Application' -ErrorRecord $_ `
+            -Text "EVENT LOG: The Application log could not be checked for CoworkVMService errors ({0})"
+    }
 
     # Check 2: Hyper-V Worker -- must mention claude/Plan9/virtio/shared memory
     if (-not $foundIssue) {
@@ -1859,14 +2385,17 @@ function Test-EventLogErrors {
                 Level     = @(1, 2)  # Critical, Error only (dropped warnings)
                 StartTime = $since
             }
-            $hvEvents = Get-WinEvent -FilterHashtable $hvWorkerFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+            $hvEvents = Get-MatchingWinEvent -Filter $hvWorkerFilter -MaxEvents 1
             if ($hvEvents) {
                 $msg = "$($hvEvents[0].Message)"
                 if ($msg -match "claude" -or $msg -match "Plan9" -or $msg -match "virtio" -or $msg -match "shared memory") {
                     $foundIssue = "Hyper-V Worker: $(& $firstLine $msg)"
                 }
             }
-        } catch { $null = $_ }
+        } catch {
+            Write-CheckError -Check 'Event Log: Hyper-V Worker' -ErrorRecord $_ `
+                -Text "EVENT LOG: The Microsoft-Windows-Hyper-V-Worker-Admin log could not be checked ({0})"
+        }
     }
 
     # Check 3: Hyper-V VMMS -- MUST mention "claude" (no more generic "failed" matching)
@@ -1877,7 +2406,7 @@ function Test-EventLogErrors {
                 Level     = @(1, 2)  # Critical, Error
                 StartTime = $since
             }
-            $vmmsEvents = Get-WinEvent -FilterHashtable $vmmsFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+            $vmmsEvents = Get-MatchingWinEvent -Filter $vmmsFilter -MaxEvents 1
             if ($vmmsEvents) {
                 $msg = "$($vmmsEvents[0].Message)"
                 # TIGHTENED: must specifically mention claude or cowork
@@ -1885,7 +2414,10 @@ function Test-EventLogErrors {
                     $foundIssue = "Hyper-V VMMS: $(& $firstLine $msg)"
                 }
             }
-        } catch { $null = $_ }
+        } catch {
+            Write-CheckError -Check 'Event Log: Hyper-V VMMS' -ErrorRecord $_ `
+                -Text "EVENT LOG: The Microsoft-Windows-Hyper-V-VMMS-Admin log could not be checked ({0})"
+        }
     }
 
     # Check 4: HCS Compute log -- dedicated channel for Host Compute Service
@@ -1896,14 +2428,17 @@ function Test-EventLogErrors {
                 Level     = @(1, 2)  # Critical, Error
                 StartTime = $since
             }
-            $hcsEvents = Get-WinEvent -FilterHashtable $hcsFilter -MaxEvents 1 -ErrorAction SilentlyContinue
+            $hcsEvents = Get-MatchingWinEvent -Filter $hcsFilter -MaxEvents 1
             if ($hcsEvents) {
                 $msg = "$($hcsEvents[0].Message)"
                 if ($msg -match "claude" -or $msg -match "cowork" -or $msg -match "failed to create" -or $msg -match "HcsWaitForOperationResult") {
                     $foundIssue = "HCS Compute: $(& $firstLine $msg)"
                 }
             }
-        } catch { $null = $_ }
+        } catch {
+            Write-CheckError -Check 'Event Log: HCS Compute' -ErrorRecord $_ `
+                -Text "EVENT LOG: The Microsoft-Windows-Hyper-V-Compute-Admin log could not be checked ({0})"
+        }
     }
 
     # Require 2 consecutive event log hits before triggering
@@ -1947,7 +2482,9 @@ function Test-WorkspaceStorage {
         claim to test them. It tests what it can actually see.
 
         Reports only. It does not trigger an auto-fix, because neither a full
-        disk nor a missing file is something a VM restart repairs.
+        disk nor a missing file is something a VM restart repairs. A free
+        space that cannot be read is logged, at most once an hour for the
+        same error (Write-CheckError); until 6.3.0 it was passed over.
     #>
     if (Test-StartupGracePeriod) { return $null }
 
@@ -1973,89 +2510,11 @@ function Test-WorkspaceStorage {
                 }
             }
         }
-    } catch { $null = $_ }
-
-    return $null
-}
-
-function Test-WinNatHealth {
-    <#
-    .SYNOPSIS
-        Checks that a WinNAT rule exists for the Cowork VM's network.
-        Without NAT, the VM has no outbound connectivity, causing API calls
-        and mount operations to fail silently.
-        Returns $null if healthy, or a description string if unhealthy.
-        Does NOT trigger auto-fix -- logs warning only.
-    #>
-    # Only check every 60 seconds (NAT doesn't change that often)
-    $now = Get-Date
-    if (($now - $script:LastNatCheckTime).TotalSeconds -lt 60) { return $null }
-    $script:LastNatCheckTime = $now
-
-    try {
-        # The Hyper-V "Default Switch" provides NAT natively through HNS
-        # without requiring a WinNAT (Get-NetNat) rule. If it exists, NAT is fine.
-        $defaultSwitch = Get-VMSwitch -Name "Default Switch" -ErrorAction SilentlyContinue
-        if ($defaultSwitch) { return $null }
-
-        $natRules = @(Get-NetNat -ErrorAction SilentlyContinue)
-        if ($natRules.Count -eq 0) {
-            # Advisory only. This block used to create a NAT rule by itself.
-            #
-            # It selected the first internal Hyper-V switch matching
-            # "WSL|claude|nat", which on a developer machine is very often WSL's
-            # own switch, then claimed a NAT over it with a hardcoded /24 and no
-            # confirmation. Windows permits only a small number of NAT
-            # instances, so taking one over another product's switch can break
-            # that product's networking AND leave no room to create the correct
-            # rule afterwards.
-            #
-            # The caller documents this check as warning-only and does not
-            # auto-fix on it. Silently reconfiguring host networking from an
-            # unattended monitor is not what that contract promises, so this
-            # reports and leaves the decision to a person.
-            $internalSwitches = @(Get-VMSwitch -SwitchType Internal -ErrorAction SilentlyContinue)
-            if ($internalSwitches.Count -eq 0) {
-                # Nothing to NAT. Without an internal switch there is no subnet
-                # for a NAT rule to serve, so a missing rule is not a fault.
-                # This used to warn every 60 seconds, forever, on any machine
-                # with no Hyper-V switch at all.
-                return $null
-            }
-
-            $coworkSwitch = @($internalSwitches | Where-Object { $_.Name -match "claude|cowork" } |
-                              Select-Object -First 1)
-            if ($coworkSwitch.Count -gt 0) {
-                return "No WinNAT rule found while internal switch '$($coworkSwitch[0].Name)' exists. If the VM has no network, create a NAT for its subnet with New-NetNat."
-            }
-            return $null
-        }
     } catch {
-        # Get-NetNat is not present on every SKU. Nothing to report.
-        $null = $_
+        Write-CheckError -Check 'storage' -ErrorRecord $_ `
+            -Text "STORAGE WARNING: The free space on the VM image's volume could not be read ({0}), so a full volume would not be seen"
     }
-    return $null
-}
 
-function Test-VmHeartbeat {
-    <#
-    .SYNOPSIS
-        Always returns $null. Retained as a no-op so the check numbering in the
-        main loop does not shift.
-    .DESCRIPTION
-        This measured the Hyper-V Integration Services heartbeat via Get-VM.
-
-        Get-VM enumerates VMMS virtual machines. The Cowork VM is an HCS
-        compute system and never appears there: Get-VM returns nothing at all
-        on this machine. So $claudeVm was always $null, the function returned
-        at the first guard every time, and the "heartbeat(x3)" monitor that the
-        startup banner advertises has never fired once in the product's life.
-
-        There is no Integration Services heartbeat for an HCS compute system to
-        replace it with. Liveness is covered by Test-VmLogStaleness, which
-        watches the VM log's write time, and by the hcsdiag instance state in
-        Test-HcsStateHealth.
-    #>
     return $null
 }
 
@@ -2124,19 +2583,186 @@ function Test-VmLogStaleness {
         } else {
             $script:VmLogStaleCount = 0
         }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'VM log staleness' -ErrorRecord $_ `
+            -Text "STALENESS WARNING: The VM log staleness check failed ({0})"
+    }
     return $null
+}
+
+function Invoke-W32tm {
+    <#
+    .SYNOPSIS
+        Runs w32tm.exe in a job with a timeout. Returns an object with its
+        output (Text) and exit code (ExitCode), or $null when it did not
+        finish in time. Throws, naming why, when it could not be run.
+    .DESCRIPTION
+        w32tm makes network calls, and this runs inside the monitor's
+        single-threaded poll loop: unbounded, a slow time server stalls every
+        check for as long as the network takes to give up. Until 6.3.0 only
+        the measurement ran with a timeout, and the forced resync ran inline.
+
+        A job whose process cannot be started does not throw at Start-Job: it
+        ends Failed, with no output, and why comes only from Receive-Job, as
+        an error. A program that cannot be found ends the job with no exit
+        code and the error beside it. Both throw here, naming the first
+        error, or the job's state when there is none. Until 6.3.0 both
+        returned $null, as a timeout does, and the clock check logged that
+        w32tm "did not answer within 15s" each time it ran.
+
+        -W32tmPath is there for the tests, which point it at a stand-in.
+    #>
+    param(
+        [string[]]$Arguments,
+        [int]$TimeoutSeconds = 15,
+        [string]$W32tmPath = "$env:SystemRoot\System32\w32tm.exe"
+    )
+    # What an error names: the command and its first argument.
+    $what = "w32tm $(@($Arguments)[0])"
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($p, $a)
+            $text = & $p @a 2>&1 | Out-String
+            [pscustomobject]@{ Text = $text; ExitCode = $LASTEXITCODE }
+        } -ArgumentList $W32tmPath, $Arguments -ErrorAction Stop
+    } catch {
+        throw "$what could not be run: $(Get-CheckErrorText -ErrorRecord $_)"
+    }
+    try {
+        if (-not (Wait-Job $job -Timeout $TimeoutSeconds)) {
+            Stop-Job $job -ErrorAction SilentlyContinue
+            return $null
+        }
+        $jobErrors = $null
+        $result = @(Receive-Job $job -ErrorAction SilentlyContinue -ErrorVariable jobErrors) |
+            Where-Object { $null -ne $_ -and $_.PSObject.Properties['ExitCode'] } | Select-Object -Last 1
+        if ($null -eq $result -or $null -eq $result.ExitCode) {
+            $first = @($jobErrors) | Where-Object { $null -ne $_ } | Select-Object -First 1
+            if ($first) {
+                $why = Get-CheckErrorText -ErrorRecord $first
+            } else {
+                $why = "the job ended $($job.State) with no exit code"
+            }
+            throw "$what could not be run: $why"
+        }
+        return $result
+    } finally {
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Measure-ClockOffset {
+    <#
+    .SYNOPSIS
+        The host clock's offset from time.windows.com in seconds, or $null
+        when it could not be measured.
+    .DESCRIPTION
+        Get-W32tmOffsetSeconds reads the text as one string. Until a fix
+        before 6.3.0 the raw output, an array of lines, was matched directly,
+        which filters rather than fills $Matches, and the drift check never
+        ran; and until 6.3.0 the pattern took a decimal point only, so on a
+        machine whose locale writes a comma it never measured anything.
+
+        $null means only that w32tm did not answer within 15s. That is
+        logged as a skipped check at most once an hour (Test-CheckErrorDue):
+        the check runs every 5 minutes, and a time server that does not
+        answer once most often does not answer the next time either. Until
+        6.3.0 it was logged on every check.
+
+        Text with no offset in it, as when the time server answers with an
+        error ("12:00:00, error: 0x800705B4"), throws, naming that line
+        without the time it starts with, so the same error reads the same
+        each time and Test-TimeSyncHealth logs it as a TIME WARNING. Until
+        6.3.0 it returned $null with no line, as if the check were skipped.
+        So does a w32tm that could not be run at all (Invoke-W32tm).
+    #>
+    param(
+        # The measurement after a forced resync. When it does not answer the
+        # check is not skipped: Test-TimeSyncHealth warns that the clock could
+        # not be measured after the resync. Until 6.3.0 this logged "skipping
+        # the clock-drift check" then too, beside that warning.
+        [switch]$AfterResync
+    )
+    $r = Invoke-W32tm -Arguments '/stripchart', '/computer:time.windows.com', '/dataonly', '/samples:1'
+    if ($null -eq $r) {
+        if ($AfterResync) {
+            Write-WatchLog "w32tm stripchart did not answer within 15s after the resync"
+        } elseif (Test-CheckErrorDue -Check 'clock timeout' -Message 'stripchart' -Now ([datetime]::UtcNow)) {
+            Write-WatchLog "w32tm stripchart did not answer within 15s; skipping the clock-drift check"
+        }
+        return $null
+    }
+    $offset = Get-W32tmOffsetSeconds -Text ([string]$r.Text)
+    if ($null -eq $offset) {
+        $lines = @(([string]$r.Text) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $said = @($lines | Where-Object { $_ -match 'error' }) | Select-Object -First 1
+        if (-not $said) { $said = $lines | Select-Object -Last 1 }
+        if (-not $said) { $said = "no output, exit $($r.ExitCode)" }
+        throw "w32tm /stripchart gave no offset: $($said -replace '^\d[^,]*,\s*', '')"
+    }
+    return $offset
+}
+
+function Get-TimeSourceName {
+    <#
+    .SYNOPSIS
+        The time source Windows syncs from, as "w32tm /query /source" names
+        it, or 'unknown'.
+    #>
+    $r = Invoke-W32tm -Arguments '/query', '/source'
+    if ($null -ne $r -and $r.ExitCode -eq 0) {
+        $line = @(([string]$r.Text) -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+        if ($line) { return $line.Trim() }
+    }
+    return 'unknown'
 }
 
 function Test-TimeSyncHealth {
     <#
     .SYNOPSIS
-        Checks for significant host clock drift. Self-repairs via NTP resync.
-        Only checks every 5 minutes. Does NOT trigger auto-fix.
+        Checks the host clock every 5 minutes and forces an NTP resync when it
+        is more than 5 seconds out. Returns a warning, or $null. Does NOT
+        trigger auto-fix.
+    .DESCRIPTION
+        A resync is logged REPAIRED only when the clock, measured again after
+        it, is back within 5 seconds. Until 6.3.0 an exit code of 0 was
+        logged REPAIRED without measuring again, and a resync that changed
+        nothing was forced again every 5 minutes for as long as the drift
+        lasted.
+
+        When a resync fails, or the clock stays out, the warning names the
+        time source Windows uses, and no resync is forced for 60 minutes
+        while the drift lasts. The clock is still measured every 5 minutes,
+        and the hold ends as soon as it is back within 5 seconds.
+
+        A check that fails part-way, when w32tm cannot be run or answers the
+        measurement with an error and no offset, logs a TIME WARNING naming
+        the error, once for each error and at most once an hour while it
+        lasts (Write-CheckError), and returns $null, so the poll goes on as
+        before. A measurement that does not answer within 15s is logged as
+        a skipped check instead, at most once an hour (Measure-ClockOffset).
+        Until 6.3.0 such an error was passed over without a word, and a
+        check that could not run looked like a clock that was right.
+
+        Once the drift is known, a resync, a measurement after it or a query
+        of the time source that fails is named in the warning, and the
+        warning is still returned. Until 6.3.0 any of them that threw lost
+        the warning, and only the failure was logged.
+
+        A hold more than 60 minutes ahead is cleared: no hold is set longer
+        than that, so the clock was set back since, as a resync can do, and
+        the hold would otherwise keep resyncs off for as long again. Until
+        6.3.0 it kept them off.
     #>
-    $now = Get-Date
-    if (($now - $script:LastTimeSyncCheck).TotalMinutes -lt 5) { return $null }
+    $now = [datetime]::UtcNow
+    # A last check in the future, after the clock was set back, counts as
+    # old, as it does in Test-LineDue: a resync that sets the clock back by
+    # hours would otherwise hold the next check off for as long. Until
+    # 6.3.0 it did.
+    $sinceCheck = ($now - $script:LastTimeSyncCheck).TotalMinutes
+    if ($sinceCheck -ge 0 -and $sinceCheck -lt 5) { return $null }
     $script:LastTimeSyncCheck = $now
+    if ($script:ResyncBackoffUntil -gt $now.AddMinutes(60)) { $script:ResyncBackoffUntil = [datetime]::MinValue }
 
     try {
         $w32svc = Get-Service -Name "W32Time" -ErrorAction SilentlyContinue
@@ -2149,42 +2775,149 @@ function Test-TimeSyncHealth {
             }
         }
 
-        # /stripchart makes a network call, and this runs inside the monitor's
-        # single-threaded poll loop. Unbounded, a blocked or slow NTP server
-        # stalls the entire monitor for as long as the network takes to give up.
-        $w32tmText = ""
-        $w32tmJob = Start-Job -ScriptBlock {
-            & w32tm /stripchart /computer:time.windows.com /dataonly /samples:1 2>&1 | Out-String
+        $offset = Measure-ClockOffset
+        if ($null -eq $offset) { return $null }
+        $drift = [math]::Round([math]::Abs($offset), 2)
+        if ($drift -le 5.0) {
+            if ($script:ResyncBackoffUntil -ne [datetime]::MinValue) {
+                Write-WatchLog "Clock drift back to ${drift}s; forced resyncs allowed again"
+                $script:ResyncBackoffUntil = [datetime]::MinValue
+            }
+            return $null
         }
-        if (Wait-Job $w32tmJob -Timeout 15) {
-            $w32tmText = (@(Receive-Job $w32tmJob) -join "`n")
-        } else {
-            Stop-Job $w32tmJob -ErrorAction SilentlyContinue
-            Write-WatchLog "w32tm stripchart timed out after 15s; skipping the clock-drift check"
+        if ($now -lt $script:ResyncBackoffUntil) {
+            # The warning that started the hold said why. Past 30 seconds it
+            # is said again: that much drift breaks the VM's connections.
+            if ($drift -gt 30.0) { return "Clock drift ${drift}s, may cause VM connectivity issues" }
+            return $null
         }
-        Remove-Job $w32tmJob -Force -ErrorAction SilentlyContinue
 
-        # Matched against a single joined string, not the raw result.
-        #
-        # w32tm returns an ARRAY of output lines, and -match against an array
-        # uses FILTER semantics: it returns the matching elements and never
-        # populates $Matches. Reading $Matches[1] on the next line therefore
-        # threw under StrictMode, the empty catch below swallowed it, and
-        # neither the drift check nor the NTP resync has ever run.
-        if ($w32tmText -match "(-?\d+\.\d+)s") {
-            $drift = [math]::Abs([double]$Matches[1])
-            if ($drift -gt 5.0) {
-                try {
-                    & w32tm /resync /force 2>&1 | Out-Null
-                    Write-WatchLog "REPAIRED: Forced NTP resync (drift was ${drift}s)"
-                } catch { $null = $_ }
-                if ($drift -gt 30.0) {
-                    return "Clock drift ${drift}s, may cause VM connectivity issues"
+        # Each step from here in a try of its own: one that fails is named in
+        # the warning, and the drift is still reported.
+        $resync = $null
+        $resyncError = $null
+        try {
+            $resync = Invoke-W32tm -Arguments '/resync', '/force'
+        } catch {
+            # Invoke-W32tm's own error names the command already.
+            $resyncError = Get-CheckErrorText -ErrorRecord $_
+            if ($resyncError -notlike 'w32tm /resync *') { $resyncError = "w32tm /resync could not be run: $resyncError" }
+        }
+        $after = $null
+        $afterError = $null
+        if ($null -ne $resync -and $resync.ExitCode -eq 0) {
+            $afterOffset = $null
+            try {
+                $afterOffset = Measure-ClockOffset -AfterResync
+            } catch {
+                $afterError = Get-CheckErrorText -ErrorRecord $_
+            }
+            if ($null -ne $afterOffset) {
+                $after = [math]::Round([math]::Abs($afterOffset), 2)
+                if ($after -le 5.0) {
+                    Write-WatchLog "REPAIRED: Forced NTP resync (drift was ${drift}s, now ${after}s)"
+                    $script:ResyncBackoffUntil = [datetime]::MinValue
+                    return $null
                 }
             }
         }
-    } catch { $null = $_ }
+        if ($resyncError) {
+            $what = $resyncError
+        } elseif ($null -eq $resync) {
+            $what = "w32tm /resync did not answer within 15s"
+        } elseif ($resync.ExitCode -ne 0) {
+            $what = "w32tm /resync failed (exit $($resync.ExitCode))"
+        } elseif ($afterError) {
+            $what = "the clock could not be measured after w32tm /resync ($afterError)"
+        } elseif ($null -eq $after) {
+            $what = "the clock could not be measured after w32tm /resync"
+        } else {
+            $what = "it is still ${after}s after w32tm /resync"
+        }
+        try {
+            $source = Get-TimeSourceName
+        } catch {
+            $source = "unknown ($(Get-CheckErrorText -ErrorRecord $_))"
+        }
+        $script:ResyncBackoffUntil = $now.AddMinutes(60)
+        return "Clock drift ${drift}s and $what; time source: $source. No resync is forced for 60 min while the drift lasts; it is still measured every 5 min"
+    } catch {
+        Write-CheckError -Check 'clock' -ErrorRecord $_ -Now $now `
+            -Text 'TIME WARNING: The clock check failed ({0}), so whether the clock is right is not known. It runs again every 5 min'
+    }
     return $null
+}
+
+function Get-CheckErrorText {
+    <#
+    .SYNOPSIS
+        An error's message on one line, or the name of its type when it has
+        no message.
+    #>
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $text = ([string]$ErrorRecord.Exception.Message -replace '\s*[\r\n]+\s*', ' ').Trim()
+    if (-not $text) { $text = $ErrorRecord.Exception.GetType().FullName }
+    return $text
+}
+
+function Test-CheckErrorDue {
+    <#
+    .SYNOPSIS
+        Whether a line saying that a check failed may be written now: $true
+        once for each error of a check, and again at most once an hour while
+        it lasts, for at most 3 different errors of one check in an hour.
+    .DESCRIPTION
+        The checks run on every poll or every few minutes, and what breaks a
+        check once most often breaks it every time: unthrottled, the same
+        line would come with each poll, and Test-LineDue's 10 minutes would
+        still give 6 an hour. Keyed on the check and the error's message, so
+        a different error is said at once; and no more than 3 for one check
+        in an hour, so an error whose message changes each time, as one that
+        names a time or a process does, cannot fill the log either.
+
+        Entries an hour old are dropped first, so the table stays small. A
+        time in the future, after the clock was set back, counts as old,
+        which matters in the clock check, which sets the clock. UTC, and in
+        memory only: after a restart each error is logged again once.
+
+        Until 6.3.0 the checks passed a failure over without a word, and a
+        check that could not run looked like one that found nothing wrong.
+    #>
+    param([string]$Check, [string]$Message, [datetime]$Now)
+    foreach ($k in @($script:CheckErrorsSaid.Keys)) {
+        $age = ($Now - $script:CheckErrorsSaid[$k]).TotalMinutes
+        if ($age -ge 60 -or $age -lt 0) { $script:CheckErrorsSaid.Remove($k) }
+    }
+    $key = "$Check|$Message"
+    if ($script:CheckErrorsSaid.ContainsKey($key)) { return $false }
+    $ofCheck = @($script:CheckErrorsSaid.Keys | Where-Object { $_.StartsWith("$Check|", [StringComparison]::OrdinalIgnoreCase) })
+    if ($ofCheck.Count -ge 3) { return $false }
+    $script:CheckErrorsSaid[$key] = $Now
+    return $true
+}
+
+function Write-CheckError {
+    <#
+    .SYNOPSIS
+        Logs that a check or a read failed, naming the error, when
+        Test-CheckErrorDue lets it.
+    .DESCRIPTION
+        -Text is the line, with {0} where the error goes (Get-CheckErrorText);
+        "; the same error is logged at most once an hour" is added to it.
+        -Check names the check, which with the error is what the throttle
+        keys on. Returns nothing: the caller goes on as it would without the
+        check, and returns what it returned before.
+    #>
+    param(
+        [string]$Check,
+        [string]$Text,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [datetime]$Now = [datetime]::UtcNow
+    )
+    $err = Get-CheckErrorText -ErrorRecord $ErrorRecord
+    if (Test-CheckErrorDue -Check $Check -Message $err -Now $Now) {
+        Write-WatchLog ($Text.Replace('{0}', $err) + '; the same error is logged at most once an hour')
+    }
 }
 
 function Test-VmcomputeHealth {
@@ -2199,7 +2932,7 @@ function Test-VmcomputeHealth {
     if (Test-StartupGracePeriod) { return $null }
 
     # Only check every 60 seconds
-    $now = Get-Date
+    $now = [datetime]::UtcNow
     if (($now - $script:LastVmcomputeCheck).TotalSeconds -lt 60) { return $null }
     $script:LastVmcomputeCheck = $now
 
@@ -2212,8 +2945,17 @@ function Test-VmcomputeHealth {
 
         $handleCount = 0
         foreach ($vp in $vmcomputeProcs) {
-            try { if ($vp.HandleCount -gt $handleCount) { $handleCount = $vp.HandleCount } }
-            catch { $null = $_ }
+            # Through the getter method: a property whose getter throws reads
+            # as nothing in PowerShell, with no error (measured on 5.1), so
+            # until 6.3.0 a count that could not be read was taken as 0 and
+            # the catch below was never reached.
+            try {
+                $hc = $vp.get_HandleCount()
+                if ($hc -gt $handleCount) { $handleCount = $hc }
+            } catch {
+                Write-CheckError -Check 'vmcompute handles' -ErrorRecord $_ `
+                    -Text "The handle count of vmcompute (PID $($vp.Id)) could not be read ({0}), so a handle leak in it would not be seen"
+            }
         }
 
         # Thresholds are 20000 and 12000, not 10000 and 5000.
@@ -2237,7 +2979,9 @@ function Test-VmcomputeHealth {
         } else {
             $script:VmcomputeLeakCount = 0
         }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'vmcompute handles' -ErrorRecord $_ -Text "The vmcompute handle check failed ({0})"
+    }
     return $null
 }
 
@@ -2251,6 +2995,9 @@ function Test-HcsStateHealth {
         It used to also count session transcript files and treat a high count
         as a critical issue. That check is gone: see the note where Check 3
         used to be.
+
+        A check that fails is logged, naming the error, at most once an hour
+        for the same error (Write-CheckError). Until 6.3.0 it was passed over.
     #>
     # Skip during startup grace period
     if (Test-StartupGracePeriod) { return $null }
@@ -2279,7 +3026,10 @@ function Test-HcsStateHealth {
                 $issues += "Multiple cowork-vm instances in HCS ($vmCount found, threshold $threshold)"
             }
         }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'HCS cowork-vm count' -ErrorRecord $_ `
+            -Text "HCS: The check for more than one cowork-vm compute system failed ({0})"
+    }
 
     # Check 2: 0xC037010D shutdown failure frequency
     # These are caused by a Claude Desktop property query bug (literal '$') and happen
@@ -2305,17 +3055,17 @@ function Test-HcsStateHealth {
             # bad hour, where the same query could return thousands.
             $shutdownFilter = @{
                 LogName   = "Microsoft-Windows-Hyper-V-Compute-Operational"
-                StartTime = (Get-Date).AddHours(-1)
+                # The UTC time as round-trip text: see Test-EventLogErrors.
+                StartTime = [datetime]::UtcNow.AddHours(-1).ToString('o')
             }
-            $allShutdownEvents = @(Get-WinEvent -FilterHashtable $shutdownFilter `
-                    -MaxEvents 500 -ErrorAction SilentlyContinue |
+            $allShutdownEvents = @(Get-MatchingWinEvent -Filter $shutdownFilter -MaxEvents 500 |
                 Where-Object { $_.Message -match "0xC037010D" })
             $shutdownCount = $allShutdownEvents.Count
             if ($shutdownCount -gt 0) {
-                $shutdownLogElapsed = ((Get-Date) - $script:LastShutdownFailLogTime).TotalMinutes
+                $shutdownLogElapsed = ([datetime]::UtcNow - $script:LastShutdownFailLogTime).TotalMinutes
                 if ($shutdownLogElapsed -ge 10) {
                     Write-WatchLog "HCS: $shutdownCount shutdown failures (0xC037010D) in last hour (property query bug, informational)"
-                    $script:LastShutdownFailLogTime = Get-Date
+                    $script:LastShutdownFailLogTime = [datetime]::UtcNow
                 }
             } else {
                 # Reset rate-limit timer when count drops to zero
@@ -2325,8 +3075,9 @@ function Test-HcsStateHealth {
                 $issues += "HCS shutdown failure spike: $shutdownCount events in last hour"
             }
             # Spike detection: excessive shutdown failures may indicate real corruption
-            $fiveMinAgo = (Get-Date).AddMinutes(-5)
-            $recentSpike = @($allShutdownEvents | Where-Object { $_.TimeCreated -gt $fiveMinAgo })
+            # In UTC, for the same reason as Test-ClaudeCodeActive's ages.
+            $fiveMinAgoUtc = [datetime]::UtcNow.AddMinutes(-5)
+            $recentSpike = @($allShutdownEvents | Where-Object { $_.TimeCreated -and $_.TimeCreated.ToUniversalTime() -gt $fiveMinAgoUtc })
             if ($recentSpike.Count -gt 15) {
                 # Before restarting vmcompute, check if there is an active session
                 $coworkSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -2334,19 +3085,12 @@ function Test-HcsStateHealth {
                 # included: this only holds a vmcompute restart back, and
                 # erring that way is safe.
                 $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
-                # Same two lock names Fix actually takes. This was still
-                # pinned to "Global\ClaudeDesktopFix_v4.8", so it never found
-                # the lock and would have restarted vmcompute out from under a
-                # running repair.
-                $fixRunning = $false
-                foreach ($fixLockName in @("Global\ClaudeDesktopFix", "Local\ClaudeDesktopFix")) {
-                    try {
-                        $probe = [System.Threading.Mutex]::OpenExisting($fixLockName)
-                        $probe.Dispose()
-                        $fixRunning = $true
-                        break
-                    } catch { $null = $_ }
-                }
+                # Fix's lock, as Invoke-AutoFix asks it. This was pinned to
+                # "Global\ClaudeDesktopFix_v4.8", so it never found the lock and
+                # would have restarted vmcompute out from under a running
+                # repair; and until 6.3.0 it kept a copy of the check of its
+                # own, which read a lock it may not open as not held.
+                $fixRunning = Test-FixLockHeld
                 if ($claudeRunning -and $coworkSvc -and $coworkSvc.Status -eq "Running") {
                     Write-WatchLog "HCS SPIKE: $($recentSpike.Count) failures in 5 min but active session detected, skipping vmcompute restart"
                 } elseif ($fixRunning) {
@@ -2363,7 +3107,10 @@ function Test-HcsStateHealth {
                 }
             }
         }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'HCS shutdown failures' -ErrorRecord $_ `
+            -Text "HCS: The check for shutdown failures (0xC037010D) failed ({0})"
+    }
 
     # Check 3 has been removed entirely.
     #
@@ -2385,139 +3132,152 @@ function Test-HcsStateHealth {
     return $null
 }
 
-function Test-GuestConnectionHealth {
-    <#
-    .SYNOPSIS
-        Monitors cowork-service.log for isGuestConnected RPC timeout patterns.
-        Returns $null if healthy, or a trigger string if guest connection is failing.
-    #>
-    # Skip during startup grace period
-    if (Test-StartupGracePeriod) { return $null }
-
-    # %ProgramData% is gone. Discovery's log directory is the only candidate.
-    $svcLogPath = $null
-    if ($ClaudeLogDir) {
-        $candidate = Join-Path $ClaudeLogDir "cowork-service.log"
-        if (Test-Path $candidate) { $svcLogPath = $candidate }
-    }
-    if (-not $svcLogPath) { return $null }
-
-    # Reject a source that predates the window we are about to ask about.
-    #
-    # cowork-service.log has not been written since 2026-03-18 on current
-    # builds. Parsing a file months out of date to answer "what happened in the
-    # last 60 seconds" cannot produce a useful answer, and the only reason it
-    # produced a harmless one before was that the timestamp regexes below never
-    # matched anything either.
-    try {
-        $svcLogAge = ((Get-Date) - (Get-Item $svcLogPath -ErrorAction Stop).LastWriteTime).TotalSeconds
-        if ($svcLogAge -gt 300) { return $null }
-    } catch {
-        $null = $_
-        return $null
-    }
-
-    try {
-        $lines = Get-Content $svcLogPath -Tail 100 -ErrorAction Stop
-        $now = Get-Date
-        $recentLines = @()
-        foreach ($line in $lines) {
-            # Two real formats, both anchored to a full date.
-            #
-            #   2026/03/18 12:39:04.457195   slashes, SIX fractional digits
-            #   2026-07-28 16:27:55          dashes, no fractional part
-            #
-            # The patterns this replaces expected "yyyy-MM-dd HH:mm:ss.fff" and
-            # a bare "HH:mm:ss.fff". Neither matches either real format, so this
-            # whole check was dead.
-            #
-            # The bare time-only branch is also gone on purpose. It rebased a
-            # time onto today's date, so a line from months ago read as minutes
-            # old. That was a false-positive generator waiting for the regex
-            # above it to start matching.
-            $stamp = $null
-            if ($line -match '^\s*(\d{4})[/-](\d{2})[/-](\d{2})\s+(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?') {
-                try {
-                    $ms = 0
-                    if ($Matches[7]) {
-                        # Truncate to milliseconds; the source emits microseconds.
-                        $ms = [int]($Matches[7].PadRight(3, '0').Substring(0, 3))
-                    }
-                    $stamp = New-Object System.DateTime(
-                        [int]$Matches[1], [int]$Matches[2], [int]$Matches[3],
-                        [int]$Matches[4], [int]$Matches[5], [int]$Matches[6], $ms)
-                } catch { $null = $_ }
-            }
-            if ($stamp -and ($now - $stamp).TotalSeconds -le 60) {
-                $recentLines += $line
-            }
-        }
-
-        $polls = @($recentLines | Where-Object { $_ -match "method=isGuestConnected" })
-        $responses = @($recentLines | Where-Object { $_ -match "Sent response" })
-
-        if ($polls.Count -gt 10 -and $responses.Count -eq 0) {
-            return "Guest connection timeout: $($polls.Count) polls, 0 responses in 60s"
-        }
-    } catch { $null = $_ }
-    return $null
-}
-
 # -- VM maintenance functions ---------------------------------------------
 
 function Set-VmWorkerPriority {
+    <#
+    .SYNOPSIS
+        Raises the Cowork VM's worker process to AboveNormal.
+    .DESCRIPTION
+        Only the vmwp.exe that runs the Cowork VM's compute system, picked by
+        Get-CoworkWorkerProcessIds. Until 6.3.0 this raised every vmwp.exe on
+        the machine: every Hyper-V VM, WSL2 and Windows Sandbox. A priority
+        does not outlive its process, so this runs on every poll and catches
+        each new VM.
+
+        The worker processes are listed with Stop. A list that cannot be
+        read, or a worker that cannot be raised, is logged, naming why, at
+        most once an hour for the same error (Write-CheckError); a worker
+        that exited since the list was read has nothing to raise, and is
+        passed over. Until 6.3.0 the list was read with SilentlyContinue,
+        and a list that could not be read, or a raise that failed, left the
+        worker where it was without a word.
+    #>
     # SupportsShouldProcess: this genuinely changes system state, raising the
     # scheduling priority of a live process.
     [CmdletBinding(SupportsShouldProcess)]
     param()
     try {
-        $vmwpProcs = @(Get-Process -Name "vmwp" -ErrorAction SilentlyContinue)
-        foreach ($p in $vmwpProcs) {
+        $hcsList = Get-HcsListCached
+        if (-not $hcsList) { return }
+        # The process query only when a Cowork VM is listed at all.
+        if (@(Get-CoworkHcsGuids -ListOutput ([string]$hcsList)).Count -eq 0) { return }
+        try {
+            $workers = @(Get-CimInstance Win32_Process -Filter "Name = 'vmwp.exe'" -ErrorAction Stop)
+        } catch {
+            Write-CheckError -Check 'VM worker priority' -ErrorRecord $_ `
+                -Text "The VM worker processes (vmwp.exe) could not be listed ({0}), so the Cowork VM's worker was not raised to AboveNormal"
+            return
+        }
+        foreach ($id in @(Get-CoworkWorkerProcessIds -ListOutput ([string]$hcsList) -Workers $workers)) {
             try {
+                $p = Get-Process -Id $id -ErrorAction Stop
                 if ($p.PriorityClass -ne 'AboveNormal') {
-                    if ($PSCmdlet.ShouldProcess("vmwp.exe PID $($p.Id)", "Set priority to AboveNormal")) {
+                    if ($PSCmdlet.ShouldProcess("vmwp.exe PID $id", "Set priority to AboveNormal")) {
                         $p.PriorityClass = 'AboveNormal'
-                        Write-WatchLog "Boosted vmwp.exe (PID $($p.Id)) to AboveNormal"
+                        Write-WatchLog "Raised the Cowork VM's worker (vmwp.exe PID $id) to AboveNormal"
                     }
                 }
-            } catch { $null = $_ }
+            } catch {
+                if ([string]$_.FullyQualifiedErrorId -notlike 'NoProcessFoundForGivenId*') {
+                    Write-CheckError -Check 'VM worker priority' -ErrorRecord $_ `
+                        -Text "The Cowork VM's worker (vmwp.exe PID $id) could not be raised to AboveNormal ({0})"
+                }
+            }
         }
-    } catch { $null = $_ }
+    } catch {
+        Write-CheckError -Check 'VM worker priority' -ErrorRecord $_ `
+            -Text "The Cowork VM's worker could not be raised to AboveNormal ({0})"
+    }
 }
 
-function Set-DynamicMemoryFlag {
+function Stop-StaleCoworkVm {
     <#
     .SYNOPSIS
-        Applies a pending "disable Dynamic Memory" request for a VMMS virtual
-        machine, if one was left behind.
+        Kills the Cowork compute systems left behind beside the live one, and
+        logs what became of each.
     .DESCRIPTION
-        Renamed from Apply-DynamicMemoryFlag: Apply is not an approved
-        PowerShell verb, which is the one thing the analyzer flagged here.
+        Run from the main loop with the HCS STATE line, at most once every 10
+        minutes. The live VM is the one whose worker process (vmwp.exe)
+        started last; every other Cowork compute system "hcsdiag list" shows
+        is killed, and the list is read again to see which are gone. Until
+        6.3.0 this kept the last entry hcsdiag printed, on the belief that
+        the list runs oldest to newest, which nothing documents, and it
+        logged "killed" for every kill it sent.
 
-        Note this is inert for the Cowork VM itself. Get-VM and Set-VMMemory
-        operate on VMMS virtual machines, and the Cowork VM is an HCS compute
-        system that does not appear to either. The flag file is only ever
-        actioned for a VM that VMMS can actually see, and nothing in this
-        toolkit writes one.
+        The worker processes are listed with Stop. A list that cannot be read
+        is logged, naming why, at most once an hour for the same error
+        (Write-CheckError), and nothing is killed. Until 6.3.0 it was read
+        with SilentlyContinue, and logged as if no compute system had a
+        worker process: "none has a worker process to tell the live one by".
+        That line is now only for a list that was read.
+
+        Rewritten before 6.3.0. The block this replaced carried the same two
+        bugs as Fix-ClaudeDesktop findings 1 and 2: it looked for the GUID on
+        a line of its own, which "hcsdiag list" never prints, so it never ran;
+        and it called "hcsdiag close", a verb hcsdiag does not have. The parse
+        lives in Get-CoworkHcsGuids, in the shared ClaudeEnv region. Until
+        6.3.0 this was part of the main loop.
     #>
+    # SupportsShouldProcess: this kills compute systems.
     [CmdletBinding(SupportsShouldProcess)]
     param()
-    $flagFile = Join-Path $ClaudeAppData "disable-dynamic-memory.flag"
-    if (-not (Test-Path $flagFile)) { return }
-
     try {
-        $vmName = (Get-Content $flagFile -Raw -ErrorAction Stop).Trim()
-        if (-not $vmName) { return }
-
-        $vm = Get-VM -VMName $vmName -ErrorAction SilentlyContinue
-        if (-not $vm) { return }
-
-        if ($vm.State -eq "Off") {
-            Set-VMMemory -VMName $vmName -DynamicMemoryEnabled $false -ErrorAction Stop
-            Remove-Item $flagFile -Force -ErrorAction SilentlyContinue
-            Write-WatchLog "Dynamic Memory disabled for VM '$vmName' (flag applied)"
+        $hcsList = Get-HcsListCached
+        if (-not $hcsList) { return }
+        $vmGuids = @(Get-CoworkHcsGuids -ListOutput ([string]$hcsList))
+        if ($vmGuids.Count -le 1) { return }
+        try {
+            $workers = @(Get-CimInstance Win32_Process -Filter "Name = 'vmwp.exe'" -ErrorAction Stop)
+        } catch {
+            Write-CheckError -Check 'stale VMs' -ErrorRecord $_ `
+                -Text "HCS: $($vmGuids.Count) cowork-vm compute systems, and the VM worker processes (vmwp.exe) could not be listed to tell the live one by ({0}); none killed"
+            return
         }
-    } catch { $null = $_ }
+        $started = @{}
+        foreach ($w in $workers) {
+            $wg = Get-VmWorkerGuid -CommandLine ([string]$w.CommandLine)
+            # In UTC: in the hour the clocks go back, a worker started later
+            # can show an earlier local time.
+            if ($wg -and $w.CreationDate) { $started[$wg] = ([datetime]$w.CreationDate).ToUniversalTime() }
+        }
+        $live = $null
+        foreach ($guid in $vmGuids) {
+            if ($started.ContainsKey($guid) -and ($null -eq $live -or $started[$guid] -gt $started[$live])) {
+                $live = $guid
+            }
+        }
+        if ($null -eq $live) {
+            Write-WatchLog "HCS: $($vmGuids.Count) cowork-vm compute systems and none has a worker process to tell the live one by; none killed"
+            return
+        }
+        $sent = @()
+        foreach ($guid in $vmGuids) {
+            if ($guid -eq $live) { continue }
+            if ($PSCmdlet.ShouldProcess("cowork-vm $guid", "hcsdiag kill")) {
+                $null = Invoke-HcsDiag -Arguments "kill", $guid
+                $sent += $guid
+            }
+        }
+        if ($sent.Count -eq 0) { return }
+        $left = Get-CoworkHcsSurvivors -Guids $sent -List { Invoke-HcsDiag -Arguments "list" }
+        # The cached list predates the kill.
+        $script:LastHcsListTime = [datetime]::MinValue
+        foreach ($guid in $sent) {
+            if ($null -eq $left) {
+                Write-WatchLog "HCS: sent a kill to stale cowork-vm ($guid); hcsdiag did not answer the check after it"
+            } elseif ($left -contains $guid) {
+                # Listed when last read, which is not proof the kill failed
+                # for good: it can take longer to leave the list than the
+                # check waits.
+                Write-WatchLog "HCS: stale cowork-vm ($guid) was still listed after the kill"
+            } else {
+                Write-WatchLog "HCS: killed stale cowork-vm ($guid)"
+            }
+        }
+    } catch {
+        Write-CheckError -Check 'stale VMs' -ErrorRecord $_ -Text 'HCS: the check for stale cowork-vm compute systems failed ({0})'
+    }
 }
 
 # -- User activity detection ---------------------------------------------
@@ -2531,6 +3291,8 @@ function Test-ClaudeCodeActive {
         expected and normal during Code usage.
 
         CHECKS:
+        0. A Claude Code CLI the app started is running: a project thread or
+           Code session (Get-ClaudeAppCliProcess). Added in 6.3.0.
         1. Session files: claude-code-sessions folder for recently-modified files (10 min)
         2. App logs: unknown-window*.log, claude.ai-web*.log or remote-control*.log
            recently written (10 min). The first two show LOCAL_SESSION activity
@@ -2547,7 +3309,8 @@ function Test-ClaudeCodeActive {
         and 2 both answered no. The CLI appends to its transcript on every
         message and tool result, and a subagent to its own file beside it.
         A terminal session counts too: holding a repair back for one costs a
-        retry two minutes later, which is the cheap mistake.
+        late repair, or one the user is told to run by hand, which is the
+        cheap mistake.
 
         WHY 35 MINUTES. A tool call writes nothing to the transcript while it
         runs, and a foreground command may run for 30 minutes. Measured
@@ -2568,10 +3331,26 @@ function Test-ClaudeCodeActive {
         Get-ClaudeDataCandidates on every call and reads every candidate, so a
         later move is covered without a restart. Reading a stale folder as
         well costs a directory listing; missing the live one cost the guard.
+    .PARAMETER Silent
+        Writes no line to the watch log: for Invoke-HeldBackRetry's quiet
+        check, which asks this every 2 minutes while a repair waits. The
+        one-time line about the missing folder is then left for a call
+        without it to write.
     #>
+    param([switch]$Silent)
     try {
+        # Check 0: a Claude Code CLI the app started. A session waiting on a
+        # long command uses no CPU and writes nothing, so checks 1 to 3 can
+        # all miss it once their windows pass, and the repair ends it. This
+        # holds every repair back for as long as the app runs a session. It
+        # throws when it cannot tell, and the catch below then answers yes.
+        if (@(Get-ClaudeAppCliProcess -Environment $script:ClaudeEnv).Count -gt 0) { return $true }
+
         $cands = Get-ClaudeDataCandidates -PackageFamilyName $script:ClaudeEnv.PackageFamilyName
-        $now = Get-Date
+        # Ages in UTC. Local time jumps an hour when summer time starts or
+        # ends, and for that hour a file written 70 minutes ago read as 10
+        # minutes old, or the other way round. Until 6.3.0 these were local.
+        $nowUtc = [datetime]::UtcNow
 
         # Check 1: Claude Code session persistence files, written as Code works,
         # under <data root>\claude-code-sessions\{accountId}\{orgId}\.
@@ -2581,11 +3360,11 @@ function Test-ClaudeCodeActive {
             if (-not (Test-Path -LiteralPath $codeSessionDir -PathType Container)) { continue }
             $sessionDirsSeen++
             $recentFiles = Get-ChildItem -LiteralPath $codeSessionDir -Filter "*.json" -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { ($now - $_.LastWriteTime).TotalMinutes -lt 10 } |
+                Where-Object { ($nowUtc - $_.LastWriteTimeUtc).TotalMinutes -lt 10 } |
                 Select-Object -First 1
             if ($recentFiles) { return $true }
         }
-        if ($sessionDirsSeen -eq 0 -and -not $script:NoCodeSessionDirLogged) {
+        if ($sessionDirsSeen -eq 0 -and -not $Silent -and -not $script:NoCodeSessionDirLogged) {
             # Said once: either Code has never run here, or the app has moved
             # its data somewhere Get-ClaudeDataCandidates does not look.
             $script:NoCodeSessionDirLogged = $true
@@ -2597,37 +3376,29 @@ function Test-ClaudeCodeActive {
         # covers the gaps. A folder whose newest log is older than the window
         # cannot hold a recent one, so it is skipped unread.
         foreach ($ld in @($cands.LogDirs)) {
-            if (-not $ld.Newest -or ($now - $ld.Newest).TotalMinutes -ge 10) { continue }
+            if (-not $ld.Newest -or ($nowUtc - $ld.Newest.ToUniversalTime()).TotalMinutes -ge 10) { continue }
             foreach ($pattern in @('unknown-window*.log', 'claude.ai-web*.log', 'remote-control*.log')) {
                 foreach ($rLog in @(Get-ChildItem -LiteralPath $ld.Path -Filter $pattern -File -ErrorAction SilentlyContinue)) {
-                    if (($now - $rLog.LastWriteTime).TotalMinutes -lt 10) { return $true }
+                    if (($nowUtc - $rLog.LastWriteTimeUtc).TotalMinutes -lt 10) { return $true }
                 }
             }
         }
 
-        # Check 3: the CLI's transcripts, <config dir>\projects\<project>\
-        # <session>.jsonl and <session>\subagents\**\*.jsonl. The config dir
-        # is CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude; the
-        # watchdog task runs as the user, so that is the user's. Measured
-        # 2026-11-21: 3,904 files, listed in 160 ms. This runs only when a
-        # repair is about to start, never on the poll. The window is longer
-        # than the CLI's 30-minute limit on a foreground command, because a
-        # tool call writes nothing here until it returns.
-        $cfgDir = $env:CLAUDE_CONFIG_DIR
-        if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
-        if ($cfgDir) {
-            $projects = Join-Path $cfgDir "projects"
-            if (Test-Path -LiteralPath $projects -PathType Container) {
-                $recentTranscript = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
-                    Where-Object { ($now - $_.LastWriteTime).TotalMinutes -lt 35 } |
-                    Select-Object -First 1
-                if ($recentTranscript) { return $true }
-            }
-        }
+        # Check 3: the CLI's transcripts, through Test-ClaudeCodeTranscriptRecent
+        # in the shared region, so Fix -Quiet asks the same question. The
+        # watchdog task runs as the user, so the config dir it finds is the
+        # user's. This runs only when a repair is about to start, and, while
+        # a held-back repair waits, at most every 2 minutes; not on every
+        # poll. The window is longer than the CLI's 30-minute limit on a
+        # foreground command, because a tool call writes nothing there until
+        # it returns.
+        if (Test-ClaudeCodeTranscriptRecent -Minutes 35) { return $true }
     } catch {
         # Fails CLOSED. Test-UserActivity calls this to decide whether a repair
         # may proceed, so an unknown answer must not read as "no session".
-        Write-WatchLog "Test-ClaudeCodeActive failed ($($_.Exception.Message)); assuming a Code session IS active"
+        if (-not $Silent) {
+            Write-WatchLog "Test-ClaudeCodeActive failed ($($_.Exception.Message)); assuming a Code session IS active"
+        }
         return $true
     }
     return $false
@@ -2651,7 +3422,13 @@ function Test-UserActivity {
         SESSION 0 (SYSTEM scheduled tasks):
         - Win32 APIs return zero/stale data, so we skip checks 1-2
         - Falls back to VM log + CPU sampling + Code session + Cowork session detection
+
+        -Silent writes no line to the watch log, here or in
+        Test-ClaudeCodeActive. Invoke-HeldBackRetry asks this before a retry,
+        so a retry shows the warning only when BLOCKED would not stop it, and
+        its wait writes one line every 10 minutes at most.
     #>
+    param([switch]$Silent)
     try {
         # Every process named claude, the Claude Code CLI included: a busy
         # project thread or terminal session is activity, and this only ever
@@ -2676,7 +3453,12 @@ function Test-UserActivity {
                         foreach ($cp in $claudeProcs) {
                             if ($cp.Id -eq $parentId) { return $true }
                         }
-                    } catch { $null = $_ }
+                    } catch {
+                        # The window's process exited since it was read, and
+                        # under StrictMode its parent is then no property of
+                        # nothing: it is not Claude's, and checks 2 to 6 follow.
+                        $null = $_
+                    }
                 }
             }
 
@@ -2726,6 +3508,8 @@ function Test-UserActivity {
         # poll, and the cancel path ran the same shape again for another 48.
         $cpuBefore = @{}
         foreach ($cp in $claudeProcs) {
+            # A process that exited since the list was read has no CPU time
+            # to read, and is not busy.
             try { $cpuBefore[$cp.Id] = $cp.TotalProcessorTime.TotalMilliseconds }
             catch { $null = $_ }
         }
@@ -2738,7 +3522,10 @@ function Test-UserActivity {
                     if (($cp.TotalProcessorTime.TotalMilliseconds - $cpuBefore[$cp.Id]) -gt 100) {
                         return $true
                     }
-                } catch { $null = $_ }
+                } catch {
+                    # Exited during the sample: not busy.
+                    $null = $_
+                }
             }
         }
 
@@ -2747,7 +3534,7 @@ function Test-UserActivity {
         # During API-wait periods, CPU can be near zero for minutes.
         # Its transcripts, session files and app logs are more reliable
         # indicators.
-        if (Test-ClaudeCodeActive) { return $true }
+        if (Test-ClaudeCodeActive -Silent:$Silent) { return $true }
 
         # Check 6: Active Cowork session (API-wait safe)
         if (Test-CoworkSessionActive) { return $true }
@@ -2761,7 +3548,9 @@ function Test-UserActivity {
         #
         # The error is logged rather than swallowed, because the previous empty
         # catch is why nobody knew this could happen.
-        Write-WatchLog "Test-UserActivity failed ($($_.Exception.Message)); assuming the user IS active"
+        if (-not $Silent) {
+            Write-WatchLog "Test-UserActivity failed ($($_.Exception.Message)); assuming the user IS active"
+        }
         return $true
     }
     return $false
@@ -2815,6 +3604,10 @@ function Test-CoworkSessionActive {
         # second precision, no fractional part.
         $activityTag = '\[(Keepalive|startVM|VM:start|postConnect|vmOneShot)\]'
         $stampPat    = '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
+        # Local time, on purpose: the stamps are parsed from log text the app
+        # writes in local time with no offset, so local now is the only time
+        # they can be compared with. For the hour around a change of the
+        # clock a line can read up to an hour newer or older than it is.
         $now         = Get-Date
         $windowSec   = 180
 
@@ -2840,37 +3633,538 @@ function Test-CoworkSessionActive {
 
 # -- Auto-fix function ---------------------------------------------------
 
-function Invoke-AutoFix {
-    param([string]$Reason)
+function Clear-HeldBackRepair {
+    <#
+    .SYNOPSIS
+        Ends a pending held-back repair, in memory. The caller saves the state.
+    #>
+    $script:PendingFixReason     = $null
+    $script:PendingFixSince      = [datetime]::MinValue
+    $script:PendingFixHeldAt     = [datetime]::MinValue
+    $script:PendingFixTries      = 0
+    $script:PendingFixRetriesHeld = 0
+    $script:PendingFixNextCheck  = [datetime]::MinValue
+    $script:PendingFixWaitLogged = [datetime]::MinValue
+    $script:PendingFixLockLogged  = $false
+}
 
-    # Do not trigger auto-fix if Fix-ClaudeDesktop is already running.
-    #
-    # Fix takes one of these two names, preferring Global and falling back to
-    # Local when it lacks SeCreateGlobalPrivilege. Both are checked here because
-    # missing the lock means starting a second repair on top of a running one.
-    #
-    # The name carries no version deliberately: two toolkit versions operating
-    # on the same service and the same VHDX files at once is exactly what the
-    # lock exists to prevent. This check used to look for
-    # "Global\ClaudeDesktopFix_v4.8", which stopped matching the moment Fix's
-    # own name moved on.
+function Close-HeldBackRepair {
+    <#
+    .SYNOPSIS
+        Ends a pending held-back repair with one line that says why, and saves
+        the state.
+    .DESCRIPTION
+        The line reads ">>> held-back repair for <reason> <Why>". The state is
+        cleared at once, so nothing that asks again can repeat the line.
+    #>
+    param([string]$Why)
+    Write-WatchLog ">>> held-back repair for $($script:PendingFixReason) $Why"
+    Clear-HeldBackRepair
+    Save-WatchState
+}
+
+function Register-HeldBackRepair {
+    <#
+    .SYNOPSIS
+        Keeps a repair pending after a hold, in memory. The caller saves the
+        state.
+    .DESCRIPTION
+        A hold is Fix's exit 3, BLOCKED or DEFERRED in Invoke-AutoFix, or a
+        one-shot trigger in the wait one of them left. A repair not pending
+        yet starts its 4 hours at -HeldAt. One already pending keeps when its
+        4 hours started: a hold alone, a retry held back again or a re-checked
+        trigger held back while it waits, does not stretch them, so a repair
+        that keeps being held back cannot go on for ever. Only a one-shot
+        trigger that fires on its own starts them again
+        (Merge-HeldBackTrigger), because it is new evidence.
+
+        -HeldAt is also the latest hold. The next retry waits from it, and a
+        Fix log newer than it is a Fix run since. -FixHeld counts a run Fix
+        held back after the 30-second warning, toward the 3 tries. With
+        -Retry too, that run was a retry, and the wait before the next one
+        doubles (Get-HeldBackRetryWait).
+    #>
+    param([string]$Reason, [datetime]$HeldAt, [switch]$FixHeld, [switch]$Retry)
+    if (-not $script:PendingFixReason) {
+        $script:PendingFixSince       = $HeldAt
+        $script:PendingFixTries       = 0
+        $script:PendingFixRetriesHeld = 0
+        $script:PendingFixWaitLogged  = [datetime]::MinValue
+        $script:PendingFixLockLogged  = $false
+    }
+    $script:PendingFixReason    = $Reason
+    $script:PendingFixHeldAt    = $HeldAt
+    $script:PendingFixNextCheck = [datetime]::MinValue
+    if ($FixHeld) {
+        $script:PendingFixTries++
+        if ($Retry) { $script:PendingFixRetriesHeld++ }
+    }
+}
+
+function Get-HeldBackRetryWait {
+    <#
+    .SYNOPSIS
+        Minutes to wait after a hold before a repair is tried again.
+    .DESCRIPTION
+        2 minutes, the cooldown a hold leaves, doubled for each hold before
+        it that counts, 60 at most: 2, 4, 8, 16, 32 and then 60 minutes, for
+        0 to 5. Two callers count differently.
+
+        Invoke-AutoFix counts the runs Fix held back in a row before this
+        one, whatever the trigger, and sets the cooldown to it. A fault
+        checked again on every poll, the service down or the vmcompute
+        handle leak, then does not come back to the 30-second warning every
+        few minutes for as long as Fix holds it back.
+
+        Invoke-HeldBackRetry counts the retries of the pending repair that
+        Fix held back, and waits that long after its latest hold. The third
+        time Fix holds a pending repair back ends it (see Invoke-AutoFix),
+        so there the longer waits are a bound, not a schedule.
+
+        Whatever held Fix back, such as a user who moves the mouse when the
+        warning comes up, is then not asked again every few minutes.
+    .PARAMETER RetriesHeld
+        The holds before this one that count.
+    #>
+    param([int]$RetriesHeld)
+    return [int][math]::Min(60, 2 * [math]::Pow(2, [math]::Max(0, $RetriesHeld)))
+}
+
+function Get-ClaudeAppStartTime {
+    <#
+    .SYNOPSIS
+        When Claude Desktop's main process started, as UTC, or $null when the
+        app is not running or no start time could be read.
+    .DESCRIPTION
+        The oldest of Get-ClaudeDesktopProcess. Electron's main process
+        starts every other one and they end with it, so a helper started
+        again later, such as a GPU or renderer process, is younger and does
+        not count. StartTime is read per process inside a try, as DEFERRED
+        reads it: it throws for a process that has just exited.
+    #>
+    try { $procs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv) }
+    catch { return $null }
+    $oldest = $null
+    foreach ($p in $procs) {
+        try {
+            $st = $p.StartTime.ToUniversalTime()
+            if ($null -eq $oldest -or $st -lt $oldest) { $oldest = $st }
+        } catch {
+            # Exited since the list was read: not the main process.
+            $null = $_
+        }
+    }
+    return $oldest
+}
+
+function Test-FixLogRepaired {
+    <#
+    .SYNOPSIS
+        Whether a Fix log holds $FixRepairLine: that run got as far as the
+        repair.
+    .DESCRIPTION
+        Opened to share reading, writing and deleting, as a transcript Fix
+        is still writing, or a log it is rotating away, may be. A log that
+        cannot be read answers $false: the repair stays pending, and at worst
+        is tried again.
+    #>
+    param([string]$Path)
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+        try {
+            $reader = [System.IO.StreamReader]::new($stream, $true)
+            return $reader.ReadToEnd().Contains($FixRepairLine)
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return $false
+    }
+}
+
+function Get-FixRunAfter {
+    <#
+    .SYNOPSIS
+        The latest time a Fix log that holds $FixRepairLine was created or
+        written after -After, as UTC, or $null when there is none.
+    .DESCRIPTION
+        Fix writes fix_<time>_transcript.log in $FixLogDir from its start,
+        and fix_<time>.log each time it saves its log, and both get
+        $FixRepairLine once the run is past every check that holds it back.
+        Such a log created or written after -After is a Fix run since then
+        that started the repair: one run by hand, or the one that held Fix's
+        lock when this monitor's run was held back and went on after it. A
+        log without the line is a run that changed nothing, such as a
+        Diagnostic run, a Cancel or a No at "Proceed?", and does not count:
+        until the line was asked for, any Fix log did, so a Diagnostic run
+        ended a pending repair as "the repair". This monitor's own run
+        writes its logs before it returns, so before the hold that follows.
+        A folder or a log that cannot be read answers as no run, and the
+        repair stays pending. A folder that is there and cannot be read is
+        logged, at most once an hour for the same error (Write-CheckError);
+        until 6.3.0 it was passed over. No folder is no Fix run yet.
+    #>
+    param([datetime]$After)
+    $latest = $null
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $FixLogDir -Filter 'fix_*.log' -File -ErrorAction Stop)) {
+            $t = $f.LastWriteTimeUtc
+            if ($f.CreationTimeUtc -gt $t) { $t = $f.CreationTimeUtc }
+            if ($t -le $After -or ($null -ne $latest -and $t -le $latest)) { continue }
+            if (Test-FixLogRepaired -Path $f.FullName) { $latest = $t }
+        }
+    } catch {
+        if ([string]$_.FullyQualifiedErrorId -notlike 'PathNotFound*') {
+            Write-CheckError -Check 'Fix logs' -ErrorRecord $_ `
+                -Text "The Fix logs in $FixLogDir could not be read ({0}), so a Fix run is not seen there, and a held-back repair stays pending"
+        }
+    }
+    return $latest
+}
+
+function Close-StaleHeldBackRepair {
+    <#
+    .SYNOPSIS
+        Ends a pending held-back repair that is over, with one line that says
+        why. Returns $true when it ended one.
+    .DESCRIPTION
+        Over is one of three things.
+
+        4 hours since it was first held back, or since the latest one-shot
+        trigger that took it over fired (Merge-HeldBackTrigger). By then what
+        was wrong has had time to change, and a repair nobody has seen asked
+        for in hours could close a session the user has just started. No hold
+        starts the 4 hours again.
+
+        Claude Desktop started again since then (Get-ClaudeAppStartTime):
+        what was detected came from the app session that ended, and starting
+        the app again is what a repair would have done.
+
+        A Fix run since the latest hold that started the repair
+        (Get-FixRunAfter): whoever ran Fix has run it. Not asked while a Fix
+        run holds Fix's lock: the callers ask Test-FixLockHeld first, and
+        that run's log says what it did once it is over.
+
+        -AgeOnly asks the first only. It costs no process or folder listing,
+        so it can be asked on every poll.
+    #>
+    param([switch]$AgeOnly)
+    if (-not $script:PendingFixReason) { return $false }
+    if (([datetime]::UtcNow - $script:PendingFixSince).TotalHours -ge 4) {
+        Close-HeldBackRepair -Why 'dropped after 4 hours; run Fix-ClaudeDesktop.ps1 when you are ready'
+        return $true
+    }
+    if ($AgeOnly) { return $false }
+    $appStart = Get-ClaudeAppStartTime
+    if ($null -ne $appStart -and $appStart -gt $script:PendingFixSince) {
+        Close-HeldBackRepair -Why 'ended: Claude Desktop was started again since it was held back'
+        return $true
+    }
+    $lastHold = $script:PendingFixHeldAt
+    if ($lastHold -eq [datetime]::MinValue) { $lastHold = $script:PendingFixSince }
+    if ($null -ne (Get-FixRunAfter -After $lastHold)) {
+        Close-HeldBackRepair -Why 'ended: Fix-ClaudeDesktop ran after it was held back, so that run was the repair'
+        return $true
+    }
+    return $false
+}
+
+function Test-FixLockHeld {
+    <#
+    .SYNOPSIS
+        Whether a Fix-ClaudeDesktop run holds Fix's lock now.
+    .DESCRIPTION
+        Fix takes one of these two names, preferring Global and falling back
+        to Local when it lacks SeCreateGlobalPrivilege. Both are checked here
+        because missing the lock means starting a second repair on top of a
+        running one.
+
+        The name carries no version deliberately: two toolkit versions
+        operating on the same service and the same VHDX files at once is
+        exactly what the lock exists to prevent. This check used to look for
+        "Global\ClaudeDesktopFix_v4.8", which stopped matching the moment
+        Fix's own name moved on.
+
+        Only a lock that does not exist is not held. One that exists but
+        this monitor may not open, as when Fix runs elevated and the
+        monitor does not, is held; and one that cannot be asked at all is
+        taken as held, so no repair starts on top of a running one, and that
+        is logged, at most once an hour for the same error
+        (Write-CheckError). Until 6.3.0 any error read as not held.
+    #>
     foreach ($fixLockName in @("Global\ClaudeDesktopFix", "Local\ClaudeDesktopFix")) {
         try {
             $existingLock = [System.Threading.Mutex]::OpenExisting($fixLockName)
             $existingLock.Dispose()
-            Write-WatchLog "AUTO-FIX SKIPPED: Fix-ClaudeDesktop is already running"
-            return
-        } catch {
+            return $true
+        } catch [System.Threading.WaitHandleCannotBeOpenedException] {
             # Not held under this scope. Try the next one.
             $null = $_
+        } catch [System.UnauthorizedAccessException] {
+            # It exists, so a Fix run holds it.
+            return $true
+        } catch {
+            Write-CheckError -Check "Fix's lock" -ErrorRecord $_ `
+                -Text "Whether Fix-ClaudeDesktop is running could not be told from its lock $fixLockName ({0}); taken as running"
+            return $true
+        }
+    }
+    return $false
+}
+
+function Write-FixRunningSkip {
+    <#
+    .SYNOPSIS
+        Says that a repair is skipped because a Fix run holds Fix's lock.
+    .DESCRIPTION
+        A Fix run by hand holds the lock while it waits in its menu, for as
+        long as the user leaves it, and a re-checked trigger asks on every
+        poll meanwhile, so the line is never written each time it is asked.
+
+        With a repair pending, once while the lock stays held, with what
+        becomes of the repair: the retry asks every 2 minutes and finds the
+        lock gone once that run is over, which lets the next run be said
+        again. With none, nothing asks between triggers, so the end of a run
+        is not seen: at most once every 10 minutes instead (Test-LineDue).
+        Until 6.3.0 it was written each time it was asked, up to 120 times
+        an hour.
+    #>
+    if (-not $script:PendingFixReason) {
+        if (Test-LineDue -Key 'SKIPPED|lock' -Now ([datetime]::UtcNow)) {
+            Write-WatchLog "AUTO-FIX SKIPPED: Fix-ClaudeDesktop is already running"
+        }
+        return
+    }
+    if ($script:PendingFixLockLogged) { return }
+    $script:PendingFixLockLogged = $true
+    Write-WatchLog "AUTO-FIX SKIPPED: Fix-ClaudeDesktop is already running"
+    Write-WatchLog "    The held-back repair for $($script:PendingFixReason) is kept while that run lasts: it ends if the run gets as far as the repair, and is tried again if the run stops before it, as a Diagnostic run does"
+}
+
+function Merge-HeldBackTrigger {
+    <#
+    .SYNOPSIS
+        Merges a one-shot trigger that fired on its own into the pending
+        held-back repair, and saves the state.
+    .DESCRIPTION
+        A pending repair that is over ends first (Close-StaleHeldBackRepair),
+        so the trigger starts one of its own. Otherwise the trigger says what
+        is wrong now: the pending repair is retried for it, and its 4 hours
+        start again from -Now, because the trigger is new evidence. Its tries
+        and the retries held back are kept, so the 30-second warning still
+        comes at most 3 times, and a hold alone never starts the 4 hours
+        again. Without the new start, a log error that fired 2 minutes
+        before the mark would be dropped "after 4 hours" with the repair it
+        merged into, and never tried. The start is persisted with the rest,
+        so a restart of the monitor keeps it.
+
+        -AgeOnly asks only the 4 hours, for the lock path: while a Fix run
+        holds the lock, the Fix logs are not read until it is over.
+
+        Returns $true when the trigger took the pending repair over, so the
+        caller can say so, and $false when none was pending or it was over.
+    #>
+    param([string]$Reason, [datetime]$Now, [switch]$AgeOnly)
+    if (-not $script:PendingFixReason) { return $false }
+    if (Close-StaleHeldBackRepair -AgeOnly:$AgeOnly) { return $false }
+    if (-not $script:PendingFixReason) { return $false }
+    $script:PendingFixReason = $Reason
+    $script:PendingFixSince  = $Now
+    Save-WatchState
+    return $true
+}
+
+function Get-ClaudeCodeSessionHold {
+    <#
+    .SYNOPSIS
+        Why Fix's -Quiet gate would hold a repair back for a Claude Code
+        session, or $null when it would not.
+    .DESCRIPTION
+        Fix's gate (Get-AutomatedFixBlocker) asks two things about Claude
+        Code first, whether or not the app runs: whether the app runs a Code
+        session (Get-ClaudeAppCliProcess), and whether a transcript was
+        written in the last 35 minutes (Test-ClaudeCodeTranscriptRecent).
+        Test-UserActivity asks both too, through Test-ClaudeCodeActive, but
+        only when a process named claude is running. With none, such as with
+        the app closed and a Code session that ended minutes ago, or one in a
+        terminal whose process has another name, the monitor showed the
+        30-second warning, Fix held the run back, and a fault checked on
+        every poll came back to the warning again. Asked here as Fix asks
+        them, BLOCKED stops that run before the warning.
+
+        Fails closed, as Fix's gate does for the app's sessions: a list or a
+        folder that cannot be read is a reason too.
+    #>
+    try {
+        $appCli = @(Get-ClaudeAppCliProcess -Environment $script:ClaudeEnv)
+        if ($appCli.Count -gt 0) { return "$($appCli.Count) Claude Code session(s) the app started are running" }
+    } catch {
+        return "the Claude Code sessions the app started could not be listed"
+    }
+    try {
+        if (Test-ClaudeCodeTranscriptRecent -Minutes 35) { return "a Claude Code transcript was written in the last 35 minutes" }
+    } catch {
+        return "the Claude Code transcripts could not be read"
+    }
+    return $null
+}
+
+function Test-LineDue {
+    <#
+    .SYNOPSIS
+        Whether a line that repeats may be written now: $true at most once
+        every 10 minutes for each key.
+    .DESCRIPTION
+        For three lines. BLOCKED and COOLDOWN, which a trigger checked again
+        on every poll reaches each time it fires while the hold or the wait
+        lasts; the lines that follow COOLDOWN are written with it or not at
+        all. And AUTO-FIX SKIPPED from Write-FixRunningSkip, which any
+        trigger reaches while a Fix run holds Fix's lock and no repair is
+        pending, under the one key SKIPPED|lock rather than a reason.
+        Keys 10 minutes old are dropped first, so the table stays small; a
+        time in the future, after the clock was set back, counts as old. In
+        memory only: after a restart each line is written again once.
+    #>
+    param([string]$Key, [datetime]$Now)
+    foreach ($k in @($script:RepeatLinesSaid.Keys)) {
+        $age = ($Now - $script:RepeatLinesSaid[$k]).TotalMinutes
+        if ($age -ge 10 -or $age -lt 0) { $script:RepeatLinesSaid.Remove($k) }
+    }
+    if ($script:RepeatLinesSaid.ContainsKey($Key)) { return $false }
+    $script:RepeatLinesSaid[$Key] = $Now
+    return $true
+}
+
+function Invoke-AutoFix {
+    param(
+        [string]$Reason,
+        # A one-shot trigger: one that does not fire again for the same fault,
+        # a log error or an Event Log error. A hold, Fix's exit 3, Fix's lock
+        # held, or BLOCKED or DEFERRED here, keeps its repair pending for
+        # Invoke-HeldBackRetry, or it would be lost. Without it the trigger is re-checked, the
+        # service or the vmcompute check: asked again on every poll, it fires
+        # again while the fault lasts, so its repair is not kept.
+        [switch]$OneShot,
+        # Invoke-HeldBackRetry's call, for a repair held back. $Reason is
+        # then the reason it was held back for, and is logged with a prefix.
+        [switch]$Retry
+    )
+
+    # What a hold keeps as the pending repair's reason: without the prefix,
+    # so a retry held back again does not stack it.
+    $pendingReason = $Reason
+    # Whether a hold keeps this repair pending: a one-shot trigger's, or a
+    # retry's.
+    $keepOnHold = ($OneShot -or $Retry)
+    if ($Retry) { $Reason = "retry of held-back repair: $Reason" }
+
+    # Do not trigger auto-fix if Fix-ClaudeDesktop is already running: see
+    # Test-FixLockHeld.
+    #
+    # A repair pending meanwhile is not ended while that run holds the lock.
+    # The run may be the repair, or one that changes nothing: a Fix run by
+    # hand takes the lock and waits in its menu, and the user may pick
+    # Diagnostic or Cancel, or answer No at "Proceed?". Its log says which
+    # once it is over, and Invoke-HeldBackRetry reads it then
+    # (Close-StaleHeldBackRepair). Until then the pending repair is kept,
+    # and said to be once (Write-FixRunningSkip). A one-shot trigger that
+    # fires now is kept as Fix's own hold at its lock keeps it: merged into
+    # the pending repair, or pending as a new one.
+    if (Test-FixLockHeld) {
+        if ($OneShot -and -not $Retry) {
+            $null = Merge-HeldBackTrigger -Reason $Reason -Now ([datetime]::UtcNow) -AgeOnly
+            if (-not $script:PendingFixReason) {
+                Register-HeldBackRepair -Reason $pendingReason -HeldAt ([datetime]::UtcNow)
+                Save-WatchState
+            }
+        }
+        Write-FixRunningSkip
+        return
+    }
+    $script:PendingFixLockLogged = $false
+
+    # A one-shot trigger that fires on its own while a repair is pending
+    # takes it over: see Merge-HeldBackTrigger. First, so the time it is
+    # given is when the trigger fired, before any Fix log is read. What it
+    # took over is kept for the COOLDOWN line below, $null when nothing. The
+    # trigger the repair is pending for, fired again, takes nothing over,
+    # and its 4 hours start again all the same: $firedAgain.
+    $tookOverFrom = $null
+    $firedAgain = $false
+    if ($OneShot -and -not $Retry) {
+        $pendingBefore = $script:PendingFixReason
+        if (Merge-HeldBackTrigger -Reason $Reason -Now ([datetime]::UtcNow)) {
+            if ($pendingBefore -eq $Reason) { $firedAgain = $true } else { $tookOverFrom = $pendingBefore }
         }
     }
 
-    $now = Get-Date
+    # A Fix run by hand that started the repair since the latest run Fix
+    # held back ends those runs in a row, as a run Fix does not hold back
+    # ends them: the count starts again, and the wait they left ends 5
+    # minutes after that run at the latest, the cooldown after a repair. It
+    # never makes the wait longer: a run by hand outside such runs does not
+    # touch it. Asked here, before the cooldown, so that a fault found after
+    # the user's repair is not held off for up to an hour by holds from
+    # before it. Asked only while the count is above 0, and Get-FixRunAfter
+    # reads the text only of the Fix logs written since that hold.
+    if ($script:FixHeldInARow -gt 0) {
+        $manualAt = Get-FixRunAfter -After $script:FixHeldLastTime
+        if ($null -ne $manualAt) {
+            $script:FixHeldInARow    = 0
+            $script:FixHeldLastTime  = [datetime]::MinValue
+            $script:CooldownFromHold = $false
+            if ($script:LastFixTime -gt $manualAt) { $script:LastFixTime = $manualAt }
+            Save-WatchState
+        }
+    }
+
+    # UTC, as every time this monitor keeps.
+    $now = [datetime]::UtcNow
     $elapsed = ($now - $script:LastFixTime).TotalMinutes
 
     if ($elapsed -lt $Cooldown) {
-        Write-WatchLog "COOLDOWN: Skipping fix ($Reason), last fix $([math]::Round($elapsed, 1)) min ago"
+        # Says when a fix is allowed again, not how long ago one ran. BLOCKED,
+        # DEFERRED, CANCELLED and HELD BACK shorten the wait by moving
+        # $script:LastFixTime back, with no fix run. Until 6.3.0 this said
+        # "last fix N min ago", counted from that time, so after a BLOCKED it
+        # named a fix 3 minutes old that never ran.
+        #
+        # At most once every 10 minutes for the same reason (Test-LineDue):
+        # after runs Fix held back in a row the wait can be an hour, and a
+        # re-checked trigger comes here each time it fires meanwhile.
+        #
+        # A one-shot trigger with no repair pending is kept as one when a
+        # hold left this wait ($script:CooldownFromHold), and
+        # Invoke-HeldBackRetry tries it once the wait is over: the trigger
+        # does not fire again, and after runs Fix held back in a row the wait
+        # can be an hour, so without this it would be lost. In the cooldown
+        # after a repair that ran it is skipped, as before: that repair has
+        # just restarted the app and the service, which is what a log error
+        # then most likely comes from, and the cooldown is there so that a
+        # second repair does not start on top of the first. After an
+        # escalation or a cancel too: the user has been told to run Fix by
+        # hand. A repair pending already has taken the trigger over above,
+        # and is tried again for it the same way, so a second line says so
+        # too, when COOLDOWN is written: COOLDOWN alone read as if the
+        # trigger were dropped, although a PRE-FIX WARNING for it follows.
+        # The trigger it is pending for, fired again, is said to be tried
+        # again, with its 4 hours from now: it takes over nothing, and
+        # naming it as the repair it took over read as if it had.
+        $sayCooldown = Test-LineDue -Key "COOLDOWN|$Reason" -Now $now
+        if ($sayCooldown) {
+            Write-WatchLog "COOLDOWN: Skipping fix ($Reason), a fix is allowed again in $([math]::Round($Cooldown - $elapsed, 1)) min"
+            if ($tookOverFrom) {
+                Write-WatchLog "    It takes over the held-back repair for $tookOverFrom, and is tried again once the wait is over, for up to 4 hours"
+            } elseif ($firedAgain) {
+                Write-WatchLog "    It is tried again once the wait is over, for up to 4 hours"
+            }
+        }
+        if ($OneShot -and -not $Retry -and $script:CooldownFromHold -and -not $script:PendingFixReason) {
+            Register-HeldBackRepair -Reason $pendingReason -HeldAt $now
+            Save-WatchState
+            if ($sayCooldown) { Write-WatchLog "    It is tried again once the wait is over, for up to 4 hours" }
+        }
         return
     }
 
@@ -2893,23 +4187,65 @@ function Invoke-AutoFix {
             $notifyIcon.BalloonTipText = "Auto-fix failed 3 times. Hyper-V nuclear reset needed.`nSee watch log for instructions."
             $notifyIcon.ShowBalloonTip(60000)
             [System.Media.SystemSounds]::Hand.Play()
-        } catch { $null = $_ }
+        } catch {
+            # No interactive desktop (Session 0) or the assemblies are
+            # absent: the steps are in the log above all the same.
+            $null = $_
+        }
         # Back off for the 30 minutes that Test-PersistentFailure measures over.
         #
         # This used to add $Cooldown, which defaults to 5, so the "back off"
         # lasted 10 minutes, not 30. Test-PersistentFailure looks at a 30-minute
         # window, so the escalation stayed true and the balloon plus alert sound
         # repeated every 10 minutes indefinitely.
-        $script:LastFixTime = (Get-Date).AddMinutes(30 - $Cooldown)
+        $script:LastFixTime = [datetime]::UtcNow.AddMinutes(30 - $Cooldown)
+        $script:CooldownFromHold = $false
         return
     }
 
     # ---- SAFETY: Never auto-fix while user is active ----
-    if (Test-UserActivity) {
-        Write-WatchLog ">>> BLOCKED: $Reason, user is active (Claude in focus, recent input, or VM busy)"
-        Write-WatchLog "    Run Fix-ClaudeDesktop.ps1 manually when ready"
-        # Set cooldown so we don't spam the log every 30s -- retry in ~2 min
+    # What Fix's -Quiet gate asks about Claude Code sessions is asked first
+    # (Get-ClaudeCodeSessionHold), so the 30-second warning is not shown for
+    # a run that gate would hold back for a Code session: Test-UserActivity
+    # asks nothing when no process named claude is running, and Fix's gate
+    # still asks about the transcripts then.
+    $codeHold = Get-ClaudeCodeSessionHold
+    if ($codeHold -or (Test-UserActivity)) {
+        if ($codeHold) {
+            $blockedWhy   = $codeHold
+            $blockedUntil = 'once that is over'
+        } else {
+            $blockedWhy   = 'user is active (Claude in focus, recent input, or VM busy)'
+            $blockedUntil = 'once the user is away'
+        }
+        # At most once every 10 minutes for the same reason (Test-LineDue):
+        # a re-checked trigger comes back here each time it fires while the
+        # hold lasts, which wrote these lines about 30 times an hour.
+        $sayBlocked = Test-LineDue -Key "BLOCKED|$Reason" -Now $now
+        if ($sayBlocked) { Write-WatchLog ">>> BLOCKED: $Reason, $blockedWhy" }
+        # Set cooldown so we don't spam the log every 30s: a trigger that
+        # fires again gets through again in about 2 minutes. A pending
+        # held-back repair waits longer when Invoke-HeldBackRetry's own wait
+        # is longer: Get-HeldBackRetryWait from its latest hold, which is
+        # this one when the repair is kept below, 2 minutes doubled for each
+        # retry Fix has held back.
         $script:LastFixTime = $now.AddMinutes(-($Cooldown - 2))
+        $script:CooldownFromHold = $true
+        # A one-shot trigger's repair, or a retry, is kept pending as HELD
+        # BACK keeps it below, and Invoke-HeldBackRetry tries it again once
+        # the hold is over. Until 6.3.0 nothing did, and a log error BLOCKED
+        # here was lost. Not counted toward the 3 tries: no warning was shown.
+        # A re-checked trigger fires again on its own, and a pending repair
+        # stays as it is.
+        if ($keepOnHold) {
+            Register-HeldBackRepair -Reason $pendingReason -HeldAt $now
+            Save-WatchState
+            if ($sayBlocked) {
+                Write-WatchLog "    It is tried again $blockedUntil, for up to 4 hours, or run Fix-ClaudeDesktop.ps1 manually when ready"
+            }
+        } elseif ($sayBlocked) {
+            Write-WatchLog "    Run Fix-ClaudeDesktop.ps1 manually when ready"
+        }
         return
     }
 
@@ -2925,10 +4261,13 @@ function Invoke-AutoFix {
     if ($claudeStartupProcs.Count -gt 0) {
         # .StartTime is read per process inside a try.
         #
-        # It throws for a process that exited between the Get-Process above and
-        # this line, and with sixteen short-lived Electron helpers around, that
-        # is a routine occurrence rather than an edge case. Unprotected, one
-        # exited helper abandoned the whole repair for that cycle.
+        # A process that exited between the Get-Process above and this line
+        # has no start time, and with sixteen short-lived Electron helpers
+        # around, that is a routine occurrence rather than an edge case.
+        # PowerShell reads it as nothing rather than throwing (measured on
+        # 5.1), and a process with none is passed over; the try is for
+        # anything else. Unprotected, one exited helper abandoned the whole
+        # repair for that cycle.
         $youngest = $null
         foreach ($sp in $claudeStartupProcs) {
             try {
@@ -2936,10 +4275,22 @@ function Invoke-AutoFix {
                 if ($null -eq $youngest -or $st -gt $youngest) { $youngest = $st }
             } catch { $null = $_ }
         }
-        $procAge = if ($youngest) { ((Get-Date) - $youngest).TotalSeconds } else { [double]::MaxValue }
+        # UTC, for the same reason as Test-ClaudeCodeActive's ages: at the
+        # change to summer time a process started a minute ago read as an
+        # hour and a minute old.
+        $procAge = if ($youngest) { ([datetime]::UtcNow - $youngest.ToUniversalTime()).TotalSeconds } else { [double]::MaxValue }
         if ($procAge -lt 120) {
             Write-WatchLog ">>> DEFERRED: $Reason, Claude launched $([math]::Round($procAge))s ago (waiting for startup to complete)"
             $script:LastFixTime = $now.AddMinutes(-($Cooldown - 1))
+            $script:CooldownFromHold = $true
+            # Kept pending for a one-shot trigger or a retry, as BLOCKED keeps
+            # it, and tried again once startup is over. Until 6.3.0 a log
+            # error DEFERRED here was lost.
+            if ($keepOnHold) {
+                Register-HeldBackRepair -Reason $pendingReason -HeldAt $now
+                Save-WatchState
+                Write-WatchLog "    It is tried again once startup is over, for up to 4 hours"
+            }
             return
         }
     }
@@ -2972,7 +4323,8 @@ function Invoke-AutoFix {
 
     Start-Sleep -Seconds 30
 
-    # Dismiss notification
+    # Dismiss notification. One that was never shown, or is gone already,
+    # has nothing to dismiss.
     try { if ($notifyIcon) { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } } catch { $null = $_ }
 
     # Re-check: only cancel if Claude is ACTIVELY being used.
@@ -3002,11 +4354,18 @@ function Invoke-AutoFix {
                                 foreach ($cp in $claudeProcs) {
                                     if ($cp.Id -eq $parentId) { $cancelFix = $true; $cancelReason = "Claude is now in focus"; break }
                                 }
-                            } catch { $null = $_ }
+                            } catch {
+                                # The window's process exited since it was
+                                # read: it is not Claude's.
+                                $null = $_
+                            }
                         }
                     }
                 }
-            } catch { $null = $_ }
+            } catch {
+                Write-CheckError -Check 'focus before repair' -ErrorRecord $_ `
+                    -Text "Whether Claude is in focus could not be read before the repair ({0}); the other checks still decide"
+            }
         }
 
         # Cancel if any Claude process is burning CPU
@@ -3022,7 +4381,10 @@ function Invoke-AutoFix {
                         $cp.Refresh()
                         $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
                         if (($cpu2 - $cpu1) -gt 50) { $cancelFix = $true; $cancelReason = "Claude CPU active (sample $sample/3)"; break }
-                    } catch { $null = $_ }
+                    } catch {
+                        # Exited during the sample: not busy.
+                        $null = $_
+                    }
                 }
             }
         }
@@ -3065,9 +4427,24 @@ function Invoke-AutoFix {
             Start-Sleep -Seconds 16
             $cancelNotify.Visible = $false
             $cancelNotify.Dispose()
-        } catch { $null = $_ }
+        } catch {
+            # No interactive desktop or no assemblies, as for the warning's
+            # balloon: the CANCELLED line above is in the log.
+            $null = $_
+        }
 
-        $script:LastFixTime = $now.AddMinutes(-($Cooldown - 2))
+        # A trigger that fires again gets through about 2 minutes from now.
+        # Until 6.3.0 this was counted from $now, which was taken before the
+        # 30-second warning, the samples and the 16 seconds the balloon is
+        # shown, so the check came back a minute or so after the cancel.
+        $script:LastFixTime = [datetime]::UtcNow.AddMinutes(-($Cooldown - 2))
+        $script:CooldownFromHold = $false
+        # The cancel ends a pending held-back repair: the user is at Claude,
+        # and the balloon has told them to run Fix if Cowork is broken.
+        if ($script:PendingFixReason) {
+            Clear-HeldBackRepair
+            Save-WatchState
+        }
         return
     }
 
@@ -3075,6 +4452,7 @@ function Invoke-AutoFix {
     Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) TRIGGERED: $Reason"
     Write-WatchLog "    (Claude still inactive after 30s warning)"
     $script:LastFixTime = $now
+    $script:CooldownFromHold = $false
 
     # Fix-ClaudeDesktop self-elevates with Start-Process -Verb RunAs -Wait when
     # it is not already running as admin. Invoking it in-process from an
@@ -3085,28 +4463,132 @@ function Invoke-AutoFix {
     # So only call it when this process already holds the token Fix needs. The
     # cooldown was set just above, so this logs at most once per cooldown
     # window rather than on every poll.
+    #
+    # A check that fails says so, naming why: until 6.3.0 it read as "not
+    # elevated", which sent the user to reinstall a task that was fine.
     $watchIsAdmin = $false
+    $adminCheckError = $null
     try {
         $watchIsAdmin = ([Security.Principal.WindowsPrincipal] `
             [Security.Principal.WindowsIdentity]::GetCurrent()
             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { $null = $_ }
+    } catch { $adminCheckError = Get-CheckErrorText -ErrorRecord $_ }
 
     if (-not $watchIsAdmin) {
-        Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) SKIPPED: this monitor is not elevated, so Fix would raise a UAC prompt with nobody to answer it. Reinstall the monitor task with highest privileges, or run Fix-ClaudeDesktop manually."
+        if ($adminCheckError) {
+            Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) SKIPPED: whether this monitor is elevated could not be read ($adminCheckError), so Fix was not started: unelevated, it would raise a UAC prompt with nobody to answer it. Run Fix-ClaudeDesktop manually."
+        } else {
+            Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) SKIPPED: this monitor is not elevated, so Fix would raise a UAC prompt with nobody to answer it. Reinstall the monitor task with highest privileges, or run Fix-ClaudeDesktop manually."
+        }
+        # Fix cannot be started from here, so a pending held-back repair ends:
+        # retried, it would only show the warning again every cooldown.
+        if ($script:PendingFixReason) {
+            Clear-HeldBackRepair
+            Save-WatchState
+        }
         return
     }
 
+    $fixExit = $null
     try {
         & $fixScript -Mode Smart -Quiet
-        Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) COMPLETE (exit $LASTEXITCODE)"
+        $fixExit = $LASTEXITCODE
     } catch {
         Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) FAILED: $($_.Exception.Message)"
     }
 
+    # Fix held the run back before it stopped the app or the service: at its
+    # start, right before Step 1's kill, or another Fix run held the lock. It
+    # is not recorded as an attempt at a repair: not toward the escalation,
+    # and the counters and baselines keep what was detected.
+    #
+    # A one-shot trigger's repair, or a retry, is kept pending, and
+    # Invoke-HeldBackRetry tries it again once the hold has cleared, so a
+    # trigger that does not fire again, such as a log error, is not lost. Its
+    # 4 hours run from when it was first held back, or from the latest
+    # one-shot trigger that took it over (Merge-HeldBackTrigger), and a retry
+    # held back again keeps that time: one that ran past the 4 hours is
+    # dropped here. The third time Fix holds a repair back after the
+    # 30-second warning, the first included, it is dropped too, and each
+    # retry Fix holds back doubles the wait before the next one. Whatever
+    # held Fix back each time, such as a user who moves the mouse when the
+    # warning comes up, is disturbed by every warning more. A re-checked
+    # trigger's repair is not kept: the check fires again while the fault
+    # lasts.
+    #
+    # Each run Fix holds back in a row doubles the wait before the next
+    # repair, whatever the trigger: 2, 4, 8, 16, 32, then 60 minutes
+    # (Get-HeldBackRetryWait), one count, kept in watch-state.json. A fault
+    # checked again on every poll, the service down or the vmcompute leak,
+    # otherwise came back to the 30-second warning every 2 to 5 minutes for
+    # as long as Fix held it back. A run Fix does not hold back starts the
+    # count again; so does a Fix run by hand that started the repair since
+    # the latest hold, seen above before the cooldown; and so does a hold 4
+    # hours or more after the one before, which belongs to a fault of its
+    # own and is seen here. The wait is kept in $script:LastFixTime, so a
+    # one-shot trigger that fires during it is kept for after it (the
+    # cooldown above).
+    #
+    # The wait runs from when Fix returned, not from $now, which was taken
+    # before the 30-second warning. Fix can run for minutes before Step 1,
+    # and 2 minutes from before all that could be over by the time it ends.
+    if ($fixExit -eq $FixHeldBackExitCode) {
+        $heldAt = [datetime]::UtcNow
+        if (($heldAt - $script:FixHeldLastTime).TotalHours -ge 4) { $script:FixHeldInARow = 0 }
+        $script:FixHeldInARow++
+        $script:FixHeldLastTime = $heldAt
+        $script:CooldownFromHold = $true
+        $heldWait = Get-HeldBackRetryWait -RetriesHeld ($script:FixHeldInARow - 1)
+        $script:LastFixTime = $heldAt.AddMinutes($heldWait - $Cooldown)
+        $held = ">>> AUTO-FIX #$($script:FixCount) HELD BACK by Fix (exit $fixExit): not counted as an attempt"
+        $dropWhy = $null
+        if (-not $keepOnHold) {
+            $held += '; the check fires again while the fault lasts'
+            # A one-shot repair pending meanwhile now waits from this hold,
+            # and this run's own Fix log is not read as a Fix run since.
+            if ($script:PendingFixReason) { $script:PendingFixHeldAt = $heldAt }
+        } else {
+            Register-HeldBackRepair -Reason $pendingReason -HeldAt $heldAt -FixHeld -Retry:$Retry
+            if (($heldAt - $script:PendingFixSince).TotalHours -ge 4) {
+                $dropWhy = 'dropped after 4 hours; run Fix-ClaudeDesktop.ps1 when you are ready'
+            } elseif ($script:PendingFixTries -ge 3) {
+                $dropWhy = 'dropped after 3 tries; run Fix-ClaudeDesktop.ps1 when you are ready'
+            } else {
+                $held += '; it is retried when the hold clears, for up to 4 hours'
+            }
+        }
+        Write-WatchLog $held
+        if ($heldWait -gt 2) {
+            Write-WatchLog "    Fix has held back $($script:FixHeldInARow) runs in a row, so the next repair waits $heldWait minutes"
+        }
+        if ($dropWhy) {
+            Close-HeldBackRepair -Why $dropWhy
+            return
+        }
+        Save-WatchState
+        return
+    }
+    # Any other end means the repair ran, or could not start: a pending
+    # held-back repair ends, and is saved with the history below, and the
+    # count of runs Fix held back in a row starts again.
+    Clear-HeldBackRepair
+    $script:FixHeldInARow   = 0
+    $script:FixHeldLastTime = [datetime]::MinValue
+    # Fix ran the repair part of the way and stopped before going further,
+    # because it found a Claude Code session, or could not list the sessions
+    # to rule one out. It had run Steps 1 and 2, which stop the app and the
+    # service when they are running, so it is an attempt like any other:
+    # recorded below toward the escalation, what was detected is reset, and
+    # the normal cooldown applies.
+    if ($fixExit -eq $FixStoppedPartWayExitCode) {
+        Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) STOPPED PART-WAY by Fix (exit $fixExit): the repair ran part of the way, then Fix stopped before going further: a Claude Code session was found, or could not be ruled out (see the Fix log); counted as an attempt"
+    } elseif ($null -ne $fixExit) {
+        Write-WatchLog ">>> AUTO-FIX #$($script:FixCount) COMPLETE (exit $fixExit)"
+    }
+
     # Record fix timestamp for persistent failure detection, and persist it so
     # the backoff survives the restart that a bad repair loop tends to cause.
-    $null = $script:FixHistory.Add((Get-Date))
+    $null = $script:FixHistory.Add([datetime]::UtcNow)
     Save-WatchState
 
     # Reset state after fix.
@@ -3122,9 +4604,87 @@ function Invoke-AutoFix {
     $script:VmLogEverActive    = $false
     $script:ServiceDownCount   = 0
     $script:EventLogHitCount   = 0
-    $script:HeartbeatFailCount = 0
     $script:VmcomputeLeakCount = 0
-    $script:GuestFailCount     = 0
+}
+
+function Invoke-HeldBackRetry {
+    <#
+    .SYNOPSIS
+        Tries again a repair held back for a one-shot trigger, once the hold
+        has cleared.
+    .DESCRIPTION
+        Called on a poll where no check fired, with the app running. A hold is
+        Fix's exit 3, Fix's lock held, BLOCKED or DEFERRED in Invoke-AutoFix,
+        or the wait one of them leaves, for a one-shot trigger that fired in
+        it. A one-shot trigger that fires on its own goes to Invoke-AutoFix as
+        before, and takes the pending repair over there, which starts its 4
+        hours again (Merge-HeldBackTrigger).
+
+        Asked once the cooldown a hold leaves is over, doubled for each run
+        Fix held back in a row, and the wait after the latest hold has passed
+        (Get-HeldBackRetryWait: 2 minutes, doubled each time Fix holds a
+        retry back), and then no more than every 2 minutes.
+
+        While a Fix run holds Fix's lock it waits, and says so once
+        (Write-FixRunningSkip): the run may be the repair, or one that
+        changes nothing, such as a Diagnostic run, and its log says which
+        once it is over. Then it ends if it is over
+        (Close-StaleHeldBackRepair): 4 hours old, the app started again, or a
+        Fix run since the latest hold that started the repair. Then it asks,
+        silently, what Fix's -Quiet gate asks about Claude Code sessions
+        (Get-ClaudeCodeSessionHold: one the app started, or a transcript in
+        the last 35 minutes), whether Test-ClaudeCodeActive sees a session,
+        and whether Test-UserActivity, which BLOCKED asks, sees the user.
+        While one does, the repair waits: no warning, no Fix, and one line
+        every 10 minutes at most. Otherwise Invoke-AutoFix runs it, through
+        the same lock check, cooldown, escalation, BLOCKED, DEFERRED and
+        30-second warning as any trigger, and a hold there is again not
+        counted as an attempt.
+
+        It also ends when a repair runs or cannot be started, when the
+        warning is cancelled, and the third time Fix holds it back after the
+        warning.
+    #>
+    if (-not $script:PendingFixReason) { return }
+    # On every poll: it lists nothing, and the drop is said on time.
+    if (Close-StaleHeldBackRepair -AgeOnly) { return }
+    $pending = $script:PendingFixReason
+    $now = [datetime]::UtcNow
+    if (($now - $script:LastFixTime).TotalMinutes -lt $Cooldown) { return }
+    $lastHold = $script:PendingFixHeldAt
+    if ($lastHold -eq [datetime]::MinValue) { $lastHold = $script:PendingFixSince }
+    if ($now -lt $lastHold.AddMinutes((Get-HeldBackRetryWait -RetriesHeld $script:PendingFixRetriesHeld))) { return }
+    if ($now -lt $script:PendingFixNextCheck) { return }
+    $script:PendingFixNextCheck = $now.AddMinutes(2)
+    # While a Fix run holds the lock, the Fix logs are not read: that run is
+    # not over, and only its log says whether it was the repair.
+    if (Test-FixLockHeld) {
+        Write-FixRunningSkip
+        return
+    }
+    $script:PendingFixLockLogged = $false
+    if (Close-StaleHeldBackRepair) { return }
+
+    # Fails closed, as Fix's -Quiet gate does.
+    $why = Get-ClaudeCodeSessionHold
+    if (-not $why -and (Test-ClaudeCodeActive -Silent)) {
+        $why = "a Claude Code session is active, or a transcript was written in the last 35 minutes"
+    }
+    # What BLOCKED asks, asked first and silently, so a retry shows the
+    # warning only when BLOCKED would not stop it. Without it, a user at the
+    # PC got a BLOCKED pair of lines every 2 minutes for as long as the
+    # repair waited.
+    if (-not $why -and (Test-UserActivity -Silent)) {
+        $why = "the user is active (Claude in focus, recent input, or VM busy)"
+    }
+    if ($why) {
+        if (($now - $script:PendingFixWaitLogged).TotalMinutes -ge 10) {
+            Write-WatchLog "a held-back repair for $pending is still waiting: $why"
+            $script:PendingFixWaitLogged = $now
+        }
+        return
+    }
+    Invoke-AutoFix -Reason $pending -Retry
 }
 
 # -- Prevent duplicate instances -----------------------------------------
@@ -3142,11 +4702,15 @@ try {
         }
         exit 0
     }
+} catch [System.Threading.AbandonedMutexException] {
+    # Taken: the monitor that held it ended without letting go of it.
+    $null = $_
 } catch {
     # Could not take the lock. Monitoring without one is better than not
     # monitoring, and Invoke-AutoFix checks Fix's own lock separately before it
-    # does anything destructive.
-    $null = $_
+    # does anything destructive. Said, naming why: until 6.3.0 it was not.
+    Write-CheckError -Check 'single instance' -ErrorRecord $_ `
+        -Text "The lock that keeps a second monitor from running ($mutexName) could not be taken ({0}); monitoring without it"
 }
 
 # Restore cooldown and fix history before the first poll, so a restart cannot
@@ -3187,8 +4751,8 @@ function Sync-ClaudeDataPaths {
     #>
     param([switch]$Force)
 
-    if (-not $Force -and (Get-Date) -lt $script:NextDataPathSync) { return }
-    $script:NextDataPathSync = (Get-Date).AddMinutes(10)
+    if (-not $Force -and [datetime]::UtcNow -lt $script:NextDataPathSync) { return }
+    $script:NextDataPathSync = [datetime]::UtcNow.AddMinutes(10)
     try {
         $p = Resolve-ClaudeDataPaths -PackageFamilyName $script:ClaudeEnv.PackageFamilyName `
                                      -AppDataDir $ClaudeAppData
@@ -3265,30 +4829,19 @@ Write-WatchLog "  Safety        : user-activity block, 180s grace period, consec
 # not match either real log format. Staleness could never fire, because it
 # measured a file last written in March. Naming dead monitors in the startup
 # banner is how they stayed unnoticed.
-# Guest-connect is reported as live or dormant based on the actual source file,
-# not asserted. Test-GuestConnectionHealth rejects cowork-service.log when it is
-# more than 300s stale, and on current builds that file has not been written
-# since March, so the check returns immediately. Claiming it as an active
-# monitor would repeat exactly the mistake this banner used to make.
-$guestSrc = $null
-if ($ClaudeLogDir) { $guestSrc = Join-Path $ClaudeLogDir "cowork-service.log" }
-$guestLive = $false
-if ($guestSrc -and (Test-Path $guestSrc)) {
-    try {
-        $guestLive = (((Get-Date) - (Get-Item $guestSrc).LastWriteTime).TotalSeconds -le 300)
-    } catch { $null = $_ }
-}
-
-$autoFixList = "logs, service(x2), events(x2)+HCS, vmcompute-health"
-if ($guestLive) { $autoFixList += ", guest-connect(x3)" }
-
-Write-WatchLog "  Auto-fix on   : $autoFixList"
-Write-WatchLog "  Warn only     : NAT, storage, VM log staleness(x5), clock drift, hcs-state"
+# Heartbeat, guest-connect and NAT were removed in 6.3.0. There is no
+# heartbeat to read for an HCS compute system. The guest check read
+# cowork-service.log for a message that file has never held, and the file is
+# no longer written. The NAT check looked for a WinNAT rule, and the Cowork VM
+# does not use one.
+Write-WatchLog "  Auto-fix on   : logs, service(x2), events(x2)+HCS, vmcompute-health"
+Write-WatchLog "  Warn only     : storage, VM log staleness(x5), clock drift, hcs-state"
 Write-WatchLog "  Not monitored : Hyper-V heartbeat (no such thing for an HCS compute system)"
-if (-not $guestLive) {
-    Write-WatchLog "  Dormant       : guest-connect (cowork-service.log is stale or absent on this build)"
-}
 Write-WatchLog "================================================================"
+if ($script:SessionReadError) {
+    Write-CheckError -Check 'session' -ErrorRecord $script:SessionReadError `
+        -Text "The session this monitor runs in could not be read ({0}), so the foreground-window and input checks are skipped, as in Session 0"
+}
 
 try {
     while ($true) {
@@ -3361,13 +4914,19 @@ try {
                 if (-not (Test-StartupGracePeriod)) {
                     $logError = Test-LogsForErrors
                     if ($logError) {
-                        Invoke-AutoFix -Reason "Log error: $logError"
+                        # One-shot: Test-LogsForErrors moves its baselines
+                        # past what it read, so the same line never fires
+                        # again, and a repair held back for it is kept.
+                        Invoke-AutoFix -Reason "Log error: $logError" -OneShot
                         continue
                     }
                 }
 
                 # Check 2: Service died while Claude is running (2 consecutive checks)
                 if (-not (Test-ServiceHealth)) {
+                    # Re-checked: the service is asked about again on every
+                    # poll, so this fires again while it stays down, and a
+                    # repair held back for it is not kept.
                     Invoke-AutoFix -Reason "CoworkVMService stopped while Claude is running (confirmed)"
                     continue
                 }
@@ -3375,14 +4934,12 @@ try {
                 # Check 3: Event Log errors (2 consecutive checks, grace period, tightened filters)
                 $eventError = Test-EventLogErrors
                 if ($eventError) {
-                    Invoke-AutoFix -Reason "Event Log: $eventError"
+                    # One-shot: an event counts only inside the 60-second
+                    # look-back, and the count starts again from 0 once it
+                    # fires, so the same event does not fire again. A repair
+                    # held back for it is kept.
+                    Invoke-AutoFix -Reason "Event Log: $eventError" -OneShot
                     continue
-                }
-
-                # Check 4: WinNAT connectivity (warning only -- does NOT auto-fix)
-                $natIssue = Test-WinNatHealth
-                if ($natIssue) {
-                    Write-WatchLog "NAT WARNING: $natIssue"
                 }
 
                 # Check 4b: workspace storage readable and not out of room.
@@ -3392,12 +4949,11 @@ try {
                     Write-WatchLog "STORAGE WARNING: $storageIssue"
                 }
 
-                # Check 5: Hyper-V heartbeat (3 consecutive checks, grace period)
-                $hbIssue = Test-VmHeartbeat
-                if ($hbIssue) {
-                    Invoke-AutoFix -Reason $hbIssue
-                    continue
-                }
+                # Check 5 was the Hyper-V heartbeat, removed in 6.3.0. It read
+                # the heartbeat through Get-VM, which never lists an HCS
+                # compute system such as the Cowork VM, so it could not fire,
+                # and from 6.0.0 it was a function that returned nothing.
+                # Check 6 and the hcs-state check watch the VM instead.
 
                 # Check 6: VM log staleness. WARNING ONLY. It does not auto-fix.
                 #
@@ -3428,6 +4984,9 @@ try {
                 # Check 7: vmcompute handle leak (2 consecutive checks, 60s interval)
                 $vmcomputeIssue = Test-VmcomputeHealth
                 if ($vmcomputeIssue) {
+                    # Re-checked: the handle count is read again every 60
+                    # seconds, so this fires again while the leak lasts, and
+                    # a repair held back for it is not kept.
                     Invoke-AutoFix -Reason $vmcomputeIssue
                     continue
                 }
@@ -3436,62 +4995,19 @@ try {
                 $hcsStateIssue = Test-HcsStateHealth
                 if ($hcsStateIssue) {
                     # Rate-limit HCS STATE logging to once per 10 minutes (was every 30s)
-                    $hcsLogElapsed = ((Get-Date) - $script:LastHcsStateLogTime).TotalMinutes
+                    $hcsLogElapsed = ([datetime]::UtcNow - $script:LastHcsStateLogTime).TotalMinutes
                     if ($hcsLogElapsed -ge 10) {
                         Write-WatchLog "HCS STATE: $hcsStateIssue"
-                        $script:LastHcsStateLogTime = Get-Date
-                        # Informational plus a pre-emptive cleanup; no auto-fix.
-                        #
-                        # Rewritten. The block this replaces carried the same two
-                        # bugs as Fix-ClaudeDesktop findings 1 and 2, and the
-                        # audit did not catch this second copy of them:
-                        #
-                        #   1. It parsed GUIDs by looking for a line matching
-                        #      ^\s*GUID\s*$. "hcsdiag list" never puts the GUID
-                        #      on a line of its own, so $vmGuids was always
-                        #      empty and this entire block was dead.
-                        #   2. It then called "hcsdiag close", and hcsdiag has
-                        #      no close verb. Even had the parse worked, the
-                        #      call would have done nothing while logging
-                        #      "proactively closed stale cowork-vm".
-                        #
-                        # The parse now lives in Get-CoworkHcsGuids in the shared
-                        # ClaudeEnv region. This was the third of four copies.
-                        try {
-                            $hcsList = Get-HcsListCached
-                            if ($hcsList) {
-                                $vmGuids = @(Get-CoworkHcsGuids -ListOutput ([string]$hcsList))
-
-                                # Keep the newest entry, which is the live VM,
-                                # and kill anything else left behind.
-                                if ($vmGuids.Count -gt 1) {
-                                    foreach ($guid in $vmGuids[0..($vmGuids.Count - 2)]) {
-                                        Invoke-HcsDiag -Arguments "kill",$guid | Out-Null
-                                        Write-WatchLog "HCS: killed stale cowork-vm ($guid)"
-                                    }
-                                }
-                            }
-                        } catch { $null = $_ }
+                        $script:LastHcsStateLogTime = [datetime]::UtcNow
+                        # Informational plus a pre-emptive cleanup of the
+                        # Cowork compute systems left behind; no auto-fix.
+                        Stop-StaleCoworkVm
                     }
                 } else {
                     # Reset timer when healthy so next issue logs immediately
                     if ($script:LastHcsStateLogTime -ne [datetime]::MinValue) {
                         $script:LastHcsStateLogTime = [datetime]::MinValue
                     }
-                }
-
-                # Check 10: Guest connection health (cowork-service.log)
-                $guestHealth = Test-GuestConnectionHealth
-                if ($guestHealth) {
-                    $script:GuestFailCount++
-                    Write-WatchLog "CHECK 10 FAIL ($($script:GuestFailCount)/3): $guestHealth"
-                    if ($script:GuestFailCount -ge 3) {
-                        Invoke-AutoFix -Reason "guest-connect-timeout"
-                        $script:GuestFailCount = 0
-                        continue
-                    }
-                } else {
-                    $script:GuestFailCount = 0
                 }
 
                 # ---- Maintenance (non-fix actions) ----
@@ -3501,15 +5017,20 @@ try {
                 if ($timeIssue) {
                     Write-WatchLog "TIME WARNING: $timeIssue"
                 }
-            }
 
-            Set-DynamicMemoryFlag
+                # A repair Fix held back, tried again once the hold has
+                # cleared. Only on a poll where no check fired: one that fires
+                # has gone to Invoke-AutoFix above and ended the poll.
+                Invoke-HeldBackRetry
+            }
         } catch {
-            Write-WatchLog "MONITOR ERROR: $($_.Exception.Message)"
+            # At most once an hour for the same error: one that breaks a poll
+            # most often breaks every poll. Until 6.3.0 it was logged on each.
+            Write-CheckError -Check 'poll' -ErrorRecord $_ -Text 'MONITOR ERROR: {0}'
         } finally {
             # The poll sleep lives in a finally, and that is the whole point.
             #
-            # Seven of the checks above end in "continue", which targets the
+            # Five of the checks above end in "continue", which targets the
             # while loop and therefore used to jump straight past a Start-Sleep
             # that sat after the try. During a real fault, when those branches
             # are exactly the ones firing, the loop span without any delay at
@@ -3526,7 +5047,11 @@ try {
         try {
             $script:Mutex.ReleaseMutex()
             $script:Mutex.Dispose()
-        } catch { $null = $_ }
+        } catch {
+            # Not held, as when it could not be taken: nothing to release,
+            # and the monitor is ending.
+            $null = $_
+        }
     }
     Write-WatchLog "Health monitor stopped"
 }

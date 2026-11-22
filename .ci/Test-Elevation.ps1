@@ -9,6 +9,9 @@
 #   -WhatIf          Prevent-ClaudeIssues did not forward it. Running the
 #                    script unelevated with -WhatIf relaunched it elevated
 #                    without -WhatIf and applied every change for real.
+#                    Since 6.3.0 Prevent refuses -WhatIf instead, because
+#                    almost none of its steps could honour it; the refusal
+#                    has to come before the relaunch, which is checked too.
 #
 #   -Wait -PassThru  Without these the parent returns the instant UAC is
 #                    accepted, always with code 0, so the .bat launcher and
@@ -68,9 +71,14 @@ foreach ($name in $targets) {
 
     # The parameters have to be assembled somewhere above the relaunch. Look
     # for the -WhatIf forward specifically, since that is the one that silently
-    # turns a dry run into a real one.
-    Assert "forwards -WhatIf across elevation" `
-        ($src -match '\$WhatIfPreference[^\r\n]*-WhatIf')
+    # turns a dry run into a real one. A script that cannot preview its changes
+    # may refuse -WhatIf instead, with exit 1, but only before the relaunch: a
+    # refusal after it would run in the elevated child, which never sees it.
+    $forwards = $src -match '\$WhatIfPreference[^\r\n]*-WhatIf'
+    $refusal = [regex]::Match($src, '(?s)if\s*\(\s*\$WhatIfPreference\s*\)\s*\{[^{}]*?exit\s+1\s*\}')
+    $refuses = $refusal.Success -and $refusal.Index -lt $relaunch[0].Index
+    Assert "forwards -WhatIf across elevation, or refuses it before elevating" `
+        ($forwards -or $refuses)
 
     # And the captured exit code has to actually be used.
     Assert "propagates the child exit code" `
@@ -87,7 +95,8 @@ foreach ($name in $targets) {
 
 # ------------------------------------------------------------------
 # Every self-elevating script must also declare SupportsShouldProcess,
-# otherwise $WhatIfPreference is never set and the forward above is dead code.
+# otherwise $WhatIfPreference is never set and the forward or refusal above is
+# dead code.
 # ------------------------------------------------------------------
 Write-Host ""
 Write-Host "--- ShouldProcess declared" -ForegroundColor Cyan

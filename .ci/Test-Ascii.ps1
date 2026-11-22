@@ -12,6 +12,13 @@
     A UTF-8 BOM at the start of a file is reported but does not fail: it is
     deliberate, and Windows PowerShell uses it to pick the right encoding.
 
+    It reads every .ps1 and .bat file in the repo root and in .ci, so a new
+    script, test or launcher is checked without being added to a list. The
+    three main scripts and the ClaudeEnv region are named as well, so that one
+    gone missing fails. Until 6.3.0 only those four were read: a test or a
+    batch file could carry a non-ASCII byte that no gate saw, and cmd.exe reads
+    a .bat in the console's code page too.
+
     Written after a full-width parenthesis reached the source of
     Watch-ClaudeHealth.ps1. It parsed as an ordinary token, so the syntax gate
     was perfectly happy with it.
@@ -29,12 +36,27 @@ if (-not $Root) {
     $Root = Split-Path $here -Parent
 }
 
-$targets = @(
+$required = @(
     'Fix-ClaudeDesktop.ps1',
     'Watch-ClaudeHealth.ps1',
     'Prevent-ClaudeIssues.ps1',
     '.ci\ClaudeEnv.region.ps1'
 )
+
+# The named four first, in that order, then every other script found, by name.
+$targets = [System.Collections.Generic.List[string]]::new()
+foreach ($name in $required) { $targets.Add($name) }
+foreach ($dir in @('', '.ci')) {
+    $full = if ($dir) { Join-Path $Root $dir } else { $Root }
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
+    $files = @(Get-ChildItem -LiteralPath $full -File |
+        Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.bat' } |
+        Sort-Object Name)
+    foreach ($file in $files) {
+        $name = if ($dir) { Join-Path $dir $file.Name } else { $file.Name }
+        if (-not ($targets -contains $name)) { $targets.Add($name) }
+    }
+}
 
 $failed = 0
 foreach ($name in $targets) {

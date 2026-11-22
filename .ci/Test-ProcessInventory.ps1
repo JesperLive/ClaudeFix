@@ -45,15 +45,18 @@ function Assert-Case {
 
 # ---------------------------------------------------------------------
 # Fakes. Each fake process is Id, Path (what MainModule.FileName returns, or
-# $null for a process whose module list cannot be read), and CimPath (what
-# Win32_Process.ExecutablePath returns for it).
+# $null for a process whose module list cannot be read), CimPath (what
+# Win32_Process.ExecutablePath returns for it) and Parent (its
+# Win32_Process.ParentProcessId). $script:CimThrows makes the process query
+# fail, as it does when WMI is broken or the caller lacks the right.
 # ---------------------------------------------------------------------
 $script:FakeProcs    = @()
 $script:FakeProducts = @{}
+$script:CimThrows    = $false
 
 function New-FakeProc {
-    param([int]$Id, [string]$Path, [string]$CimPath)
-    $o = [pscustomobject]@{ Id = $Id; Name = 'claude'; CimPath = $CimPath; FakePath = $Path }
+    param([int]$Id, [string]$Path, [string]$CimPath, [int]$Parent = 0)
+    $o = [pscustomobject]@{ Id = $Id; Name = 'claude'; CimPath = $CimPath; FakePath = $Path; Parent = $Parent }
     if ($Path) {
         $o | Add-Member -MemberType NoteProperty -Name MainModule -Value ([pscustomobject]@{ FileName = $Path })
     } else {
@@ -79,8 +82,9 @@ function Get-Item {
 function Get-CimInstance {
     param([string]$ClassName, [string]$Filter, [string]$ErrorAction)
     $null = $ClassName, $Filter, $ErrorAction
+    if ($script:CimThrows) { throw 'Invalid class' }
     return @($script:FakeProcs | ForEach-Object {
-        [pscustomobject]@{ ProcessId = $_.Id; ExecutablePath = $_.CimPath }
+        [pscustomobject]@{ ProcessId = $_.Id; ExecutablePath = $_.CimPath; ParentProcessId = $_.Parent }
     })
 }
 
@@ -193,6 +197,61 @@ Assert-Case "the app is not the CLI"           (-not (Test-ClaudeCodeCliPath "$i
 Assert-Case "an empty path is not the CLI"     (-not (Test-ClaudeCodeCliPath ''))
 
 # ---------------------------------------------------------------------
+Write-Host ""
+Write-Host "--- Get-ClaudeAppCliProcess: the sessions the app started"
+
+# The CLI copies the app starts are its children; a terminal CLI's parent is a
+# shell or python. Measured 2026-11-21: four app-started CLIs, parent the app's
+# main process, and one terminal CLI under python.exe. A repair ends the
+# first kind and not the second, so only the first holds an automated repair
+# back.
+function Get-AppCliIds {
+    param($Environment)
+    return (@(Get-ClaudeAppCliProcess -Environment $Environment | ForEach-Object { [int]$_.Id } | Sort-Object) -join ',')
+}
+$script:CimThrows = $false
+$script:FakeProcs = @(
+    (New-FakeProc 101 "$install\app\Claude.exe" '' 4000),
+    (New-FakeProc 102 "$install\app\Claude.exe" '' 101),
+    (New-FakeProc 201 $appCli '' 101),
+    (New-FakeProc 203 $appCli '' 102),
+    (New-FakeProc 202 $termCli '' 900),
+    (New-FakeProc 204 $appCli '' 999),
+    (New-FakeProc 205 $termCli '' 101)
+)
+$got = '<threw>'
+try { $got = Get-AppCliIds $msixEnv } catch { $got = "<threw: $($_.Exception.Message)>" }
+Assert-Case "a CLI whose parent is the app's main process counts"       ($got -match '(^|,)201(,|$)') "got $got"
+Assert-Case "a CLI whose parent is another of the app's processes counts" ($got -match '(^|,)203(,|$)') "got $got"
+Assert-Case "a terminal CLI under python does not count"                ($got -notmatch '(^|,)202(,|$)') "got $got"
+Assert-Case "a CLI whose parent has exited does not count"              ($got -notmatch '(^|,)204(,|$)') "got $got"
+Assert-Case "a CLI by product name, started by the app, counts"         ($got -match '(^|,)205(,|$)') "got $got"
+Assert-Case "exactly the app's sessions, nothing else"                  ($got -eq '201,203,205') "got $got"
+
+$script:FakeProcs = @(
+    (New-FakeProc 201 $appCli '' 101),
+    (New-FakeProc 202 $termCli '' 900)
+)
+$got = '<threw>'
+try { $got = Get-AppCliIds $msixEnv } catch { $got = "<threw: $($_.Exception.Message)>" }
+Assert-Case "no app running: no session counts" ($got -eq '') "got $got"
+
+$script:FakeProcs = @((New-FakeProc 101 "$install\app\Claude.exe" '' 4000))
+$script:CimThrows = $true
+$got = '<threw>'
+try { $got = Get-AppCliIds $msixEnv } catch { $got = "<threw: $($_.Exception.Message)>" }
+Assert-Case "no CLI at all: empty, without asking WMI" ($got -eq '') "got $got"
+
+$script:FakeProcs = @(
+    (New-FakeProc 101 "$install\app\Claude.exe" '' 4000),
+    (New-FakeProc 201 $appCli '' 101)
+)
+$threwWith = ''
+try { $null = Get-ClaudeAppCliProcess -Environment $msixEnv } catch { $threwWith = $_.Exception.Message }
+Assert-Case "a failed parent query throws, so a caller can fail closed" ($threwWith -eq 'Invalid class') "threw: $threwWith"
+$script:CimThrows = $false
+
+# ---------------------------------------------------------------------
 # Fix's own functions, lifted out by the parser and run here against the same
 # fakes.
 # ---------------------------------------------------------------------
@@ -274,6 +333,351 @@ Assert-Case "Fix Step 1 stops only the desktop set" `
     ($fixSrc -match '\$claudeProcs\s+= @\(\$claudeInventory \| Where-Object \{ \$_\.IsDesktop \}')
 Assert-Case "Fix Step 4 stops only the desktop set and the service" `
     ($fixSrc -match '\$remaining = @\(@\(\$orphanInventory \| Where-Object \{ \$_\.IsDesktop \}')
+
+# ---------------------------------------------------------------------
+Write-Host ""
+Write-Host "--- Fix -Quiet holds back for the app's sessions"
+
+# Until 6.3.0 the -Quiet gate asked only about CPU, a VM log under 120 s old
+# and recent input. A project thread waiting on a 25-minute command uses no
+# CPU and writes nothing, so an unattended run passed all three and ended the
+# thread. Get-AutomatedFixBlocker asks about the app's sessions first, fails
+# closed when they cannot be listed, then asks the monitor's transcript
+# question. Everything it calls is faked inside the scope that runs it.
+$blockDef = Get-FixFunction 'Get-AutomatedFixBlocker'
+Assert-Case "Get-AutomatedFixBlocker was found in Fix" ($null -ne $blockDef)
+# Since 6.3.0 the question about the app's sessions is its own function, so
+# the check before each kill of the app asks the same one.
+$sessionDef = Get-FixFunction 'Get-AppSessionBlocker'
+if ($blockDef) {
+    $blocked = & {
+        Set-StrictMode -Version Latest
+        $ProcessName      = 'claude'
+        $script:ClaudeEnv = [pscustomobject]@{ ProcessName = 'claude'; LogDir = 'C:\nowhere' }
+        $appCliNow        = @()
+        $appCliThrows     = $false
+        $transcriptRecent = $false
+        $busyProc         = $null
+        $vmLogAge         = $null
+        $transcriptAsked  = New-Object System.Collections.ArrayList
+        function Get-ClaudeAppCliProcess {
+            param($Environment)
+            $null = $Environment
+            if ($appCliThrows) { throw 'Access denied' }
+            return @($appCliNow)
+        }
+        function Test-ClaudeCodeTranscriptRecent {
+            param([int]$Minutes)
+            [void]$transcriptAsked.Add($Minutes)
+            return $transcriptRecent
+        }
+        function Get-ClaudeVmLogAge { param($LogDir) $null = $LogDir; return $vmLogAge }
+        function Start-Sleep { param([int]$Milliseconds, [int]$Seconds) $null = $Milliseconds, $Seconds }
+        function Get-Process {
+            param([string]$Name, [int]$Id, [string]$ErrorAction)
+            $null = $ErrorAction
+            if ($Id) { return [pscustomobject]@{ Id = $Id; SessionId = 0 } }
+            if ($Name -eq 'claude' -and $busyProc) { return @($busyProc) }
+            return @()
+        }
+        if ($sessionDef) { . ([scriptblock]::Create($sessionDef.Extent.Text)) }
+        . ([scriptblock]::Create($blockDef.Extent.Text))
+
+        $r = [ordered]@{}
+        $appCliNow = @([pscustomobject]@{ Id = 201 }, [pscustomobject]@{ Id = 203 })
+        $transcriptRecent = $true
+        $r['cli'] = Get-AutomatedFixBlocker
+        $appCliNow = @()
+        $appCliThrows = $true
+        $r['throws'] = Get-AutomatedFixBlocker
+        $appCliThrows = $false
+        $r['transcript'] = Get-AutomatedFixBlocker
+        $r['minutes'] = (@($transcriptAsked) -join ',')
+        $transcriptRecent = $false
+        $busyProc = [pscustomobject]@{ Id = 77; Ms = 0 }
+        $busyProc | Add-Member -MemberType ScriptProperty -Name TotalProcessorTime -Value { [timespan]::FromMilliseconds($this.Ms) }
+        $busyProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { $this.Ms += 400 }
+        $r['cpu'] = Get-AutomatedFixBlocker
+        $busyProc = $null
+        $vmLogAge = 30.4
+        $r['vmlog'] = Get-AutomatedFixBlocker
+        $vmLogAge = 600
+        $r['clear'] = Get-AutomatedFixBlocker
+        $r
+    }
+    Assert-Case "a running app session blocks, naming its PIDs" `
+        ("$($blocked['cli'])" -match '^2 Claude Code session\(s\) the app started are running \(PID 201, 203\)$') "got: $($blocked['cli'])"
+    Assert-Case "sessions that cannot be listed block (fail closed)" `
+        ("$($blocked['throws'])" -match '^the Claude Code sessions the app started could not be listed \(Access denied\)$') "got: $($blocked['throws'])"
+    Assert-Case "a transcript written in the last 35 minutes blocks" `
+        ("$($blocked['transcript'])" -match 'transcript was written in the last 35 minutes') "got: $($blocked['transcript'])"
+    Assert-Case "the transcript question is asked with 35 minutes" `
+        ($blocked['minutes'] -match '^35(,35)*$') "asked with: $($blocked['minutes'])"
+    Assert-Case "a busy claude process still blocks" `
+        ("$($blocked['cpu'])" -eq 'claude process 77 is using CPU') "got: $($blocked['cpu'])"
+    Assert-Case "a fresh VM log still blocks" `
+        ("$($blocked['vmlog'])" -eq 'a VM log was written 30s ago') "got: $($blocked['vmlog'])"
+    Assert-Case "nothing going on: no blocker" ($null -eq $blocked['clear']) "got: $($blocked['clear'])"
+}
+# Held back, not done: exit $script:BlockedExitCode. Until 6.3.0 it was exit 0,
+# the same as a finished repair. Test-RunOutcomes runs the gate.
+$gateRx = '(?ms)^if \(\$Quiet\) \{\s*\r?\n\s*\$blocker = Get-AutomatedFixBlocker\s*\r?\n\s*if \(\$blocker\) \{\s*\r?\n\s*Log "BLOCKED: \$blocker, skipping automated fix"[^\r\n]*\r?\n\s*Save-Log\s*\r?\n(\s*#[^\r\n]*\r?\n)*\s*exit \$script:BlockedExitCode\s*\r?\n'
+Assert-Case "Fix's -Quiet gate exits through Get-AutomatedFixBlocker, as held back" ($fixSrc -match $gateRx)
+$blockerCalls = [regex]::Matches($fixSrc, '(?m)^\s*\$blocker = Get-AutomatedFixBlocker\s*$').Count
+Assert-Case "and the gate at the start asks it once" ($blockerCalls -eq 1) "found $blockerCalls call(s)"
+
+# ---------------------------------------------------------------------
+Write-Host ""
+Write-Host "--- Fix -Quiet asks again before each kill of the app"
+
+# The gate asks at the start, and a Smart run takes minutes: the app can
+# start a Code session or a project thread in that time. Until 6.3.0 nothing
+# asked again, and the next kill of the app ended it. Assert-NoNewAppSession
+# asks right before Step 1's kill, Step 4's kill of the app's leftover
+# processes and each escalation that stops the app. Before Step 1 nothing
+# that stops the app or the service has run, so a session found there ends
+# the run as held back, exit 3. After it Steps 1 and 2 have run, so a session
+# found ends the run as stopped part-way, exit 4, and the service is started
+# again first when this run stopped it. Until 6.3.0 Step 4 was not asked, and
+# every guard ended the run as held back.
+$fixLines = $fixSrc -split "\r?\n"
+$guardLineRx = '^(if \(\$orphanAppCount -gt 0\) \{ )?Assert-NoNewAppSession -Before "([^"]+)" -ExitCode \$script:(BlockedExitCode|StoppedPartWayExitCode)( \})?$'
+function Get-GuardBefore {
+    # The guard call on the nearest code line above line $At, or $null when
+    # that line is anything else; comment and blank lines in between are
+    # skipped.
+    param([int]$At)
+    for ($k = $At - 1; $k -ge 0 -and $k -ge $At - 8; $k--) {
+        $t = $fixLines[$k].Trim()
+        if ($t -eq '' -or $t.StartsWith('#')) { continue }
+        if ($t -match $guardLineRx) { return [pscustomobject]@{ Before = $Matches[2]; Code = $Matches[3]; Line = $t } }
+        return $null
+    }
+    return $null
+}
+$killSites = @()
+for ($k = 0; $k -lt $fixLines.Count; $k++) {
+    if ($fixLines[$k] -match '^\s*\$null = Stop-ClaudeDesktopApp\s*$') { $killSites += $k }
+    if ($fixLines[$k] -match '^\s*if \(\$PSCmdlet\.ShouldProcess\("\$\(\$claudeProcs\.Count\) Claude process\(es\)", "Stop"\)\) \{\s*$') { $killSites += $k }
+    if ($fixLines[$k] -match '^\s*if \(\$PSCmdlet\.ShouldProcess\("\$\(\$remaining\.Count\) orphan process\(es\)", "Force-kill"\)\) \{\s*$') { $killSites += $k }
+}
+Assert-Case "four kills of the app found (Step 1, Step 4 and the two escalations)" ($killSites.Count -eq 4) "found $($killSites.Count)"
+$guardedBy = @()
+foreach ($k in $killSites) {
+    $g = Get-GuardBefore -At $k
+    Assert-Case "line $($k + 1) asks Assert-NoNewAppSession right before it" ($null -ne $g) $fixLines[$k].Trim()
+    if ($g) {
+        $want = if ($g.Before -eq 'Step 1') { 'BlockedExitCode' } else { 'StoppedPartWayExitCode' }
+        Assert-Case "  and a session found before $($g.Before) ends the run with `$script:$want" ($g.Code -eq $want) $g.Line
+        $guardedBy += $g.Before
+    }
+}
+$guardedSeen = (@($guardedBy | Sort-Object) -join ' | ')
+$guardedWant = (@('Step 1', 'Step 4', 'the escalation to Deep', 'the no-progress escalation') | Sort-Object) -join ' | '
+Assert-Case "the guards stand before Step 1, Step 4 and both escalations" ($guardedSeen -eq $guardedWant) "before: $guardedSeen"
+$guardCalls = [regex]::Matches($fixSrc, '(?m)^\s*(if \(\$orphanAppCount -gt 0\) \{ )?Assert-NoNewAppSession -Before "').Count
+Assert-Case "and nowhere else" ($guardCalls -eq 4) "found $guardCalls call(s)"
+# Step 4 asks only when a process of the app is left over, not for the
+# service alone, which no Claude Code session runs in.
+Assert-Case "Step 4 counts the app's own processes it is about to stop" `
+    ($fixSrc -match '(?m)^\$orphanAppCount\s+= @\(\$orphanInventory \| Where-Object \{ \$_\.IsDesktop \}\)\.Count\s*$')
+
+# Run in a child process, because it ends the run with exit. Everything it
+# calls is faked there; the exit code is the outcome.
+$guardDef   = Get-FixFunction 'Assert-NoNewAppSession'
+$codeLine   = [regex]::Match($fixSrc, '(?m)^\$script:BlockedExitCode = \d+\s*$').Value
+$partLine   = [regex]::Match($fixSrc, '(?m)^\$script:StoppedPartWayExitCode = \d+\s*$').Value
+Assert-Case "Fix sets both codes the guard ends a run with" ($codeLine -ne '' -and $partLine -ne '') "[$($codeLine.Trim())] [$($partLine.Trim())]"
+Assert-Case "Assert-NoNewAppSession and Get-AppSessionBlocker were found in Fix" ($null -ne $guardDef -and $null -ne $sessionDef)
+# The service as Step 2 left it: stopped by this run, unless the case says
+# 'notstopped' (it was not running then), or running again ('svcup'), as at
+# an escalation after Step 7. Start-Service only says what it was handed,
+# and throws for 'startfails'.
+$restartDef = Get-FixFunction 'Start-ServiceStoppedByRun'
+Assert-Case "Start-ServiceStoppedByRun was found in Fix" ($null -ne $restartDef)
+$restartText = if ($restartDef) { $restartDef.Extent.Text } else { '' }
+$svcFakes = @(
+    '$ServiceName = "CoworkVMService"',
+    '$script:ServiceStoppedByRun = ($Case -notmatch ''notstopped'')',
+    'function Get-Service {',
+    '    param([string]$Name, [string]$ErrorAction)',
+    '    $null = $ErrorAction',
+    '    $st = if ($Case -match ''svcup'') { ''Running'' } else { ''Stopped'' }',
+    '    return [pscustomobject]@{ Name = $Name; Status = $st }',
+    '}',
+    'function Start-Service {',
+    '    param([string]$Name, [string]$ErrorAction)',
+    '    $null = $ErrorAction',
+    '    if ($Case -match ''startfails'') { throw "Cannot start service $Name" }',
+    '    [Console]::Out.WriteLine("STARTED $Name")',
+    '}',
+    $restartText
+) -join "`r`n"
+# Every place Fix stops the service notes it, so the guard knows the stop
+# was this run's: Step 2, inside its ShouldProcess, Restart-CoworkService
+# and Stop-CoworkServiceWithTimeout.
+Assert-Case "Fix starts each run with `$script:ServiceStoppedByRun false" `
+    ($fixSrc -match '(?m)^\$script:ServiceStoppedByRun = \$false\s*$')
+$s2Stop = @($fixAst.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.IfStatementAst] -and
+    $n.Clauses[0].Item1.Extent.Text -eq '$PSCmdlet.ShouldProcess($ServiceName, "Stop")' }, $true))
+Assert-Case "Step 2 notes that it stopped the service" `
+    ($s2Stop.Count -eq 1 -and $s2Stop[0].Clauses[0].Item2.Extent.Text -match '(?m)^\s*\$script:ServiceStoppedByRun = \$true\s*$') `
+    "found $($s2Stop.Count) stop block(s)"
+foreach ($fn in 'Restart-CoworkService', 'Stop-CoworkServiceWithTimeout') {
+    $fnDef = Get-FixFunction $fn
+    Assert-Case "and so does $fn" ($null -ne $fnDef -and $fnDef.Extent.Text -match '(?m)^\s*\$script:ServiceStoppedByRun = \$true\s*$')
+}
+$guardFakes = @(
+    $svcFakes,
+    '$script:ClaudeEnv = [pscustomobject]@{ ProcessName = ''claude'' }',
+    'function Log { param([string]$Message, [string]$Colour, [switch]$Indent) $null = $Colour, $Indent; Write-Output "LOG: $Message" }',
+    'function Save-Log { Write-Output ''SAVED'' }',
+    'function Get-ClaudeAppCliProcess {',
+    '    param($Environment)',
+    '    $null = $Environment',
+    '    if ($Case -match ''throws'') { throw ''Access denied'' }',
+    '    if ($Case -match ''session'') { return @([pscustomobject]@{ Id = 301 }) }',
+    '    return @()',
+    '}'
+) -join "`r`n"
+if ($guardDef -and $sessionDef) {
+    $guardScript = Join-Path ([System.IO.Path]::GetTempPath()) ('cf-guard-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+    $guardBody = @(
+        'param([string]$Case, [string]$Before, [string]$Code, [switch]$Quiet)',
+        'Set-StrictMode -Version Latest',
+        $codeLine,
+        $partLine,
+        $guardFakes,
+        $sessionDef.Extent.Text,
+        $guardDef.Extent.Text,
+        '$exitWith = if ($Code -eq ''Part'') { $script:StoppedPartWayExitCode } else { $script:BlockedExitCode }',
+        'Assert-NoNewAppSession -Before $Before -ExitCode $exitWith',
+        "Write-Output 'RETURNED'",
+        'exit 0'
+    ) -join "`r`n"
+    [System.IO.File]::WriteAllText($guardScript, $guardBody, [System.Text.Encoding]::ASCII)
+    try {
+        foreach ($gc in @(
+            @{ Case = 'session'; Before = 'Step 1'; Code = 'Blocked'; Quiet = $true; Exit = 3; Not = 'STOPPED PART-WAY|STARTED CoworkVMService'
+               Rx = 'LOG: BLOCKED: 1 Claude Code session\(s\) the app started are running \(PID 301\); Step 1 would stop the app, so the automated fix ends here' },
+            @{ Case = 'throws';  Before = 'Step 1'; Code = 'Blocked'; Quiet = $true; Exit = 3; Not = 'STOPPED PART-WAY|STARTED CoworkVMService'
+               Rx = 'LOG: BLOCKED: the Claude Code sessions the app started could not be listed \(Access denied\)' },
+            @{ Case = 'session'; Before = 'Step 4'; Code = 'Part'; Quiet = $true; Exit = 4; Not = 'BLOCKED'
+               Rx = 'LOG: STOPPED PART-WAY: 1 Claude Code session\(s\) the app started are running \(PID 301\); Step 4 would stop the app, so the automated fix ends here, after the steps it has run' },
+            @{ Case = 'throws';  Before = 'the escalation to Deep'; Code = 'Part'; Quiet = $true; Exit = 4; Not = 'BLOCKED'
+               Rx = 'LOG: STOPPED PART-WAY: the Claude Code sessions the app started could not be listed \(Access denied\); the escalation to Deep would stop the app' },
+            @{ Case = 'none';    Before = 'Step 4'; Code = 'Part'; Quiet = $true;  Exit = 0; Not = 'BLOCKED|STOPPED|STARTED CoworkVMService'; Rx = 'RETURNED' },
+            @{ Case = 'session'; Before = 'Step 4'; Code = 'Part'; Quiet = $false; Exit = 0; Not = 'BLOCKED|STOPPED|STARTED CoworkVMService'; Rx = 'RETURNED' }
+        )) {
+            $gArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $guardScript, '-Case', $gc.Case, '-Before', $gc.Before, '-Code', $gc.Code)
+            if ($gc.Quiet) { $gArgs += '-Quiet' }
+            $gOut = (& powershell.exe @gArgs 2>&1 | Out-String)
+            $gExit = $LASTEXITCODE
+            $label = "$($gc.Case) before $($gc.Before)$(if ($gc.Quiet) { ', -Quiet' } else { ', manual' })"
+            Assert-Case "$label exits $($gc.Exit)" ($gExit -eq $gc.Exit -and $gOut -match $gc.Rx -and $gOut -notmatch $gc.Not) "exit $gExit; output: $($gOut.Trim())"
+        }
+    } finally {
+        Remove-Item -LiteralPath $guardScript -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Step 4 itself, lifted from its inventory of the app's processes to the end
+# of its kill and run in a child process. Every command it calls is faked
+# there, and the kill is a fake Stop-Process that only says which Id it was
+# handed; ShouldProcess is a stand-in that says it was asked. Step 2 ran
+# before it, so the service is stopped and this run stopped it, unless the
+# case says otherwise. Until 6.3.0 an exit 4 here left it stopped, and
+# Windows does not start a manually stopped service through its trigger.
+$s4First = @($fixAst.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$orphanInventory' }, $true))
+$s4Last  = @($fixAst.FindAll({ param($n)
+    $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$remaining.Count -gt 0' }, $true))
+Assert-Case "Step 4's inventory and its kill were found" ($s4First.Count -eq 1 -and $s4Last.Count -eq 1) "found $($s4First.Count), $($s4Last.Count)"
+if ($s4First.Count -eq 1 -and $s4Last.Count -eq 1 -and $guardDef -and $sessionDef) {
+    $s4Text = $fixAst.Extent.Text.Substring($s4First[0].Extent.StartOffset, $s4Last[0].Extent.EndOffset - $s4First[0].Extent.StartOffset)
+    $s4Swaps = ([regex]::Matches($s4Text, [regex]::Escape('$PSCmdlet.ShouldProcess('))).Count
+    $s4Text = $s4Text.Replace('$PSCmdlet.ShouldProcess(', '$fakeCmdlet.ShouldProcess(')
+    $s4Faked = @('Get-ClaudeProcessInventory', 'Get-Process', 'Log', 'Save-Log', 'Stop-Process', 'Start-Sleep',
+        'Get-ClaudeDesktopProcess', 'Get-ClaudeAppCliProcess', 'Assert-NoNewAppSession', 'Get-AppSessionBlocker',
+        'Where-Object', 'ForEach-Object', 'Start-ServiceStoppedByRun', 'Get-Service', 'Start-Service')
+    $s4Parsed = [System.Management.Automation.Language.Parser]::ParseInput($s4Text, [ref]$null, [ref]$null)
+    $s4Unfaked = @(@($s4Parsed, $guardDef, $sessionDef, $restartDef) | Where-Object { $_ } | ForEach-Object {
+        $_.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) } | ForEach-Object {
+        $name = $_.GetCommandName()
+        if (-not $name) { "<called through $($_.CommandElements[0].Extent.Text)>" } elseif ($s4Faked -notcontains $name) { $name }
+    } | Sort-Object -Unique)
+    Assert-Case "Step 4's ShouldProcess was swapped for the stand-in, and every command it calls is faked" `
+        ($s4Swaps -eq 1 -and $s4Unfaked.Count -eq 0) "swapped $s4Swaps; not faked: $($s4Unfaked -join ', ')"
+    if ($s4Swaps -eq 1 -and $s4Unfaked.Count -eq 0) {
+        $s4Script = Join-Path ([System.IO.Path]::GetTempPath()) ('cf-step4-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.ps1')
+        $s4Body = @(
+            'param([string]$Case, [switch]$Quiet)',
+            'Set-StrictMode -Version Latest',
+            $codeLine,
+            $partLine,
+            $guardFakes,
+            '$ServiceExe = "cowork-svc"',
+            'function Start-Sleep { param([int]$Seconds, [int]$Milliseconds) $null = $Seconds, $Milliseconds }',
+            'function Get-ClaudeProcessInventory {',
+            '    param($Environment)',
+            '    $null = $Environment',
+            '    if ($Case -match ''desktop'') { return @([pscustomobject]@{ IsDesktop = $true; Process = [pscustomobject]@{ Id = 101 } }) }',
+            '    return @()',
+            '}',
+            'function Get-Process {',
+            '    param([string]$Name, [string]$ErrorAction)',
+            '    $null = $ErrorAction',
+            '    if ($Case -match ''service'' -and $Name -eq $ServiceExe) { return @([pscustomobject]@{ Id = 900 }) }',
+            '    return @()',
+            '}',
+            'function Stop-Process { param([switch]$Force, [string]$ErrorAction) $null = $Force, $ErrorAction; foreach ($p in $input) { [Console]::Out.WriteLine("KILLED $($p.Id)") } }',
+            'function Get-ClaudeDesktopProcess { param($Environment) $null = $Environment; return @() }',
+            '$fakeCmdlet = New-Object psobject',
+            '$fakeCmdlet | Add-Member -MemberType ScriptMethod -Name ShouldProcess -Value { param($Target, $Action) [Console]::Out.WriteLine("ASKED $Action"); return $true }',
+            $sessionDef.Extent.Text,
+            $guardDef.Extent.Text,
+            $s4Text,
+            "Write-Output 'STEP 4 DONE'",
+            'exit 0'
+        ) -join "`r`n"
+        [System.IO.File]::WriteAllText($s4Script, $s4Body, [System.Text.Encoding]::ASCII)
+        try {
+            foreach ($sc in @(
+                # Until 6.3.0 this one went straight on to the kill. It
+                # starts the service Step 2 stopped again before it exits.
+                @{ Case = 'desktop-session'; Quiet = $true;  Exit = 4
+                   Has = @('STOPPED PART-WAY: 1 Claude Code session\(s\) the app started are running \(PID 301\); Step 4 would stop the app',
+                           'STARTED CoworkVMService', 'LOG: Started CoworkVMService again, which this run had stopped')
+                   Not = 'ASKED|KILLED|STEP 4 DONE|Could not start' },
+                # The other paths start nothing.
+                @{ Case = 'desktop';         Quiet = $true;  Exit = 0; Has = @('ASKED Force-kill', 'KILLED 101', 'STEP 4 DONE'); Not = 'STOPPED|BLOCKED|STARTED CoworkVMService' },
+                @{ Case = 'service-session'; Quiet = $true;  Exit = 0; Has = @('ASKED Force-kill', 'KILLED 900', 'STEP 4 DONE'); Not = 'STOPPED|BLOCKED|KILLED 101|STARTED CoworkVMService' },
+                @{ Case = 'desktop-session'; Quiet = $false; Exit = 0; Has = @('ASKED Force-kill', 'KILLED 101', 'STEP 4 DONE'); Not = 'STOPPED|BLOCKED|STARTED CoworkVMService' },
+                # Not this run's stop, or running already: nothing to start.
+                @{ Case = 'desktop-session-notstopped'; Quiet = $true; Exit = 4; Has = @('STOPPED PART-WAY: 1 Claude Code session')
+                   Not = 'ASKED|KILLED|STEP 4 DONE|STARTED CoworkVMService|Could not start' },
+                @{ Case = 'desktop-session-svcup'; Quiet = $true; Exit = 4; Has = @('STOPPED PART-WAY: 1 Claude Code session')
+                   Not = 'ASKED|KILLED|STEP 4 DONE|STARTED CoworkVMService|Could not start' },
+                # A start that fails is logged, and the run still ends with 4.
+                @{ Case = 'desktop-session-startfails'; Quiet = $true; Exit = 4
+                   Has = @('STOPPED PART-WAY: 1 Claude Code session', 'LOG: \[!\] Could not start CoworkVMService again \(Cannot start service CoworkVMService\); run Fix when Cowork is needed')
+                   Not = 'ASKED|KILLED|STEP 4 DONE|STARTED CoworkVMService' }
+            )) {
+                $sArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $s4Script, '-Case', $sc.Case)
+                if ($sc.Quiet) { $sArgs += '-Quiet' }
+                $sOut = (& powershell.exe @sArgs 2>&1 | Out-String)
+                $sExit = $LASTEXITCODE
+                $missing = @($sc.Has | Where-Object { $sOut -notmatch $_ })
+                $label = "Step 4, $($sc.Case)$(if ($sc.Quiet) { ', -Quiet' } else { ', manual' })"
+                Assert-Case "$label exits $($sc.Exit)" ($sExit -eq $sc.Exit -and $missing.Count -eq 0 -and $sOut -notmatch $sc.Not) `
+                    "exit $sExit; missing [$($missing -join '; ')]; output: $($sOut.Trim())"
+            }
+        } finally {
+            Remove-Item -LiteralPath $s4Script -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 
 # ---------------------------------------------------------------------
 Write-Host ""
