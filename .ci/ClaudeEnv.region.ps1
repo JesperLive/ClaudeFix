@@ -599,6 +599,80 @@ function Get-ClaudeDesktopProcess {
              Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
 }
 
+function Get-ClaudeAppCliProcess {
+    <#
+    .SYNOPSIS
+        The Claude Code CLI processes the desktop app started, one for each
+        project thread or Code session it runs.
+    .DESCRIPTION
+        Measured 2026-11-21 on app 6.18355: four CLI processes, each a child
+        of the app's main process, and one terminal CLI whose parent was
+        python.exe. A repair stops the app, and the sessions it started stop
+        with it, busy or waiting. A session waiting on a long command uses no
+        CPU and writes nothing, so a check of CPU, logs or transcripts can
+        miss it. Its process is there to be seen.
+
+        A CLI counts when its parent is any desktop process, so which of the
+        app's processes started it does not matter. A terminal CLI is not
+        counted: a repair does not end it.
+
+        Throws when the parent ids cannot be read, so a caller deciding
+        whether a repair may run can fail closed.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+
+    $inventory = @(Get-ClaudeProcessInventory -Environment $Environment)
+    $cli = @($inventory | Where-Object { $_.Kind -eq 'cli' })
+    if ($cli.Count -eq 0) { return @() }
+    $desktop = @{}
+    foreach ($e in $inventory) { if ($e.IsDesktop) { $desktop[[int]$e.Id] = $true } }
+    if ($desktop.Count -eq 0) { return @() }
+    $parentOf = @{}
+    foreach ($w in @(Get-CimInstance Win32_Process -Filter "Name='$($Environment.ProcessName).exe'" -ErrorAction Stop)) {
+        $parentOf[[int]$w.ProcessId] = [int]$w.ParentProcessId
+    }
+    return @($cli | Where-Object { $parentOf.ContainsKey([int]$_.Id) -and $desktop.ContainsKey($parentOf[[int]$_.Id]) })
+}
+
+function Test-ClaudeCodeTranscriptRecent {
+    <#
+    .SYNOPSIS
+        Whether any Claude Code transcript was written in the last $Minutes
+        minutes.
+    .DESCRIPTION
+        <config dir>\projects\<project>\<session>.jsonl, and a subagent's
+        <session>\subagents\**\*.jsonl beside it. The config dir is
+        CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude. The CLI
+        appends on every message and tool result. Measured 2026-11-21: 3,904
+        files, listed in 160 ms.
+
+        The monitor and Fix -Quiet both ask with 35 minutes. A tool call
+        writes nothing here until it returns, and a foreground command may
+        run for 30 minutes: measured 2026-11-21, three Bash calls of 25
+        minutes each in a row in one project thread, nothing written during
+        the first two.
+
+        Ages are taken in UTC. Local time jumps an hour at a daylight-saving
+        change, and until 6.3.0 a transcript written 20 minutes before the
+        spring change read as 80 minutes old, so an unattended repair could
+        start while a session was working.
+    #>
+    param([int]$Minutes = 35)
+
+    $cfgDir = $env:CLAUDE_CONFIG_DIR
+    if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
+    if (-not $cfgDir) { return $false }
+    $projects = Join-Path $cfgDir "projects"
+    if (-not (Test-Path -LiteralPath $projects -PathType Container)) { return $false }
+    $now = [datetime]::UtcNow
+    $recent = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { ($now - $_.LastWriteTimeUtc).TotalMinutes -lt $Minutes } |
+        Select-Object -First 1
+    return [bool]$recent
+}
+
 function Get-ClaudeDataCandidates {
     <#
     .SYNOPSIS
@@ -820,15 +894,16 @@ function Get-ClaudeVmLogCandidates {
                         Name          = $n
                         Path          = $fi.FullName
                         LastWriteTime = $fi.LastWriteTime
+                        LastWriteTimeUtc = $fi.LastWriteTimeUtc
                         AgeHours      = [math]::Round( `
-                            ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
+                            ([datetime]::UtcNow - $fi.LastWriteTimeUtc).TotalHours, 2)
                         Length        = $fi.Length
                     }
                 }
             }
         } catch { $null = $_ }
     }
-    return @($cands | Sort-Object LastWriteTime -Descending)
+    return @($cands | Sort-Object LastWriteTimeUtc -Descending)
 }
 
 function Get-ClaudeVmLogAge {
@@ -843,11 +918,145 @@ function Get-ClaudeVmLogAge {
         the VM (each command again, and a clock line every few hours). A
         freshness test that read only the log that happened to be newest when
         the script started could be reading the quiet one. Never throws.
+        Measured in UTC, so a daylight-saving change does not move it an hour.
     #>
     param([string]$LogDir)
 
     $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
     if ($c.Count -eq 0) { return $null }
-    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
+    return ([datetime]::UtcNow - $c[0].LastWriteTimeUtc).TotalSeconds
+}
+
+function Get-CoworkWorkerProcessIds {
+    <#
+    .SYNOPSIS
+        The process ids of the vmwp.exe workers that run the Cowork VM.
+    .DESCRIPTION
+        Every Hyper-V VM, and every WSL2 or Windows Sandbox utility VM, has a
+        vmwp.exe of its own. A worker's first command-line argument is the
+        GUID of the compute system it runs:
+
+            "C:\Windows\System32\vmwp.exe" ECDA1B8B-...-0A4035733BF3 0x330
+
+        Matching that against the GUIDs Get-CoworkHcsGuids reads out of
+        "hcsdiag list" picks the Cowork VM's worker and nothing else. Until
+        6.3.0 Prevent and the monitor raised the priority of every vmwp.exe
+        on the machine.
+
+        Takes the list text and the worker objects (anything with ProcessId
+        and CommandLine, as Win32_Process gives) rather than querying either,
+        so it can be tested without Hyper-V.
+    #>
+    param([string]$ListOutput, [object[]]$Workers)
+
+    $guids = @(Get-CoworkHcsGuids -ListOutput $ListOutput)
+    if ($guids.Count -eq 0) { return @() }
+    $ids = @()
+    foreach ($w in @($Workers)) {
+        if ($null -eq $w) { continue }
+        $g = Get-VmWorkerGuid -CommandLine ([string]$w.CommandLine)
+        if ($g -and $guids -contains $g) { $ids += [int]$w.ProcessId }
+    }
+    return @($ids)
+}
+
+function Get-VmWorkerGuid {
+    <#
+    .SYNOPSIS
+        The GUID of the compute system a vmwp.exe runs, read from its command
+        line, or $null when the line holds none.
+    .DESCRIPTION
+        The worker takes that GUID as its first argument:
+
+            "C:\Windows\System32\vmwp.exe" ECDA1B8B-...-0A4035733BF3 0x330
+
+        Only the first argument is read. Until 6.3.0 Fix took the first GUID
+        anywhere on the line.
+    #>
+    param([string]$CommandLine)
+
+    if ($CommandLine -match '^\s*(?:"[^"]*"|\S+)\s+\{?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Get-CoworkHcsSurvivors {
+    <#
+    .SYNOPSIS
+        Which of the given Cowork compute systems "hcsdiag list" still shows,
+        or $null when the list could not be read.
+    .DESCRIPTION
+        A kill that returned is no proof the compute system is gone. Until
+        6.3.0 Fix counted every kill it sent as done, and the monitor logged
+        "killed" for each one, whether hcsdiag had removed anything or not.
+
+        $List is a script block that returns the list text when hcsdiag
+        answered, and nothing (or $null) when it did not: a timeout or an
+        exit code other than 0. Each script keeps its own way of running
+        hcsdiag: Fix and the monitor through a job with a timeout, Prevent
+        directly. The list is read up to $Attempts times, $DelaySeconds
+        apart, because a compute system can take a moment to leave it.
+
+        An empty answer is an answer: "hcsdiag list" prints nothing at all
+        when no compute system is left, which is what a kill of the only one
+        leaves. Until 6.3.0 that read as "did not answer", so every kill of a
+        lone Cowork VM was reported as unconfirmed.
+
+        Returns an array, empty when every one is gone. The leading comma
+        keeps an empty array from reaching the caller as $null, which here
+        means "not known": the first read did not answer. A later read that
+        does not answer keeps what the read before it showed, so a kill that
+        read confirmed is not thrown away; the ones returned were still
+        listed when the list was last read.
+    #>
+    param([string[]]$Guids, [scriptblock]$List, [int]$Attempts = 2, [int]$DelaySeconds = 2)
+
+    $left = @($Guids)
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        if ($i -gt 0) { Start-Sleep -Seconds $DelaySeconds }
+        $out = & $List
+        if ($null -eq $out) {
+            if ($i -eq 0) { return $null }
+            break
+        }
+        # Joined with newlines: [string] on an array joins with spaces, and the
+        # parser reads the list one line at a time.
+        $text = @($out) -join "`n"
+        $listed = @(Get-CoworkHcsGuids -ListOutput $text)
+        $left = @($left | Where-Object { $listed -contains $_ })
+        if ($left.Count -eq 0) { break }
+    }
+    return ,$left
+}
+
+function Get-W32tmOffsetSeconds {
+    <#
+    .SYNOPSIS
+        The clock offset in seconds from what "w32tm /stripchart /dataonly"
+        prints, or $null when the text holds none.
+    .DESCRIPTION
+        Each sample line ends in the offset:
+
+            20:22:22, -00.0684055s
+
+        w32tm writes the number in the system locale, so a machine set to
+        Dutch or German prints "-00,0684055s". The pattern every copy of this
+        check used, a dot only, never matched there, and the drift check read
+        "could not measure" on every such machine. Both separators are taken,
+        and the number is parsed with the invariant culture so the result does
+        not depend on the locale either. Error lines ("error: 0x800705B4")
+        carry no offset and are skipped; the last sample wins.
+    #>
+    param([string]$Text)
+
+    if (-not $Text) { return $null }
+    $value = $null
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '([+-]?\d+[.,]\d+)s\s*$') {
+            $value = [double]::Parse(($Matches[1] -replace ',', '.'), [Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return $value
 }
 #endregion ClaudeEnv

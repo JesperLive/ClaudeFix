@@ -103,6 +103,51 @@ foreach ($bat in @('Fix-ClaudeDesktop.bat', 'Prevent-ClaudeIssues.bat', 'Stop-Cl
 }
 
 # ------------------------------------------------------------------
+# 3 and 4 are outcomes of a Fix run, through Fix-ClaudeDesktop.bat and
+# Stop-ClaudeDesktop.bat alike: 3, held back before the app or the service
+# was stopped; 4, stopped part-way because a Claude Code session was found or
+# could not be ruled out. Each has its own lines, no launcher complaint and
+# no pause of the launcher's own, as for 0 and 1. Until 6.3.0 Fix set
+# neither, and the launchers read both as PowerShell failing to run the
+# script. Until 6.3.0 too, 3 said nothing was changed and 4 that a session
+# had started, and neither is always so.
+# ------------------------------------------------------------------
+foreach ($bat in @('Fix-ClaudeDesktop.bat', 'Stop-ClaudeDesktop.bat')) {
+
+    Write-Host ""
+    Write-Host "--- $bat, exits 3 and 4" -ForegroundColor Cyan
+
+    # The pause the launcher prints its prompt for, seen where it must be,
+    # so its absence below means something.
+    $r9 = Invoke-Launcher -BatName $bat -StubExit 9
+    Assert "the harness sees the launcher's pause (exit 9)" ($r9.Output -match 'Press any key')
+
+    foreach ($c in @(
+        @{ Code = 3; Rx = @(
+            '(?m)^\s*Held back before the app or the service was stopped: another repair is running,\s*$',
+            '(?m)^\s*or the PC or Claude is in use, or a Claude Code session could not be ruled out\.\s*$',
+            '(?m)^\s*The lines above say which\.\s*$') },
+        @{ Code = 4; Rx = @(
+            '(?m)^\s*The repair ran part of the way, then stopped before going further: a Claude Code\s*$',
+            '(?m)^\s*session was found, or could not be ruled out\. The lines above say which\.\s*$') }
+    )) {
+        $r = Invoke-Launcher -BatName $bat -StubExit $c.Code
+        $unsaid = @($c.Rx | Where-Object { $r.Output -notmatch $_ })
+        Assert "exit $($c.Code) propagates"                    ($r.ExitCode -eq $c.Code)
+        Assert "exit $($c.Code) says what happened"            ($unsaid.Count -eq 0)
+        Assert "exit $($c.Code) does not say nothing was changed, or that a session started" `
+            ($r.Output -notmatch 'nothing was changed|a Claude Code session started')
+        Assert "exit $($c.Code) prints no launcher complaint"  ($r.Output -notmatch '\[!\]')
+        Assert "exit $($c.Code) does not ask for a screenshot" ($r.Output -notmatch 'screenshot')
+        Assert "exit $($c.Code) does not pause, as 0 and 1 do not" ($r.Output -notmatch 'Press any key')
+    }
+}
+
+# Prevent never sets 3 or 4, so there they are still PowerShell failing.
+$p3 = Invoke-Launcher -BatName 'Prevent-ClaudeIssues.bat' -StubExit 3
+Assert "Prevent-ClaudeIssues.bat: exit 3 is still a complaint" ($p3.ExitCode -eq 3 -and $p3.Output -match '\[!\]')
+
+# ------------------------------------------------------------------
 # Watch-ClaudeHealth is the exception. Exit 1 there means the monitor refused
 # to start, so the launcher SHOULD pause and point at the log folder.
 # ------------------------------------------------------------------

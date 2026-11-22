@@ -74,6 +74,14 @@ jobs:
         shell: powershell
         run: .\.ci\Test-LogTriggers.ps1
 
+      - name: Prevent's steps against fakes
+        shell: powershell
+        run: .\.ci\Test-PreventSteps.ps1
+
+      - name: How Fix runs end, the clock check and UTC ages
+        shell: powershell
+        run: .\.ci\Test-RunOutcomes.ps1
+
       - name: PSScriptAnalyzer
         shell: powershell
         run: |

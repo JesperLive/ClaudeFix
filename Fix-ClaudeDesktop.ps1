@@ -25,6 +25,14 @@
 .PARAMETER SkipLaunch
     Reset the VM service but don't relaunch Claude Desktop afterwards.
 
+.PARAMETER BootPrep
+    Retired in 6.3.0: says that it does nothing and exits 0, before anything
+    else runs, so it writes, deletes, elevates and touches nothing: no log,
+    no cleanup, no vmcompute, no VM. Until 6.3.0 it restarted vmcompute, from
+    a task older versions of Prevent ran at every logon. The switch stays so
+    that task, until Prevent or -Undo removes it, gets a no-op rather than an
+    error.
+
 .PARAMETER Quiet
     Suppress the "press any key" prompt at the end and skip the
     interactive menu. Defaults to Smart mode.
@@ -65,7 +73,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.2.1
+    Version : 6.3.0
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -83,6 +91,23 @@ param(
     [string]$Mode
 )
 
+# -- -BootPrep: retired ----------------------------------------------
+# Until 6.3.0 -BootPrep restarted vmcompute when no Cowork workspace was up,
+# from a task older versions of Prevent ran 45 seconds after every logon. A
+# vmcompute restart is a restart of the service every VM on the machine
+# depends on. The task was retired in 6.3.0, and Prevent and -Undo remove it.
+# Until they run, the task still passes -BootPrep, so the switch is kept and
+# does nothing but say so.
+#
+# First, before anything else: the elevation below would raise a UAC prompt
+# at logon, and what follows it saves the environment, prunes old logs and
+# VHDX backups and writes a log. Until 6.3.0 all of that ran first, for a run
+# that was to do nothing.
+if ($BootPrep) {
+    Write-Host "  [BootPrep] -BootPrep is retired since 6.3.0 and does nothing; vmcompute and the VMs were not touched" -ForegroundColor DarkGray
+    exit 0
+}
+
 # -- Admin elevation (optional) --------------------------------------
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
@@ -95,7 +120,6 @@ if (-not $script:IsAdmin) {
     if ($Quiet)            { $elevateArgs += " -Quiet" }
     if ($WhatIfPreference) { $elevateArgs += " -WhatIf" }
     if ($KeepCache)        { $elevateArgs += " -KeepCache" }
-    if ($BootPrep)         { $elevateArgs += " -BootPrep" }
     if ($Close)            { $elevateArgs += " -Close" }
     if ($PurgeSessions)    { $elevateArgs += " -PurgeSessions" }
     if ($Mode)             { $elevateArgs += " -Mode $Mode" }
@@ -109,7 +133,7 @@ if (-not $script:IsAdmin) {
     try {
         # -PassThru so the child's exit code can be propagated. This used to be
         # a hardcoded "exit 0", so no caller could tell a clean repair from a
-        # hard failure. BootPrep exits 1, which made the inconsistency visible.
+        # hard failure, or either from a run that was held back.
         $elevated = Start-Process PowerShell -ArgumentList $elevateArgs -Verb RunAs -Wait -PassThru
         if ($elevated) { exit $elevated.ExitCode }
         exit 0
@@ -723,6 +747,80 @@ function Get-ClaudeDesktopProcess {
              Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process })
 }
 
+function Get-ClaudeAppCliProcess {
+    <#
+    .SYNOPSIS
+        The Claude Code CLI processes the desktop app started, one for each
+        project thread or Code session it runs.
+    .DESCRIPTION
+        Measured 2026-11-21 on app 6.18355: four CLI processes, each a child
+        of the app's main process, and one terminal CLI whose parent was
+        python.exe. A repair stops the app, and the sessions it started stop
+        with it, busy or waiting. A session waiting on a long command uses no
+        CPU and writes nothing, so a check of CPU, logs or transcripts can
+        miss it. Its process is there to be seen.
+
+        A CLI counts when its parent is any desktop process, so which of the
+        app's processes started it does not matter. A terminal CLI is not
+        counted: a repair does not end it.
+
+        Throws when the parent ids cannot be read, so a caller deciding
+        whether a repair may run can fail closed.
+    .PARAMETER Environment
+        A Get-ClaudeEnvironment result.
+    #>
+    param([Parameter(Mandatory)]$Environment)
+
+    $inventory = @(Get-ClaudeProcessInventory -Environment $Environment)
+    $cli = @($inventory | Where-Object { $_.Kind -eq 'cli' })
+    if ($cli.Count -eq 0) { return @() }
+    $desktop = @{}
+    foreach ($e in $inventory) { if ($e.IsDesktop) { $desktop[[int]$e.Id] = $true } }
+    if ($desktop.Count -eq 0) { return @() }
+    $parentOf = @{}
+    foreach ($w in @(Get-CimInstance Win32_Process -Filter "Name='$($Environment.ProcessName).exe'" -ErrorAction Stop)) {
+        $parentOf[[int]$w.ProcessId] = [int]$w.ParentProcessId
+    }
+    return @($cli | Where-Object { $parentOf.ContainsKey([int]$_.Id) -and $desktop.ContainsKey($parentOf[[int]$_.Id]) })
+}
+
+function Test-ClaudeCodeTranscriptRecent {
+    <#
+    .SYNOPSIS
+        Whether any Claude Code transcript was written in the last $Minutes
+        minutes.
+    .DESCRIPTION
+        <config dir>\projects\<project>\<session>.jsonl, and a subagent's
+        <session>\subagents\**\*.jsonl beside it. The config dir is
+        CLAUDE_CONFIG_DIR when set, else %USERPROFILE%\.claude. The CLI
+        appends on every message and tool result. Measured 2026-11-21: 3,904
+        files, listed in 160 ms.
+
+        The monitor and Fix -Quiet both ask with 35 minutes. A tool call
+        writes nothing here until it returns, and a foreground command may
+        run for 30 minutes: measured 2026-11-21, three Bash calls of 25
+        minutes each in a row in one project thread, nothing written during
+        the first two.
+
+        Ages are taken in UTC. Local time jumps an hour at a daylight-saving
+        change, and until 6.3.0 a transcript written 20 minutes before the
+        spring change read as 80 minutes old, so an unattended repair could
+        start while a session was working.
+    #>
+    param([int]$Minutes = 35)
+
+    $cfgDir = $env:CLAUDE_CONFIG_DIR
+    if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
+    if (-not $cfgDir) { return $false }
+    $projects = Join-Path $cfgDir "projects"
+    if (-not (Test-Path -LiteralPath $projects -PathType Container)) { return $false }
+    $now = [datetime]::UtcNow
+    $recent = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { ($now - $_.LastWriteTimeUtc).TotalMinutes -lt $Minutes } |
+        Select-Object -First 1
+    return [bool]$recent
+}
+
 function Get-ClaudeDataCandidates {
     <#
     .SYNOPSIS
@@ -944,15 +1042,16 @@ function Get-ClaudeVmLogCandidates {
                         Name          = $n
                         Path          = $fi.FullName
                         LastWriteTime = $fi.LastWriteTime
+                        LastWriteTimeUtc = $fi.LastWriteTimeUtc
                         AgeHours      = [math]::Round( `
-                            ((Get-Date) - $fi.LastWriteTime).TotalHours, 2)
+                            ([datetime]::UtcNow - $fi.LastWriteTimeUtc).TotalHours, 2)
                         Length        = $fi.Length
                     }
                 }
             }
         } catch { $null = $_ }
     }
-    return @($cands | Sort-Object LastWriteTime -Descending)
+    return @($cands | Sort-Object LastWriteTimeUtc -Descending)
 }
 
 function Get-ClaudeVmLogAge {
@@ -967,12 +1066,146 @@ function Get-ClaudeVmLogAge {
         the VM (each command again, and a clock line every few hours). A
         freshness test that read only the log that happened to be newest when
         the script started could be reading the quiet one. Never throws.
+        Measured in UTC, so a daylight-saving change does not move it an hour.
     #>
     param([string]$LogDir)
 
     $c = @(Get-ClaudeVmLogCandidates -LogDir $LogDir)
     if ($c.Count -eq 0) { return $null }
-    return ((Get-Date) - $c[0].LastWriteTime).TotalSeconds
+    return ([datetime]::UtcNow - $c[0].LastWriteTimeUtc).TotalSeconds
+}
+
+function Get-CoworkWorkerProcessIds {
+    <#
+    .SYNOPSIS
+        The process ids of the vmwp.exe workers that run the Cowork VM.
+    .DESCRIPTION
+        Every Hyper-V VM, and every WSL2 or Windows Sandbox utility VM, has a
+        vmwp.exe of its own. A worker's first command-line argument is the
+        GUID of the compute system it runs:
+
+            "C:\Windows\System32\vmwp.exe" ECDA1B8B-...-0A4035733BF3 0x330
+
+        Matching that against the GUIDs Get-CoworkHcsGuids reads out of
+        "hcsdiag list" picks the Cowork VM's worker and nothing else. Until
+        6.3.0 Prevent and the monitor raised the priority of every vmwp.exe
+        on the machine.
+
+        Takes the list text and the worker objects (anything with ProcessId
+        and CommandLine, as Win32_Process gives) rather than querying either,
+        so it can be tested without Hyper-V.
+    #>
+    param([string]$ListOutput, [object[]]$Workers)
+
+    $guids = @(Get-CoworkHcsGuids -ListOutput $ListOutput)
+    if ($guids.Count -eq 0) { return @() }
+    $ids = @()
+    foreach ($w in @($Workers)) {
+        if ($null -eq $w) { continue }
+        $g = Get-VmWorkerGuid -CommandLine ([string]$w.CommandLine)
+        if ($g -and $guids -contains $g) { $ids += [int]$w.ProcessId }
+    }
+    return @($ids)
+}
+
+function Get-VmWorkerGuid {
+    <#
+    .SYNOPSIS
+        The GUID of the compute system a vmwp.exe runs, read from its command
+        line, or $null when the line holds none.
+    .DESCRIPTION
+        The worker takes that GUID as its first argument:
+
+            "C:\Windows\System32\vmwp.exe" ECDA1B8B-...-0A4035733BF3 0x330
+
+        Only the first argument is read. Until 6.3.0 Fix took the first GUID
+        anywhere on the line.
+    #>
+    param([string]$CommandLine)
+
+    if ($CommandLine -match '^\s*(?:"[^"]*"|\S+)\s+\{?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\b') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+function Get-CoworkHcsSurvivors {
+    <#
+    .SYNOPSIS
+        Which of the given Cowork compute systems "hcsdiag list" still shows,
+        or $null when the list could not be read.
+    .DESCRIPTION
+        A kill that returned is no proof the compute system is gone. Until
+        6.3.0 Fix counted every kill it sent as done, and the monitor logged
+        "killed" for each one, whether hcsdiag had removed anything or not.
+
+        $List is a script block that returns the list text when hcsdiag
+        answered, and nothing (or $null) when it did not: a timeout or an
+        exit code other than 0. Each script keeps its own way of running
+        hcsdiag: Fix and the monitor through a job with a timeout, Prevent
+        directly. The list is read up to $Attempts times, $DelaySeconds
+        apart, because a compute system can take a moment to leave it.
+
+        An empty answer is an answer: "hcsdiag list" prints nothing at all
+        when no compute system is left, which is what a kill of the only one
+        leaves. Until 6.3.0 that read as "did not answer", so every kill of a
+        lone Cowork VM was reported as unconfirmed.
+
+        Returns an array, empty when every one is gone. The leading comma
+        keeps an empty array from reaching the caller as $null, which here
+        means "not known": the first read did not answer. A later read that
+        does not answer keeps what the read before it showed, so a kill that
+        read confirmed is not thrown away; the ones returned were still
+        listed when the list was last read.
+    #>
+    param([string[]]$Guids, [scriptblock]$List, [int]$Attempts = 2, [int]$DelaySeconds = 2)
+
+    $left = @($Guids)
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        if ($i -gt 0) { Start-Sleep -Seconds $DelaySeconds }
+        $out = & $List
+        if ($null -eq $out) {
+            if ($i -eq 0) { return $null }
+            break
+        }
+        # Joined with newlines: [string] on an array joins with spaces, and the
+        # parser reads the list one line at a time.
+        $text = @($out) -join "`n"
+        $listed = @(Get-CoworkHcsGuids -ListOutput $text)
+        $left = @($left | Where-Object { $listed -contains $_ })
+        if ($left.Count -eq 0) { break }
+    }
+    return ,$left
+}
+
+function Get-W32tmOffsetSeconds {
+    <#
+    .SYNOPSIS
+        The clock offset in seconds from what "w32tm /stripchart /dataonly"
+        prints, or $null when the text holds none.
+    .DESCRIPTION
+        Each sample line ends in the offset:
+
+            20:22:22, -00.0684055s
+
+        w32tm writes the number in the system locale, so a machine set to
+        Dutch or German prints "-00,0684055s". The pattern every copy of this
+        check used, a dot only, never matched there, and the drift check read
+        "could not measure" on every such machine. Both separators are taken,
+        and the number is parsed with the invariant culture so the result does
+        not depend on the locale either. Error lines ("error: 0x800705B4")
+        carry no offset and are skipped; the last sample wins.
+    #>
+    param([string]$Text)
+
+    if (-not $Text) { return $null }
+    $value = $null
+    foreach ($line in ($Text -split "`r?`n")) {
+        if ($line -match '([+-]?\d+[.,]\d+)s\s*$') {
+            $value = [double]::Parse(($Matches[1] -replace ',', '.'), [Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return $value
 }
 #endregion ClaudeEnv
 
@@ -983,7 +1216,7 @@ function Get-ClaudeVmLogAge {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.2.1"
+$ToolkitVersion  = "6.3.0"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName
@@ -1022,6 +1255,80 @@ $script:ServicePrereq     = $null  # set by Test-CoworkServicePrereq
 # without exhausting its retries. Anything scheduling this script can act on it.
 $script:ExitCode = 0
 
+# Exit code of a run that was held back before anything that stops the app or
+# the service had run: another Fix run holds the lock; or, in a -Quiet run,
+# the gate at the start (Get-AutomatedFixBlocker) found Claude or the PC in
+# use (a Claude Code session or a recent transcript, claude using CPU, a recent
+# VM log, or keyboard or mouse input in the last 3 minutes), or the check
+# right before Step 1's kill found a Claude Code session or could not rule one
+# out. Step 0 may already have removed a
+# stale compute system by then. No other path uses it. Until 6.3.0 these
+# exited 0, the same as a finished repair, so the monitor logged a run that
+# did not repair anything as a completed fix, counted it toward "Auto-fix
+# failed 3 times" and dropped what it had detected. The monitor reads this
+# same number as FixHeldBackExitCode: the run is not an attempt, and a repair
+# for a trigger that does not fire again, a log error or an Event Log error,
+# is kept pending and tried again once the hold has cleared, and so is one
+# for such a trigger that fires during the wait the hold leaves. Each run
+# held back in a row doubles the monitor's wait before its next repair, from
+# 2 minutes up to 60, until a run that is not held back, a run by hand that
+# gets as far as the repair, which also ends that wait 5 minutes after it at
+# the latest, or a hold 4 hours or more after the one before.
+# A Fix run by hand ends that pending repair only when it gets as far as the
+# repair: see $script:RepairUnderWayLine.
+$script:BlockedExitCode = 3
+
+# The line a run logs once it is past every check that holds it back with
+# exit 3 and has begun the repair: after the menu, the Diagnostic branch, the
+# "Proceed?" confirmation, the -Quiet gate and the check right before Step
+# 1's kill. The monitor ends a held-back repair it keeps pending only for a
+# Fix log written since its hold that holds this line, so a run that changed
+# nothing, such as a Diagnostic run, a Cancel or a No at "Proceed?", does not
+# end it. Such a log written since the latest of its runs held back with
+# exit 3 also starts its count of runs held back in a row again, and ends
+# the longer wait they left. A -WhatIf
+# run changes nothing and does not log it. It must match
+# $FixRepairLine in Watch-ClaudeHealth.ps1, which a test checks.
+$script:RepairUnderWayLine = 'Repair under way: this run is past every check that holds it back'
+
+# Exit code of a -Quiet run that stopped part-way: Steps 1 and 2 had run, so
+# the app was stopped if it was running and so was the service, and then the
+# check before Step 4's kill of the app's leftover processes, before the
+# no-progress escalation or before the escalation to Deep found a Claude Code
+# session, or could not rule one out. The check starts the service again
+# first when this run stopped it. No other path uses this code. It is not 3,
+# because 3 tells the monitor that the app and the service were left alone,
+# and the monitor then keeps what it detected and, for a trigger that does not
+# fire again, tries the repair again once the hold has cleared.
+# This run did stop them, so the monitor counts it as an attempt at a repair,
+# and, as after any run that was not held back, its wait before the next
+# repair starts again from 2 minutes.
+# The monitor reads this same number as FixStoppedPartWayExitCode.
+$script:StoppedPartWayExitCode = 4
+
+# Set when this run stops CoworkVMService: in Step 2, and in the restarts and
+# recoveries after it. A -Quiet run that then stops part-way starts the
+# service again before it exits, because Windows does not start a manually
+# stopped service through its named-pipe trigger, and Cowork would otherwise
+# stay down until the next repair, a full cooldown of the monitor later.
+$script:ServiceStoppedByRun = $false
+
+# Every Cowork compute system GUID any "hcsdiag list" showed during this run,
+# added by Get-HcsList and never cleared. Step 5 matches vmwp.exe workers
+# against it: a compute system leaves the list when it is killed, and a worker
+# left hanging can then only be matched to it by a GUID seen earlier.
+$script:CoworkGuidsSeen = @{}
+# Set by Close-StaleHcsVms: whether hcsdiag answered its list, how many Cowork
+# compute systems it listed, and how many kills it sent. A return of 0 alone
+# cannot tell "nothing to kill" from "listed, no kill sent" from "kills sent,
+# none confirmed" from "no answer".
+$script:LastHcsListOk    = $false
+$script:LastHcsListed    = 0
+$script:LastHcsKillsSent = 0
+# The last non-zero exit Invoke-HcsDiag logged, so a failure that repeats is
+# not logged again on every pass of Step 9's wait.
+$script:LastHcsDiagNote  = $null
+
 # -- Logging ---------------------------------------------------------
 if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
 $script:SessionTimestamp = "{0:yyyyMMdd_HHmmss}" -f (Get-Date)
@@ -1033,10 +1340,11 @@ $LogFile = Join-Path $LogDir "fix_$($script:SessionTimestamp).log"
 # run ten commands by hand.
 $null = Save-ClaudeEnvironment -Environment $script:ClaudeEnv -Path $EnvArtifact
 
-# Clean up logs older than 30 days
+# Clean up logs older than 30 days. Measured in UTC, like every age in this
+# script: local time jumps an hour when summer time starts or ends.
 try {
     Get-ChildItem $LogDir -Filter "fix_*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-30) } |
+        Where-Object { $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-30) } |
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { $null = $_ }
 
@@ -1049,7 +1357,7 @@ try {
     if (Test-Path $staleBackupDir) {
         Get-ChildItem $staleBackupDir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -like "*.vhdx*" -and
-                           $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+                           $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-7) } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
 } catch { $null = $_ }
@@ -1494,6 +1802,8 @@ function Restart-CoworkService {
     # correctly; the two implementations had drifted apart.
     if ($svc.Status -eq "Running") {
         $stopped = $false
+        # See $script:ServiceStoppedByRun.
+        $script:ServiceStoppedByRun = $true
         if ($script:IsAdmin) {
             try {
                 $svc.Stop()
@@ -1612,6 +1922,8 @@ function Stop-CoworkServiceWithTimeout {
     # does not go on to describe a cascade of recovery work it also would not
     # have performed.
     if (-not $PSCmdlet.ShouldProcess($ServiceName, "Stop")) { return $true }
+    # See $script:ServiceStoppedByRun.
+    $script:ServiceStoppedByRun = $true
 
     $stopped = $false
     $job     = $null
@@ -1709,22 +2021,59 @@ function Start-ClaudeDesktop {
 }
 
 # -- HCS error detection -----------------------------------------------
+function Get-FixWinEvent {
+    <#
+    .SYNOPSIS
+        Get-WinEvent -FilterHashtable with -ErrorAction Stop, where nothing to
+        read is no error: returns the events, or nothing when none matches,
+        the log does not exist or its provider is not installed. Any other
+        error is thrown, for the caller to name.
+    .DESCRIPTION
+        Get-WinEvent says there is nothing to read with an error whose id
+        starts NoMatchingEventsFound, NoMatchingLogsFound or
+        NoMatchingProvidersFound (measured on Windows PowerShell 5.1), the
+        usual answer on a machine without Hyper-V. Until 6.3.0 the reads used
+        SilentlyContinue, which hid every other error with them, so a log
+        that could not be read looked like one with nothing in it. The same
+        as Get-MatchingWinEvent in Watch-ClaudeHealth.ps1.
+
+        Each StartTime given here is the UTC time as round-trip text, ending
+        in Z: given a [datetime], Get-WinEvent reads it as local time whatever
+        its Kind, and a local time is wrong in the hour the clocks go back,
+        which happens twice. Measured on Windows PowerShell 5.1 on this
+        machine's log, in summer time and across that hour: the text was
+        exact in both. Until 6.3.0 it was the local time.
+    #>
+    param([hashtable]$Filter, [int]$MaxEvents = 0)
+    try {
+        if ($MaxEvents -gt 0) { return @(Get-WinEvent -FilterHashtable $Filter -MaxEvents $MaxEvents -ErrorAction Stop) }
+        return @(Get-WinEvent -FilterHashtable $Filter -ErrorAction Stop)
+    } catch {
+        if ([string]$_.FullyQualifiedErrorId -match '^NoMatching(Events|Logs|Providers)Found(,|$)') { return }
+        throw
+    }
+}
+
 function Test-RecentHcsErrors {
     <#
     .SYNOPSIS
         Checks for recent HCS errors. Now checks Information-level events too (v4.8.0).
         Returns: $null (clean), "shutdown_stale" (0xC037010D -- property query bug),
         "construct_failure" (0x800707DE), "guest_connect_failure" (isGuestConnected timeout),
-        or "hcs_error" (other HCS issues).
+        or "hcs_error" (other HCS issues). A log that cannot be read, an
+        Event Log, a Claude log or the Claude log folder, is said, naming the
+        error, and passed over: until 6.3.0 it was not said, and a log that
+        could not be read looked like one with no HCS error in it.
     #>
     # Check 1: HCS Compute event log -- check ALL levels including Information
     try {
         # Check for 0xC037010D (shutdown failures) -- these are Information-level
         $hcsInfoFilter = @{
             LogName   = "Microsoft-Windows-Hyper-V-Compute-Operational"
-            StartTime = (Get-Date).AddMinutes(-5)
+            # The UTC time as round-trip text: see Get-FixWinEvent.
+            StartTime = [datetime]::UtcNow.AddMinutes(-5).ToString('o')
         }
-        $hcsInfoEvents = @(Get-WinEvent -FilterHashtable $hcsInfoFilter -MaxEvents 50 -ErrorAction SilentlyContinue)
+        $hcsInfoEvents = @(Get-FixWinEvent -Filter $hcsInfoFilter -MaxEvents 50)
 
         $shutdownFailures = 0
         $constructFailures = 0
@@ -1755,9 +2104,10 @@ function Test-RecentHcsErrors {
         $hcsCritFilter = @{
             LogName   = "Microsoft-Windows-Hyper-V-Compute-Admin"
             Level     = @(1, 2)
-            StartTime = (Get-Date).AddMinutes(-5)
+            # The UTC time as round-trip text: see Get-FixWinEvent.
+            StartTime = [datetime]::UtcNow.AddMinutes(-5).ToString('o')
         }
-        $hcsCritEvents = @(Get-WinEvent -FilterHashtable $hcsCritFilter -MaxEvents 10 -ErrorAction SilentlyContinue)
+        $hcsCritEvents = @(Get-FixWinEvent -Filter $hcsCritFilter -MaxEvents 10)
         if ($hcsCritEvents) {
             $hasRealError = $false
             foreach ($evt in $hcsCritEvents) {
@@ -1771,7 +2121,9 @@ function Test-RecentHcsErrors {
             }
             if ($hasRealError) { return "hcs_error" }
         }
-    } catch { $null = $_ }
+    } catch {
+        Log "  HCS: the Hyper-V Compute event logs could not be read ($($_.Exception.Message)), so recent HCS errors are not known" -Colour DarkYellow -Indent
+    }
 
     # Check 2: Claude log files (keep existing logic)
     $hcsPatterns = @("HCS operation failed", "failed to create compute system",
@@ -1783,23 +2135,26 @@ function Test-RecentHcsErrors {
     if ($script:ClaudeEnv.LogDir) { $claudeLogDirs += $script:ClaudeEnv.LogDir }
     $recentLogs = @()
     foreach ($dir in $claudeLogDirs) {
-        if (Test-Path $dir) {
-            $recentLogs += @(Get-ChildItem $dir -Filter "*.log" -ErrorAction SilentlyContinue |
-                Where-Object { ((Get-Date) - $_.LastWriteTime).TotalMinutes -lt 5 })
+        if (Test-Path -LiteralPath $dir) {
+            try {
+                $recentLogs += @(Get-ChildItem -LiteralPath $dir -Filter "*.log" -ErrorAction Stop |
+                    Where-Object { ([datetime]::UtcNow - $_.LastWriteTimeUtc).TotalMinutes -lt 5 })
+            } catch {
+                Log "  HCS: the Claude log folder $dir could not be listed ($($_.Exception.Message)), so HCS errors in its logs are not known" -Colour DarkYellow -Indent
+            }
         }
     }
-    if ($recentLogs.Count -gt 0) {
+    foreach ($logFile in $recentLogs) {
         try {
-            foreach ($logFile in $recentLogs) {
-                try {
-                    $content = Get-Content $logFile.FullName -Tail 50 -ErrorAction SilentlyContinue
-                    $text = $content -join "`n"
-                    foreach ($pattern in $hcsPatterns) {
-                        if ($text -match [regex]::Escape($pattern)) { return "hcs_error" }
-                    }
-                } catch { $null = $_ }
-            }
-        } catch { $null = $_ }
+            $content = Get-Content -LiteralPath $logFile.FullName -Tail 50 -ErrorAction Stop
+        } catch {
+            Log "  HCS: the Claude log $($logFile.Name) could not be read ($($_.Exception.Message)), so HCS errors in it are not known" -Colour DarkYellow -Indent
+            continue
+        }
+        $text = $content -join "`n"
+        foreach ($pattern in $hcsPatterns) {
+            if ($text -match [regex]::Escape($pattern)) { return "hcs_error" }
+        }
     }
 
     # Check 3: cowork-service.log for guest connection failures
@@ -1864,6 +2219,11 @@ function Test-CoworkServiceLog {
     if (-not $lines -or $lines.Count -eq 0) { return $null }
 
     # d) Filter to lines within the last $WindowSeconds
+    #
+    # Local time, on purpose: the stamps below are parsed from log text the
+    # service writes in local time with no offset, so local now is the only
+    # time they can be compared with. For the hour around a change of the
+    # clock a line can read up to an hour newer or older than it is.
     $now = Get-Date
     $recentLines = @()
     foreach ($line in $lines) {
@@ -1987,29 +2347,79 @@ function Wait-ForServiceProcessExit {
 function Invoke-HcsDiag {
     <#
     .SYNOPSIS
-        Runs hcsdiag.exe with a timeout. Returns output string or $null on timeout/error.
+        Runs hcsdiag.exe with a timeout. Returns its output when it exited 0,
+        '' when it exited 0 and printed nothing, and $null when it exited with
+        any other code, timed out or is not installed.
+    .DESCRIPTION
+        Until 6.3.0 the exit code was thrown away. An error hcsdiag printed
+        came back as if it were the list, so the check after a kill read the
+        error, found no compute system in it and counted the kill as done.
+        And "hcsdiag list" prints nothing at all when no compute system is
+        left, which callers that tested the text for truth read as no answer.
+        $null is now the only "did not answer". The exit code is read inside
+        the job, where hcsdiag runs.
+
+        A non-zero exit is logged once, and again only when what hcsdiag says
+        changes or it has answered in between, as the monitor's copy does.
+        Step 9's wait asks for the list on every pass, so a host where it
+        keeps failing would otherwise get the same line every few seconds.
+
+        -HcsdiagPath is there for the tests, which point it at a stand-in.
     #>
     param(
         [string[]]$Arguments,
-        [int]$TimeoutSeconds = 15
+        [int]$TimeoutSeconds = 15,
+        [string]$HcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
     )
-    $hcsdiagPath = "$env:SystemRoot\System32\hcsdiag.exe"
-    if (-not (Test-Path $hcsdiagPath)) { return $null }
+    if (-not (Test-Path -LiteralPath $HcsdiagPath)) { return $null }
     $job = Start-Job -ScriptBlock {
         param($p, $a)
-        & $p @a 2>&1 | Out-String
-    } -ArgumentList $hcsdiagPath, $Arguments
+        $text = & $p @a 2>&1 | Out-String
+        [pscustomobject]@{ Text = $text; ExitCode = $LASTEXITCODE }
+    } -ArgumentList $HcsdiagPath, $Arguments
     $completed = Wait-Job $job -Timeout $TimeoutSeconds
-    if ($completed) {
-        $result = Receive-Job $job
-        Remove-Job $job -Force
-        return $result
-    } else {
+    if (-not $completed) {
         Stop-Job $job -ErrorAction SilentlyContinue
         Remove-Job $job -Force -ErrorAction SilentlyContinue
         Log "hcsdiag timed out after ${TimeoutSeconds}s (args: $($Arguments -join ' '))" -Colour DarkYellow -Indent
         return $null
     }
+    $result = @(Receive-Job $job -ErrorAction SilentlyContinue) |
+        Where-Object { $null -ne $_ -and $_.PSObject.Properties['ExitCode'] } | Select-Object -Last 1
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    if ($null -eq $result) { return $null }
+    if ($result.ExitCode -ne 0) {
+        $firstLine = @(([string]$result.Text) -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
+        $said = if ($firstLine) { ": $($firstLine.Trim())" } else { '' }
+        # The verb only, so a kill of each GUID in turn is one note, not one each.
+        $note = "hcsdiag $(@($Arguments)[0]) exited $($result.ExitCode)$said"
+        if ($note -ne $script:LastHcsDiagNote) {
+            Log $note -Colour DarkGray -Indent
+            $script:LastHcsDiagNote = $note
+        }
+        return $null
+    }
+    $script:LastHcsDiagNote = $null
+    return [string]$result.Text
+}
+
+function Get-HcsList {
+    <#
+    .SYNOPSIS
+        "hcsdiag list" through Invoke-HcsDiag: the text, '' for an empty list,
+        or $null when hcsdiag did not answer. Every Cowork GUID it shows is
+        added to $script:CoworkGuidsSeen.
+    .DESCRIPTION
+        Every list this script reads goes through here, so step 5 can match a
+        hung worker against any Cowork compute system seen during the run.
+        Until 6.3.0 it matched against the one list the last cleanup had read,
+        which step 5 cleared just before, and which each cleanup overwrote.
+    #>
+    $text = Invoke-HcsDiag -Arguments "list"
+    if ($null -ne $text) {
+        foreach ($g in @(Get-CoworkHcsGuids -ListOutput ([string]$text))) { $script:CoworkGuidsSeen[$g] = $true }
+    }
+    return $text
 }
 
 function Close-StaleHcsVms {
@@ -2038,23 +2448,370 @@ function Close-StaleHcsVms {
     # hcsdiag could not be reached at all, and callers were printing "none found
     # via hcsdiag" for both. Step 0 already told the truth here; step 5 did not.
     $script:LastHcsListOk = $false
+    # And what it listed and whether kills went out, for the callers that say
+    # what was found.
+    $script:LastHcsListed    = 0
+    $script:LastHcsKillsSent = 0
     try {
-        $hcsList = Invoke-HcsDiag -Arguments "list"
-        if (-not $hcsList) { return 0 }
+        # Get-HcsList also records what the list shows, for step 5's worker
+        # check: a compute system leaves the list when it is killed.
+        $hcsList = Get-HcsList
+        # $null is "did not answer". An empty list is an answer, with nothing
+        # in it to kill. Until 6.3.0 the test was "-not $hcsList", and '' is
+        # false, so a host with no compute system left read as no answer.
+        if ($null -eq $hcsList) { return 0 }
         $script:LastHcsListOk = $true
-        $entries = Get-CoworkHcsGuids -ListOutput ([string]$hcsList)
+        # @(): with exactly one stale VM the parser returns a single string,
+        # and .Count on a string throws under StrictMode in Windows PowerShell
+        # 5.1. Until 6.3.0 the catch below swallowed that, so the one case
+        # this function exists for returned 0, which callers print as "none
+        # found".
+        $entries = @(Get-CoworkHcsGuids -ListOutput ([string]$hcsList))
+        $script:LastHcsListed = $entries.Count
         if ($entries.Count -eq 0) { return 0 }
 
+        $sent = @()
         foreach ($guid in $entries) {
             try {
                 if ($PSCmdlet.ShouldProcess($guid, "hcsdiag $Action")) {
-                    Invoke-HcsDiag -Arguments $Action,$guid | Out-Null
-                    $killed++
+                    # What the kill returns is not read: the list afterwards
+                    # says whether it worked.
+                    $null = Invoke-HcsDiag -Arguments $Action,$guid
+                    $sent += $guid
                 }
             } catch { $null = $_ }
         }
+        $script:LastHcsKillsSent = $sent.Count
+        if ($sent.Count -eq 0) { return 0 }
+
+        # Counted from the list afterwards, not from the calls made. Until
+        # 6.3.0 every kill sent was counted, and the callers printed "Killed N"
+        # whether hcsdiag had removed anything or not.
+        $left = Get-CoworkHcsSurvivors -Guids $sent -List { Get-HcsList }
+        if ($null -eq $left) {
+            Log "hcsdiag did not answer after the kill, so whether $($sent.Count) compute system(s) are gone is not known" -Colour DarkYellow -Indent
+            return 0
+        }
+        foreach ($g in $left) {
+            # Listed when last read, which is not proof the kill failed for
+            # good: a compute system can take longer to leave the list than
+            # the check waits. Until 6.3.0 this said the kill did not remove it.
+            Log "[!] compute system $g was still listed after the kill" -Colour DarkYellow -Indent
+        }
+        $killed = $sent.Count - @($left).Count
     } catch { $null = $_ }
     return $killed
+}
+
+function Test-WorkerExited {
+    <#
+    .SYNOPSIS
+        Whether a held worker process has exited: its handle says so, or no
+        process with its id and start time is running any more.
+    .DESCRIPTION
+        HasExited answers through the handle the Process object holds. Where
+        no handle could be held it opens the process by id, which after the
+        worker exits can name a new process, so the start time is compared
+        too. When the start time cannot be read the answer is "not exited",
+        so a worker is never reported gone on a guess.
+    #>
+    param($Held, [int]$ProcessId, [datetime]$StartTime)
+    try { if ($Held.HasExited) { return $true } } catch { $null = $_ }
+    $now = $null
+    try { $now = Get-Process -Id $ProcessId -ErrorAction Stop } catch { return $true }
+    try { return ($now.StartTime -ne $StartTime) } catch { return $false }
+}
+
+function Stop-HungCoworkWorker {
+    <#
+    .SYNOPSIS
+        Stops the worker process (vmwp.exe) of any Cowork compute system seen
+        during this run that is still running. Returns how many it stopped
+        (Stopped) and how many it found but could not confirm gone (Left).
+    .DESCRIPTION
+        Step 5's Method 2. Only the worker of a Cowork compute system: until
+        6.3.0 this killed every vmwp.exe on the machine, so a Hyper-V VM, WSL2
+        or Windows Sandbox running beside Claude went down with it. A worker
+        is the Cowork VM's when the GUID its command line starts with is in
+        $script:CoworkGuidsSeen, every Cowork GUID any hcsdiag list showed in
+        this run. Until 6.3.0 it was matched against the one list the last
+        cleanup read, which step 5 cleared first, so a compute system killed
+        earlier in the run, whose worker hung on, was never matched.
+
+        Each worker is held as a Process object before anything is sent to
+        it, and only when its start time is the one the process query read,
+        so a PID Windows has since given to another process is left alone.
+        The object keeps a handle open where Windows allows one, and while it
+        does the PID cannot be reused. After hcsdiag's kill it waits on that
+        object, up to five seconds, for the worker to go. The force-kill goes
+        through that object too, and the worker counts as stopped only once
+        it has exited. Until 6.3.0 the
+        fallback killed by bare PID two seconds later and counted the worker
+        stopped as soon as Stop-Process returned, without looking.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+
+    $stopped = 0
+    $left    = 0
+    $vmwpProcs = @(Get-CimInstance Win32_Process -Filter "Name='vmwp.exe'" -ErrorAction SilentlyContinue)
+    $coworkWorkers = @($vmwpProcs | Where-Object {
+        $wg = Get-VmWorkerGuid -CommandLine ([string]$_.CommandLine)
+        $wg -and $script:CoworkGuidsSeen.ContainsKey($wg)
+    })
+    if ($vmwpProcs.Count -eq 0) {
+        Log "No VM worker processes running" -Colour DarkGray -Indent
+    } elseif ($script:CoworkGuidsSeen.Count -eq 0) {
+        Log "$($vmwpProcs.Count) VM worker process(es) running, none known to be the Cowork VM's, so none were touched" -Colour DarkGray -Indent
+    } elseif ($coworkWorkers.Count -eq 0) {
+        Log "No hung Cowork VM worker" -Colour DarkGray -Indent
+    }
+    foreach ($vmwp in $coworkWorkers) {
+        $vmwpPid  = [int]$vmwp.ProcessId
+        $vmwpGuid = Get-VmWorkerGuid -CommandLine ([string]$vmwp.CommandLine)
+        if (-not $PSCmdlet.ShouldProcess("vmwp.exe PID $vmwpPid (GUID $vmwpGuid)", "Kill")) { continue }
+        $held = $null
+        try {
+            try { $held = Get-Process -Id $vmwpPid -ErrorAction Stop } catch { $held = $null }
+            if (-not $held) {
+                Log "The Cowork VM's worker (vmwp.exe PID $vmwpPid) had exited before it was stopped" -Colour DarkGray -Indent
+                continue
+            }
+            $heldStart = $null
+            try { $heldStart = $held.StartTime } catch { $heldStart = $null }
+            if ($null -eq $heldStart -or $null -eq $vmwp.CreationDate) {
+                Log "vmwp.exe PID $vmwpPid could not be confirmed as the Cowork VM's worker, so it was left alone" -Colour DarkYellow -Indent
+                $left++
+                continue
+            }
+            if ([math]::Abs(($heldStart - [datetime]$vmwp.CreationDate).TotalSeconds) -ge 1) {
+                Log "The Cowork VM's worker (PID $vmwpPid) had exited, and the PID now belongs to another process, which was left alone" -Colour DarkGray -Indent
+                continue
+            }
+            # Hold a handle, so the PID cannot be reused while this runs.
+            # Best effort: Test-WorkerExited also compares the start time.
+            try { $null = $held.Handle } catch { $null = $_ }
+            if ($script:IsAdmin) {
+                # Cleaner than killing the worker. What hcsdiag returns is not
+                # read: the worker gone is the proof.
+                $null = Invoke-HcsDiag -Arguments "kill",$vmwpGuid
+                # Wait on the held object for the worker to go, up to five
+                # seconds, and only then fall back to the force-kill below.
+                # Until 6.3.0 this slept a fixed two seconds, so a worker that
+                # took longer to leave after a kill that worked was force-killed
+                # anyway, with the VHDX risk that brings. Where the object has
+                # no handle to wait on, the two seconds are kept.
+                $waited = $false
+                try { $null = $held.WaitForExit(5000); $waited = $true } catch { $null = $_ }
+                if (-not $waited) { Start-Sleep -Seconds 2 }
+                if (Test-WorkerExited -Held $held -ProcessId $vmwpPid -StartTime $heldStart) {
+                    Log "Stopped the Cowork VM's worker (vmwp.exe PID $vmwpPid) through hcsdiag" -Colour Green -Indent
+                    $stopped++
+                    continue
+                }
+            }
+            # Fallback: kill it through the object held above, never by a bare
+            # PID, and give it five seconds to go.
+            try { $held.Kill() } catch { $null = $_ }
+            try { $null = $held.WaitForExit(5000) } catch { $null = $_ }
+            if (Test-WorkerExited -Held $held -ProcessId $vmwpPid -StartTime $heldStart) {
+                Log "WARNING: Force-killed vmwp.exe (PID $vmwpPid, GUID $vmwpGuid); VHDX corruption risk" -Colour DarkYellow -Indent
+                $stopped++
+            } else {
+                Log "[!] vmwp.exe (PID $vmwpPid) is unkillable, host restart may be needed" -Colour Red -Indent
+                $left++
+            }
+        } finally {
+            if ($held) { try { $held.Dispose() } catch { $null = $_ } }
+        }
+    }
+    return [pscustomobject]@{ Stopped = $stopped; Left = $left }
+}
+
+function Get-AppSessionBlocker {
+    <#
+    .SYNOPSIS
+        Why the app's own Claude Code sessions hold an automated repair back,
+        or $null when the app runs none.
+    .DESCRIPTION
+        A repair stops the app, and every Claude Code session the app started
+        stops with it. Fails closed: when the sessions cannot be listed, that
+        is the reason given. Get-AutomatedFixBlocker asks this first, and
+        Assert-NoNewAppSession asks it again before each kill of the app.
+    #>
+    try {
+        $appCli = @(Get-ClaudeAppCliProcess -Environment $script:ClaudeEnv)
+        if ($appCli.Count -gt 0) {
+            return "$($appCli.Count) Claude Code session(s) the app started are running (PID $(@($appCli | ForEach-Object { $_.Id }) -join ', '))"
+        }
+    } catch {
+        return "the Claude Code sessions the app started could not be listed ($($_.Exception.Message))"
+    }
+    return $null
+}
+
+function Start-ServiceStoppedByRun {
+    <#
+    .SYNOPSIS
+        Starts CoworkVMService again when this run stopped it and it is not
+        running. Best effort: it logs what happened and does not throw.
+    .DESCRIPTION
+        Assert-NoNewAppSession calls this before a -Quiet run ends part-way,
+        after Step 2 stopped the service and before Step 7 would start it
+        again, or after a recovery in Step 9 stopped it and could not start
+        it. Windows does not start a manually stopped service through its
+        named-pipe trigger, so without this Cowork stayed down for as long as
+        the Claude Code session the run stopped for went on, and the monitor
+        waits a full cooldown before it tries again. Nothing is started when
+        this run did not stop the service, or when it is running.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if (-not $script:ServiceStoppedByRun) { return }
+    try {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -eq "Running") { return }
+        if (-not $PSCmdlet.ShouldProcess($ServiceName, "Start again")) { return }
+        Start-Service -Name $ServiceName -ErrorAction Stop
+        Log "Started $ServiceName again, which this run had stopped, so Cowork is not left down" -Colour Green -Indent
+    } catch {
+        Log "[!] Could not start $ServiceName again ($($_.Exception.Message)); run Fix when Cowork is needed" -Colour DarkYellow -Indent
+    }
+}
+
+function Assert-NoNewAppSession {
+    <#
+    .SYNOPSIS
+        In a -Quiet run, ends the run when the app runs a Claude Code session,
+        or when that cannot be ruled out, right before a step that stops the
+        app. -ExitCode is the code it ends with: $script:BlockedExitCode
+        before Step 1, when nothing that stops the app or the service has run
+        yet, and $script:StoppedPartWayExitCode after it, when Steps 1 and 2
+        have run. On that second path it first starts the service again when
+        this run stopped it.
+    .DESCRIPTION
+        The -Quiet gate asks once, at the start. A Smart run takes minutes,
+        and the app can start a project thread or a Code session in that
+        time, which the next kill of the app would end. Until 6.3.0 the start
+        was the only time it was asked. This asks again before Step 1's kill,
+        before Step 4's kill of the app's leftover processes and before each
+        escalation that stops the app, and fails closed the same way. Manual
+        runs are not asked: the user wants the fix.
+
+        exit here ends the script, not only this function, and the finally at
+        the end of the script still releases the lock.
+    #>
+    param(
+        [string]$Before,
+        [Parameter(Mandatory)][int]$ExitCode
+    )
+    if (-not $Quiet) { return }
+    $why = Get-AppSessionBlocker
+    if ($why) {
+        if ($ExitCode -eq $script:BlockedExitCode) {
+            Log "BLOCKED: $why; $Before would stop the app, so the automated fix ends here" -Colour Yellow
+        } else {
+            Log "STOPPED PART-WAY: $why; $Before would stop the app, so the automated fix ends here, after the steps it has run" -Colour Yellow
+            # Nothing after this exit would start the service again.
+            Start-ServiceStoppedByRun
+        }
+        Save-Log
+        exit $ExitCode
+    }
+}
+
+function Get-AutomatedFixBlocker {
+    <#
+    .SYNOPSIS
+        Why an automated (-Quiet) repair must not run now, or $null when
+        nothing holds it back.
+    .DESCRIPTION
+        A repair stops the app, and every Claude Code session the app started
+        stops with it. Manual runs (no -Quiet) are not asked: the user wants
+        the fix. The checks:
+
+        1. A Claude Code CLI the app started is running: a project thread or
+           Code session. Added in 6.3.0, and it fails closed: when the
+           sessions cannot be listed, the repair waits.
+        2. A Claude Code transcript written in the last 35 minutes, the same
+           question the monitor asks before its own repair. Added in 6.3.0.
+        3. A claude process using CPU: over 100 ms in 500 ms.
+        4. A VM log written in the last 120 seconds.
+        5. Keyboard or mouse input in the last 3 minutes.
+
+        Until 6.3.0 only checks 3 to 5 ran. A project thread waiting on a
+        25-minute command uses almost no CPU and writes nothing, so an
+        unattended -Quiet run passed all three and ended it.
+    #>
+    $appSession = Get-AppSessionBlocker
+    if ($appSession) { return $appSession }
+
+    if (Test-ClaudeCodeTranscriptRecent -Minutes 35) {
+        return "a Claude Code transcript was written in the last 35 minutes"
+    }
+
+    # Check 3: any claude process burning CPU. The Claude Code CLI counts as
+    # well: a busy terminal session is a reason to wait too.
+    foreach ($cp in @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)) {
+        try {
+            $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds
+            Start-Sleep -Milliseconds 500
+            $cp.Refresh()
+            $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
+            if (($cpu2 - $cpu1) -gt 100) { return "claude process $($cp.Id) is using CPU" }
+        } catch { $null = $_ }
+    }
+
+    # Check 4: VM log active within 120s (Code may be thinking)
+    #
+    # Every VM log in the app's log folder, read now (Get-ClaudeVmLogAge). The
+    # list before discovery led with C:\ProgramData\Claude\Logs\coworkd.log, on
+    # a hardcoded drive letter, in a tree that does not exist.
+    $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeEnv.LogDir
+    if ($null -ne $ageSec -and $ageSec -lt 120) { return "a VM log was written $([int]$ageSec)s ago" }
+
+    # Check 5: user input within 3 minutes (interactive sessions only)
+    try {
+        $sessionId = (Get-Process -Id $PID -ErrorAction Stop).SessionId
+        if ($sessionId -gt 0) {
+            Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FixActivityCheck {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+}
+'@
+            $lastInput = New-Object FixActivityCheck+LASTINPUTINFO
+            $lastInput.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($lastInput)
+            if ([FixActivityCheck]::GetLastInputInfo([ref]$lastInput)) {
+                # TickCount is a SIGNED 32-bit value that goes negative once
+                # uptime passes 24.9 days, while dwTime is unsigned. Doing
+                # the subtraction directly then produces a hugely negative
+                # idle time, which reads as "user is active", so every
+                # -Quiet run on a long-uptime machine exited having done
+                # nothing. TickCount64 would avoid this but does not exist
+                # on Windows PowerShell 5.1, which is the engine the
+                # elevation path always lands in. Doing the arithmetic in
+                # unsigned 32-bit space makes the wrap cancel out instead.
+                # 0xFFFFFFFFL, with the L. A bare 0xFFFFFFFF is parsed by
+                # PowerShell as Int32 -1, so the mask is a no-op on a
+                # negative TickCount and the [uint32] cast then throws
+                # "Value was either too large or too small for a UInt32",
+                # in precisely the past-24.9-days case this exists for.
+                $nowTicks  = [uint32]([Environment]::TickCount -band 0xFFFFFFFFL)
+                $lastTicks = [uint32]$lastInput.dwTime
+                if ($nowTicks -ge $lastTicks) {
+                    $idleMs = [long]$nowTicks - [long]$lastTicks
+                } else {
+                    $idleMs = [long]4294967296 - [long]$lastTicks + [long]$nowTicks
+                }
+                if ($idleMs -lt 180000) { return "keyboard or mouse input $([int]($idleMs / 1000))s ago" }
+            }
+        }
+    } catch { $null = $_ }
+    return $null
 }
 
 # ====================================================================
@@ -2092,7 +2849,14 @@ foreach ($fixMutexName in @("Global\ClaudeDesktopFix", "Local\ClaudeDesktopFix")
             try { $candidate.Dispose() } catch { $null = $_ }
             Log "Another Fix instance is already running, exiting" -Colour DarkGray
             Save-Log
-            exit 0
+            # A manual run waits for a key before it ends, as every other
+            # manual run does, so the window does not close before this can
+            # be read. The launchers do not pause again after it. Until 6.3.0
+            # it closed at once, and Fix-ClaudeDesktop.bat then reported a
+            # PowerShell failure.
+            if (-not $Quiet) { Wait-ForAnyKey }
+            # Held back, not done: see $script:BlockedExitCode.
+            exit $script:BlockedExitCode
         }
         break
     } catch {
@@ -2140,9 +2904,12 @@ if ($Close) {
                     Log "Service stopped gracefully (${elapsed}s)" -Colour Green -Indent
                     break
                 }
-                $hcsOut = Invoke-HcsDiag -Arguments "list"
-                $vmStillExists = $hcsOut -and ($hcsOut -match "cowork-vm")
-                if ($vmStillExists) {
+                # $null is no answer, which says nothing about the VM. Until
+                # 6.3.0 it read as "VM gone".
+                $hcsOut = Get-HcsList
+                if ($null -eq $hcsOut) {
+                    Log "Waiting for service... (${elapsed}s, hcsdiag did not answer)" -Colour DarkGray -Indent
+                } elseif ($hcsOut -match "cowork-vm") {
                     Log "Waiting for VM shutdown... (${elapsed}s)" -Colour DarkGray -Indent
                 } else {
                     Log "VM gone, waiting for service... (${elapsed}s)" -Colour DarkGray -Indent
@@ -2192,8 +2959,25 @@ if ($Close) {
             $cleaned = Close-StaleHcsVms -Action kill
             if ($cleaned -gt 0) {
                 Log "Killed $cleaned remaining compute system(s)" -Colour Green -Indent
-            } else {
+            } elseif ($script:LastHcsKillsSent -gt 0) {
+                # The lines above say which were still listed, or that the
+                # check after the kill did not answer. Until 6.3.0 this said
+                # "No remaining compute systems".
+                Log "No compute system confirmed gone" -Colour DarkYellow -Indent
+            } elseif ($script:LastHcsListed -gt 0) {
+                # Listed, and no kill went out: -WhatIf, or every kill threw.
+                # Until 6.3.0 this said "No remaining compute systems".
+                Log "$($script:LastHcsListed) compute system(s) listed, none killed" -Colour DarkYellow -Indent
+            } elseif ($script:LastHcsListOk) {
                 Log "No remaining compute systems" -Colour DarkGray -Indent
+            } else {
+                Log "hcsdiag did not answer, so this check was not run" -Colour DarkGray -Indent
+            }
+            # Kills went out for some of those listed and not for the rest,
+            # which are still there. Until 6.3.0 nothing said so.
+            $notSent = $script:LastHcsListed - $script:LastHcsKillsSent
+            if ($script:LastHcsKillsSent -gt 0 -and $notSent -gt 0) {
+                Log "$notSent compute system(s) listed, not killed" -Colour DarkYellow -Indent
             }
         } catch {
             Log "HCS cleanup error: $($_.Exception.Message)" -Colour DarkYellow -Indent
@@ -2247,28 +3031,53 @@ if ($Close) {
     $remainingProcs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
     $remainingSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     $remainingHcs = $false
+    $hcsUnknown   = $false
     try {
-        $hcsCheck = Invoke-HcsDiag -Arguments "list"
-        $remainingHcs = $hcsCheck -and ($hcsCheck -match "cowork-vm")
-    } catch { $null = $_ }
+        $hcsCheck = Get-HcsList
+        if ($null -eq $hcsCheck) { $hcsUnknown = $true }
+        else { $remainingHcs = ($hcsCheck -match "cowork-vm") }
+    } catch { $hcsUnknown = $true }
+    if ($hcsUnknown) {
+        Log "Whether a compute system is left is not known: hcsdiag did not answer" -Colour DarkGray -Indent
+    }
     $svcRunning = $remainingSvc -and $remainingSvc.Status -eq "Running"
+    # Whether the branch that calls the shutdown clean ran. The summary after
+    # it says the app is shut down only then.
+    $closeClean = $false
     if ($remainingProcs.Count -eq 0 -and -not $remainingHcs) {
-        if ($svcRunning) {
+        if ($hcsUnknown) {
+            # Not "complete": hcsdiag did not say whether a compute system is
+            # left. Until 6.3.0 this said "Clean shutdown complete" here too.
+            $svcSaid = if ($svcRunning) { 'the service is running' } else { 'the service is not running' }
+            Log "No app processes are left and $svcSaid; whether a compute system is left is not known" -Colour DarkYellow -Indent
+        } elseif ($svcRunning) {
             Log "Clean shutdown complete (service idle, ready for relaunch)" -Colour Green -Indent
+            $closeClean = $true
         } else {
             Log "Clean shutdown complete (service not running, may need Fix on relaunch)" -Colour DarkYellow -Indent
+            $closeClean = $true
         }
     } else {
         if ($remainingProcs.Count -gt 0) { Log "Warning: $($remainingProcs.Count) Claude processes still running" -Colour DarkYellow -Indent }
         if ($remainingHcs) { Log "Warning: HCS compute system still present" -Colour DarkYellow -Indent }
     }
+    # Until 6.3.0 this said in green that the app was shut down, and with the
+    # service running that a relaunch would work at once, after either
+    # warning above and when hcsdiag had not answered.
     Write-Host ""
-    if ($svcRunning) {
+    if ($closeClean) {
         Write-Host "  Claude Desktop is shut down." -ForegroundColor Green
-        Write-Host "  Service is idle and ready, relaunch should work immediately." -ForegroundColor Green
+        if ($svcRunning) {
+            Write-Host "  Service is idle and ready, relaunch should work immediately." -ForegroundColor Green
+        } else {
+            Write-Host "  Service is not running, you may need to run Fix after relaunch." -ForegroundColor DarkYellow
+        }
+    } elseif ($hcsUnknown -and $remainingProcs.Count -eq 0) {
+        Write-Host "  Claude Desktop's processes are stopped, but whether a compute system is left is not known." -ForegroundColor DarkYellow
+        Write-Host "  If the relaunch fails, run Fix." -ForegroundColor DarkYellow
     } else {
-        Write-Host "  Claude Desktop is shut down." -ForegroundColor Green
-        Write-Host "  Service is not running, you may need to run Fix after relaunch." -ForegroundColor DarkYellow
+        Write-Host "  Claude Desktop is not fully shut down: see the warnings above." -ForegroundColor DarkYellow
+        Write-Host "  If the relaunch fails, run Fix." -ForegroundColor DarkYellow
     }
     Write-Host ""
     Save-Log
@@ -2461,9 +3270,10 @@ if ($script:SelectedMode -eq "Diagnostic") {
             LogName      = "Application"
             ProviderName = "CoworkVMService"
             Level        = 2
-            StartTime    = (Get-Date).AddHours(-1)
+            # The UTC time as round-trip text: see Get-FixWinEvent.
+            StartTime    = [datetime]::UtcNow.AddHours(-1).ToString('o')
         }
-        $diagEvents = @(Get-WinEvent -FilterHashtable $diagEvFilter -MaxEvents 5 -ErrorAction SilentlyContinue)
+        $diagEvents = @(Get-FixWinEvent -Filter $diagEvFilter -MaxEvents 5)
         if ($diagEvents) {
             Write-Host ""
             Log "  Recent service errors (last hour):" -Colour DarkYellow
@@ -2473,13 +3283,17 @@ if ($script:SelectedMode -eq "Diagnostic") {
                 Log "    [$deTime] $deMsg" -Colour DarkGray
             }
         }
-    } catch { $null = $_ }
+    } catch {
+        Log "  Service errors: the Application log could not be read ($($_.Exception.Message))" -Colour DarkGray
+    }
 
     # HCS state via hcsdiag (v4.8.0)
     if ($script:IsAdmin) {
         try {
-            $diagHcsList = Invoke-HcsDiag -Arguments "list"
-            if ($diagHcsList) {
+            $diagHcsList = Get-HcsList
+            # '' is an answer: nothing listed. Until 6.3.0 it read as
+            # "Unable to query".
+            if ($null -ne $diagHcsList) {
                 # Counts DISTINCT GUIDs, not occurrences of the name.
                 #
                 # "hcsdiag list" prints the compute system name twice for a
@@ -2500,7 +3314,7 @@ if ($script:SelectedMode -eq "Diagnostic") {
                     Log "  HCS VMs       : None" -Colour DarkGray
                 }
             } else {
-                Log "  HCS VMs       : Unable to query (timeout or not available)" -Colour DarkGray
+                Log "  HCS VMs       : Unable to query (hcsdiag timed out, failed or is not installed)" -Colour DarkGray
             }
         } catch { $null = $_ }
     }
@@ -2513,25 +3327,33 @@ if ($script:SelectedMode -eq "Diagnostic") {
     # failed under StrictMode.
     $diagEventFilter = @{
         LogName   = "Microsoft-Windows-Hyper-V-Compute-Operational"
-        StartTime = (Get-Date).AddHours(-24)
+        # The UTC time as round-trip text: see Get-FixWinEvent.
+        StartTime = [datetime]::UtcNow.AddHours(-24).ToString('o')
     }
     try {
-        $diagShutdownEvents = @(Get-WinEvent -FilterHashtable $diagEventFilter -ErrorAction SilentlyContinue |
+        $diagShutdownEvents = @(Get-FixWinEvent -Filter $diagEventFilter |
             Where-Object { $_.Message -match "0xC037010D" })
-        $last1h = @($diagShutdownEvents | Where-Object { $_.TimeCreated -gt (Get-Date).AddHours(-1) }).Count
+        # The age in UTC: local time jumps an hour when summer time starts or
+        # ends. Until 6.3.0 it was local.
+        $hourAgoUtc = [datetime]::UtcNow.AddHours(-1)
+        $last1h = @($diagShutdownEvents | Where-Object { $_.TimeCreated -and $_.TimeCreated.ToUniversalTime() -gt $hourAgoUtc }).Count
         $last24h = $diagShutdownEvents.Count
         $statusColour = if ($last1h -gt 10) { "Red" } elseif ($last1h -gt 3) { "Yellow" } else { "Green" }
         Log "  Shutdown fails: $last1h (1h) / $last24h (24h)" -Colour $statusColour
-    } catch { $null = $_ }
+    } catch {
+        Log "  Shutdown fails: the Hyper-V Compute log could not be read ($($_.Exception.Message))" -Colour DarkGray
+    }
 
     # 0x800707DE frequency (v4.8.0)
     try {
-        $diagConstructEvents = @(Get-WinEvent -FilterHashtable $diagEventFilter -ErrorAction SilentlyContinue |
+        $diagConstructEvents = @(Get-FixWinEvent -Filter $diagEventFilter |
             Where-Object { $_.Message -match "0x800707DE" })
         if ($diagConstructEvents.Count -gt 0) {
             Log "  Construct fails: $($diagConstructEvents.Count) (24h)" -Colour Red
         }
-    } catch { $null = $_ }
+    } catch {
+        Log "  Construct fails: the Hyper-V Compute log could not be read ($($_.Exception.Message))" -Colour DarkGray
+    }
 
     # Session file count.
     #
@@ -2766,11 +3588,14 @@ if ($script:SelectedMode -eq "Diagnostic") {
         try {
             $svcNames = @($ServiceName, 'vmcompute', 'hns') | Where-Object { $_ }
             $pattern  = ($svcNames | ForEach-Object { [regex]::Escape($_) }) -join '|'
-            $evts = @(Get-WinEvent -FilterHashtable @{
+            # None in the window is no error: Get-FixWinEvent. Until 6.3.0
+            # it was logged as a System log that could not be read.
+            $evts = @(Get-FixWinEvent -Filter @{
                           LogName      = 'System'
                           ProviderName = 'Service Control Manager'
-                          StartTime    = (Get-Date).AddDays(-7)
-                      } -MaxEvents 500 -ErrorAction Stop |
+                          # The UTC time as round-trip text: see Get-FixWinEvent.
+                          StartTime    = [datetime]::UtcNow.AddDays(-7).ToString('o')
+                      } -MaxEvents 500 |
                       Where-Object { $_.Message -match $pattern })
             if ($evts.Count -gt 0) {
                 $evts | Select-Object TimeCreated, Id, LevelDisplayName, Message |
@@ -2852,185 +3677,18 @@ if ($script:SelectedMode -eq "Diagnostic") {
 }
 
 # ====================================================================
-# BOOT PREP MODE -- Non-destructive vmcompute preparation (v4.8.4)
-# ====================================================================
-# When -BootPrep is set (called by boot task 30s after logon), do a
-# lightweight vmcompute restart to clear stale state from previous session.
-# This runs BEFORE the user opens Claude, preventing construct failures.
-# Does NOT kill Claude, stop services, or touch any files.
-if ($BootPrep) {
-    Log "=== ClaudeFix Boot Prep v$ToolkitVersion ===" -Colour Cyan
-    Log "[BootPrep] Non-destructive boot preparation (30s post-logon)" -Colour DarkGray
-    if (-not $script:IsAdmin) {
-        Log "[BootPrep] Not running as admin, cannot restart vmcompute" -Colour Yellow
-        Save-Log
-        exit 1
-    }
-    # Wait for vmcompute to be running (may still be starting after boot)
-    $vmcWait = 0
-    $vmcReady = $false
-    while ($vmcWait -lt 30) {
-        $vmcSvc = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
-        if ($vmcSvc -and $vmcSvc.Status -eq "Running") { $vmcReady = $true; break }
-        if ($vmcWait -eq 0) {
-            Log "[BootPrep] Waiting for vmcompute service to start..." -Colour DarkGray
-        }
-        Start-Sleep -Seconds 3
-        $vmcWait += 3
-    }
-    if (-not $vmcReady) {
-        Log "[BootPrep] vmcompute not running after 30s, cannot prepare" -Colour Yellow
-        Save-Log
-        exit 1
-    }
-    Log "[BootPrep] vmcompute is running" -Colour DarkGray
-    # Check if there is an active workspace (do not disrupt healthy sessions)
-    $activeWorkspace = $false
-    try {
-        $hcsList = Invoke-HcsDiag -Arguments "list"
-        if ($hcsList) {
-            if ($hcsList -match "cowork-vm") {
-                # Distinguish stale VMs (from before reboot) from active ones
-                # If Claude is running and cowork-vm exists, it is likely active.
-                # Every process named claude counts here, the CLI included: this
-                # only decides to leave the VM alone, and erring that way is safe.
-                $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
-                if ($claudeRunning) {
-                    $activeWorkspace = $true
-                    Log "[BootPrep] Active workspace detected (Claude running + cowork-vm in HCS)" -Colour DarkGray
-                } else {
-                    # Stale VM from previous session -- clean it up
-                    Log "[BootPrep] Stale cowork-vm found in HCS, cleaning" -Colour DarkYellow
-                    try {
-                        $cleaned = Close-StaleHcsVms -Action kill
-                        if ($cleaned -gt 0) {
-                            Log "[BootPrep] Closed $cleaned stale HCS system(s)" -Colour Green -Indent
-                        }
-                    } catch {
-                        Log "[BootPrep] HCS cleanup failed: $($_.Exception.Message)" -Colour DarkGray
-                    }
-                }
-            }
-        }
-    } catch {
-        Log "[BootPrep] HCS check failed: $($_.Exception.Message)" -Colour DarkGray
-    }
-    if ($activeWorkspace) {
-        Log "[BootPrep] Skipping vmcompute restart (active workspace)" -Colour Green
-        Log "[BootPrep] Boot prep complete, no action needed" -Colour Green
-        Save-Log
-        exit 0
-    }
-    # Proactive vmcompute restart to clear stale boot state
-    Log "[BootPrep] Restarting vmcompute to clear stale boot state..." -Colour DarkYellow
-    try {
-        Stop-Service vmcompute -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-        Start-Service vmcompute -ErrorAction SilentlyContinue
-        $vmcElapsed = 0
-        $vmcRunning = $false
-        while ($vmcElapsed -lt 15) {
-            Start-Sleep -Seconds 3
-            $vmcElapsed += 3
-            $vmcSvc2 = Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue
-            if ($vmcSvc2 -and $vmcSvc2.Status -eq "Running") { $vmcRunning = $true; break }
-        }
-        if ($vmcRunning) {
-            Log "[BootPrep] vmcompute restarted successfully, ready for Claude" -Colour Green
-        } else {
-            Log "[BootPrep] vmcompute not running after restart" -Colour Yellow
-        }
-    } catch {
-        Log "[BootPrep] vmcompute restart failed: $($_.Exception.Message)" -Colour Red
-    }
-    Log "[BootPrep] Boot prep complete" -Colour Green
-    Save-Log
-    exit 0
-}
-
-# ====================================================================
 # SAFETY GATE -- Block when called by automation while user is active
 # ====================================================================
-# When -Quiet is set (called by health monitor or boot task), check if
-# Claude Desktop is actively in use. This prevents killing Claude while
-# the user is typing, Cowork is running, or Code is doing a task.
-# Manual runs (no -Quiet) always proceed -- user explicitly wants a fix.
+# When -Quiet is set (called by the health monitor), Get-AutomatedFixBlocker
+# says whether Claude is in use. Manual runs (no -Quiet) always proceed: the
+# user explicitly wants a fix.
 if ($Quiet) {
-    $isActive = $false
-
-    # Check 1: Any Claude process burning CPU (active request processing).
-    # The Claude Code CLI counts as well: a busy project thread is a reason to
-    # hold the repair back, and the repair would end it.
-    $claudeCheck = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
-    foreach ($cp in $claudeCheck) {
-        try {
-            $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds
-            Start-Sleep -Milliseconds 500
-            $cp.Refresh()
-            $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
-            if (($cpu2 - $cpu1) -gt 100) { $isActive = $true; break }
-        } catch { $null = $_ }
-    }
-
-    # Check 2: VM log active within 120s (Code may be thinking)
-    #
-    # Every VM log in the app's log folder, read now (Get-ClaudeVmLogAge). The
-    # list before discovery led with C:\ProgramData\Claude\Logs\coworkd.log, on
-    # a hardcoded drive letter, in a tree that does not exist.
-    if (-not $isActive) {
-        $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeEnv.LogDir
-        if ($null -ne $ageSec -and $ageSec -lt 120) { $isActive = $true }
-    }
-
-    # Check 3: User input within 3 minutes (interactive sessions only)
-    if (-not $isActive) {
-        try {
-            $sessionId = (Get-Process -Id $PID -ErrorAction Stop).SessionId
-            if ($sessionId -gt 0) {
-                Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class FixActivityCheck {
-    [StructLayout(LayoutKind.Sequential)]
-    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
-    [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
-}
-'@
-                $lastInput = New-Object FixActivityCheck+LASTINPUTINFO
-                $lastInput.cbSize = [uint32][System.Runtime.InteropServices.Marshal]::SizeOf($lastInput)
-                if ([FixActivityCheck]::GetLastInputInfo([ref]$lastInput)) {
-                    # TickCount is a SIGNED 32-bit value that goes negative once
-                    # uptime passes 24.9 days, while dwTime is unsigned. Doing
-                    # the subtraction directly then produces a hugely negative
-                    # idle time, which reads as "user is active", so every
-                    # -Quiet run on a long-uptime machine exited having done
-                    # nothing. TickCount64 would avoid this but does not exist
-                    # on Windows PowerShell 5.1, which is the engine the
-                    # elevation path always lands in. Doing the arithmetic in
-                    # unsigned 32-bit space makes the wrap cancel out instead.
-                    # 0xFFFFFFFFL, with the L. A bare 0xFFFFFFFF is parsed by
-                    # PowerShell as Int32 -1, so the mask is a no-op on a
-                    # negative TickCount and the [uint32] cast then throws
-                    # "Value was either too large or too small for a UInt32",
-                    # in precisely the past-24.9-days case this exists for.
-                    $nowTicks  = [uint32]([Environment]::TickCount -band 0xFFFFFFFFL)
-                    $lastTicks = [uint32]$lastInput.dwTime
-                    if ($nowTicks -ge $lastTicks) {
-                        $idleMs = [long]$nowTicks - [long]$lastTicks
-                    } else {
-                        $idleMs = [long]4294967296 - [long]$lastTicks + [long]$nowTicks
-                    }
-                    if ($idleMs -lt 180000) { $isActive = $true }
-                }
-            }
-        } catch { $null = $_ }
-    }
-
-    if ($isActive) {
-        $msg = "BLOCKED: User/Code appears active, skipping automated fix"
-        Log $msg -Colour Yellow
+    $blocker = Get-AutomatedFixBlocker
+    if ($blocker) {
+        Log "BLOCKED: $blocker, skipping automated fix" -Colour Yellow
         Save-Log
-        exit 0
+        # Held back, not done: see $script:BlockedExitCode.
+        exit $script:BlockedExitCode
     }
 }
 
@@ -3048,9 +3706,11 @@ $script:DeepEscalated = $false
 Log "[0/10] Checking for stale HCS compute systems..." -Colour Yellow
 if ($script:IsAdmin) {
     try {
-        $hcsList = Invoke-HcsDiag -Arguments "list"
-        if (-not $hcsList) {
-            Log "hcsdiag unavailable or timed out, skipping HCS cleanup" -Colour DarkGray -Indent
+        # $null is no answer; '' is an empty list, which is clean. Until 6.3.0
+        # an empty list read as "hcsdiag unavailable".
+        $hcsList = Get-HcsList
+        if ($null -eq $hcsList) {
+            Log "hcsdiag unavailable, timed out or failed, skipping HCS cleanup" -Colour DarkGray -Indent
         } elseif ($hcsList -match "cowork-vm") {
             # Only STALE compute systems get killed here, and a compute system
             # is only stale if Claude is not running.
@@ -3062,8 +3722,8 @@ if ($script:IsAdmin) {
             # Claude to build another one, which Step 1 then orphans.
             #
             # A VM belonging to a running Claude is dealt with by Step 5, after
-            # the process is gone. BootPrep already draws this distinction.
-            # Every process named claude counts, the CLI included: this only
+            # the process is gone. Every process named claude counts, the CLI
+            # included: this only
             # decides to leave the VM alone until Step 5.
             $claudeUp = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
             if ($claudeUp) {
@@ -3099,9 +3759,10 @@ if ($PurgeSessions) {
     $sessionDir = $script:ClaudeEnv.SessionsDir
     if ($sessionDir -and (Test-Path $sessionDir)) {
         try {
-            $cutoff = (Get-Date).AddDays(-7)
+            # UTC: local time jumps an hour when summer time starts or ends.
+            $cutoff = [datetime]::UtcNow.AddDays(-7)
             $oldFiles = @(Get-ChildItem $sessionDir -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTime -lt $cutoff })
+                Where-Object { $_.LastWriteTimeUtc -lt $cutoff })
             if ($oldFiles.Count -gt 0) {
                 $sizeMB = [math]::Round(($oldFiles | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
                 if ($PSCmdlet.ShouldProcess("$($oldFiles.Count) session file(s)", "Delete ($sizeMB MB)")) {
@@ -3167,6 +3828,12 @@ if ($claudeProcs.Count -gt 0) {
                 (New-Object System.Text.UTF8Encoding($false)))
         } catch { $null = $_ }
     }
+    # The gate at the start asked whether the app runs a Claude Code session;
+    # step 0 can take a while, so it is asked again right before the kill.
+    # Nothing that stops the app or the service has run yet, so a session
+    # found here holds the run back. Step 0 may have removed a stale compute
+    # system by now.
+    Assert-NoNewAppSession -Before "Step 1" -ExitCode $script:BlockedExitCode
     # The confirming line sits INSIDE the gate. It used to sit outside, so a
     # -WhatIf run printed "Killed 16 Claude process(es)" having killed none.
     if ($PSCmdlet.ShouldProcess("$($claudeProcs.Count) Claude process(es)", "Stop")) {
@@ -3177,6 +3844,15 @@ if ($claudeProcs.Count -gt 0) {
     Log "No Claude processes running" -Colour DarkGray -Indent
 }
 Start-Sleep -Seconds 1
+
+# Past every check that holds a run back with exit 3: the menu, Diagnostic,
+# Cancel, a No at "Proceed?", the -Quiet gate and the check right before
+# Step 1's kill all come before this, and Step 1 has stopped the app if it
+# was running. This run is the repair, and says so once, in the log and in
+# the transcript, so that the monitor can tell it from a run that stopped
+# before it (see $script:RepairUnderWayLine). Not in a -WhatIf run, which
+# changes nothing.
+if (-not $WhatIfPreference) { Log $script:RepairUnderWayLine -Colour DarkGray }
 
 # ====================================================================
 # STEP 2 -- Stop CoworkVMService
@@ -3190,6 +3866,9 @@ if (-not $svc) {
     Log "Service already stopped ($($svc.Status))" -Colour DarkGray -Indent
 } else {
     if ($PSCmdlet.ShouldProcess($ServiceName, "Stop")) {
+        # See $script:ServiceStoppedByRun: a -Quiet run that stops part-way
+        # after this starts the service again.
+        $script:ServiceStoppedByRun = $true
         $stopped = $false
         if ($script:IsAdmin) {
             try {
@@ -3323,6 +4002,7 @@ Log "[4/10] Checking for orphan processes..." -Colour Yellow
 # an orphan of the app: it belongs to a project thread or a terminal session.
 $orphanInventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
 $orphanSpared    = @($orphanInventory | Where-Object { -not $_.IsDesktop }).Count
+$orphanAppCount  = @($orphanInventory | Where-Object { $_.IsDesktop }).Count
 $remaining = @(@($orphanInventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process }) +
                @(Get-Process -Name $ServiceExe -ErrorAction SilentlyContinue))
 if ($orphanSpared -gt 0) {
@@ -3330,6 +4010,13 @@ if ($orphanSpared -gt 0) {
         -Colour DarkGray -Indent
 }
 if ($remaining.Count -gt 0) {
+    # A process of the app found here can be one the app started after Step
+    # 1, running a Claude Code session that the kill below would end, so a
+    # -Quiet run asks again first, as before Step 1. Steps 1 and 2 have run,
+    # so a session found here ends the run as stopped part-way, not as held
+    # back, after starting again the service Step 2 stopped. The service
+    # alone is stopped without asking. Until 6.3.0 nothing was asked here.
+    if ($orphanAppCount -gt 0) { Assert-NoNewAppSession -Before "Step 4" -ExitCode $script:StoppedPartWayExitCode }
     if ($PSCmdlet.ShouldProcess("$($remaining.Count) orphan process(es)", "Force-kill")) {
         foreach ($proc in $remaining) {
             try { $proc | Stop-Process -Force -ErrorAction Stop } catch { $null = $_ }
@@ -3353,17 +4040,40 @@ if ($remaining.Count -gt 0) {
 Log "[5/10] Checking for orphan compute systems..." -Colour Yellow
 try {
     $orphanKilled = $false
+    # Something found and not confirmed gone: a compute system listed that no
+    # kill went out for, whether none or only some of the kills were sent; a
+    # kill hcsdiag did not confirm; or a worker still running. "No orphan
+    # compute systems found" is not printed then. Until 6.3.0 it was.
+    $orphanLeft = $false
+    # Why the compute systems were not checked, or $null once hcsdiag's list
+    # answered; and whether the worker check below finished. "No orphan
+    # compute systems found" is printed only when both checks ran. Until
+    # 6.3.0 it was printed in green when this run had no admin, when hcsdiag
+    # did not answer, and when either check failed.
+    $hcsNotChecked = 'needs admin'
+    $workerChecked = $false
     # Method 1: hcsdiag (most reliable for HCS compute systems)
     if ($script:IsAdmin) {
+        $hcsNotChecked = 'hcsdiag did not answer'
         try {
             # Close-StaleHcsVms owns the hcsdiag list parsing and the kill,
             # including the ShouldProcess gate. This used to carry a second,
             # independent parser that expected the GUID on a line of its own,
             # which hcsdiag never emits.
             $killedCount = Close-StaleHcsVms -Action kill
+            if ($script:LastHcsListOk) { $hcsNotChecked = $null }
             if ($killedCount -gt 0) {
                 Log "Killed $killedCount orphan compute system(s)" -Colour Green -Indent
                 $orphanKilled = $true
+            } elseif ($script:LastHcsKillsSent -gt 0) {
+                # The lines above say which were still listed, or that the
+                # check after the kill did not answer.
+                Log "No orphan compute system confirmed gone" -Colour DarkYellow -Indent
+            } elseif ($script:LastHcsListed -gt 0) {
+                # Listed, and no kill went out: -WhatIf, or every kill threw.
+                # Until 6.3.0 this ended in "No orphan compute systems found".
+                Log "$($script:LastHcsListed) orphan compute system(s) listed, none killed" -Colour DarkYellow -Indent
+                $orphanLeft = $true
             } elseif ($script:LastHcsListOk) {
                 Log "No orphan compute systems via hcsdiag" -Colour DarkGray -Indent
             } else {
@@ -3374,62 +4084,43 @@ try {
                 # later. Seen in a user transcript on 2026-07-29.
                 Log "hcsdiag did not answer, so this check was not run" -Colour DarkGray -Indent
             }
+            # Kills went out for some of those listed and not for the rest:
+            # those are still there, and are left. Until 6.3.0 nothing said so,
+            # and they were not counted as left.
+            $notSent = $script:LastHcsListed - $script:LastHcsKillsSent
+            if ($script:LastHcsKillsSent -gt 0 -and $notSent -gt 0) {
+                Log "$notSent orphan compute system(s) listed, not killed" -Colour DarkYellow -Indent
+                $orphanLeft = $true
+            }
+            if ($script:LastHcsKillsSent -gt $killedCount) { $orphanLeft = $true }
         } catch {
+            $hcsNotChecked = 'the hcsdiag query failed'
             Log "hcsdiag query failed: $($_.Exception.Message)" -Colour DarkGray -Indent
         }
     }
     # Note: Get-VM does not see HCS compute systems (like cowork-vm).
     # All cleanup is handled by hcsdiag above. (v4.8.0)
 
-    # Method 2: Kill hung vmwp.exe (VM Worker Process)
+    # Method 2: a hung Cowork VM worker (vmwp.exe), and only the Cowork VM's.
+    # Stop-HungCoworkWorker says how it tells which worker that is.
     try {
-        $vmwpProcs = @(Get-CimInstance Win32_Process -Filter "Name='vmwp.exe'" -ErrorAction SilentlyContinue)
-        if ($vmwpProcs.Count -gt 0) {
-            foreach ($vmwp in $vmwpProcs) {
-                $vmwpPid = $vmwp.ProcessId
-                $vmwpCmd = $vmwp.CommandLine
-                if (-not $vmwpCmd) {
-                    Log "vmwp.exe (PID $vmwpPid) has no command line, skipping" -Colour DarkGray -Indent
-                    continue
-                }
-                # Extract GUID from command line
-                if ($vmwpCmd -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-                    $vmwpGuid = $Matches[1]
-                    # Only kill if related to Claude's VM (match claude/cowork in hcsdiag or if this is the only VM)
-                    if ($PSCmdlet.ShouldProcess("vmwp.exe PID $vmwpPid (GUID $vmwpGuid)", "Kill")) {
-                        $vmwpKilled = $false
-                        # Try hcsdiag kill first (cleaner)
-                        if ($script:IsAdmin) {
-                            try {
-                                $killResult = Invoke-HcsDiag -Arguments "kill",$vmwpGuid
-                                if ($null -ne $killResult) { $vmwpKilled = $true }
-                            } catch { $null = $_ }
-                        }
-                        # Fallback: force-kill the process
-                        if (-not $vmwpKilled) {
-                            try {
-                                Stop-Process -Id $vmwpPid -Force -ErrorAction Stop
-                                $vmwpKilled = $true
-                            } catch {
-                                Log "[!] vmwp.exe (PID $vmwpPid) is unkillable, host restart may be needed" -Colour Red -Indent
-                            }
-                        }
-                        if ($vmwpKilled) {
-                            Log "WARNING: Force-killed vmwp.exe (PID $vmwpPid, GUID $vmwpGuid); VHDX corruption risk" -Colour DarkYellow -Indent
-                            $orphanKilled = $true
-                        }
-                    }
-                }
-            }
-        } else {
-            Log "No hung VM worker processes found" -Colour DarkGray -Indent
-        }
+        $workerResult = Stop-HungCoworkWorker
+        if ($workerResult.Stopped -gt 0) { $orphanKilled = $true }
+        if ($workerResult.Left -gt 0) { $orphanLeft = $true }
+        $workerChecked = $true
     } catch {
         Log "vmwp.exe check failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
     }
 
-    if (-not $orphanKilled) {
-        Log "No orphan compute systems found" -Colour Green -Indent
+    if (-not $orphanKilled -and -not $orphanLeft) {
+        if ($null -eq $hcsNotChecked -and $workerChecked) {
+            Log "No orphan compute systems found" -Colour Green -Indent
+        } else {
+            $notChecked = @()
+            if ($null -ne $hcsNotChecked) { $notChecked += "compute systems were not checked ($hcsNotChecked)" }
+            if (-not $workerChecked) { $notChecked += 'the VM worker check did not finish' }
+            Log "Nothing was stopped, but $($notChecked -join ', and ')" -Colour DarkYellow -Indent
+        }
     }
 } catch {
     Log "Orphan VM check failed (non-critical): $($_.Exception.Message)" -Colour DarkGray -Indent
@@ -3681,7 +4372,7 @@ if ($skipCachePurge) {
     # Phase 0: HCS state cleanup before cache purge (v4.8.0)
     if ($script:IsAdmin) {
         try {
-            $hcsList = Invoke-HcsDiag -Arguments "list"
+            $hcsList = Get-HcsList
             if ($hcsList -and $hcsList -match "cowork-vm") {
                 $cleaned = Close-StaleHcsVms -Action kill
                 if ($cleaned -gt 0) {
@@ -4025,13 +4716,26 @@ if ($SkipLaunch) {
     # ====================================================================
     # STEP 9 -- Wait for Cowork workspace readiness (now Step 9/10)
     # ====================================================================
-    # Detection strategy (in order of reliability):
-    #   A. VM logs: cowork_vm_node.log -- "Startup complete" or "Keepalive";
-    #      coworkd.log -- "connected, waiting for commands"
-    #   B. Hyper-V VM state: Get-VM "claudevm" shows Running + heartbeat
-    #   C. Log file: step markers like "guest_vsock_connect completed"
-    #   D. File size stability fallback (last resort)
-    #   E. cowork-service.log -- guest connection state via isGuestConnected RPC
+    # What each pass of the wait reads, in the order it reads them:
+    #   D. The size of the VM cache. While it keeps growing the deadline
+    #      moves out, so a slow download is not taken for a stuck VM.
+    #   E. cowork-service.log: the guest connection state, from the
+    #      isGuestConnected polling it logs. Connected, with a VM log marker,
+    #      ends the wait. A timeout, 90 s or more in, starts a recovery; an
+    #      error is only logged.
+    #   A. Every VM log, from where each stood when the wait began:
+    #      "Startup complete" or "[Keepalive]" in cowork_vm_node.log,
+    #      "connected, waiting for commands" in coworkd.log.
+    #   A2. The tail of any VM log written in the last 3 minutes, for a
+    #      workspace that was already up when the wait began.
+    #   B. Whether "hcsdiag list" shows a cowork-vm compute system, noted
+    #      once. A compute system existing does not mean the workspace is
+    #      ready, and it is not read as if it did.
+    #   C. Step markers in the VM logs, such as "guest_vsock_connect
+    #      completed", shown as progress.
+    # Until 6.3.0 this list named Get-VM "claudevm" with its heartbeat, which
+    # never lists an HCS compute system, and a file size fallback the wait
+    # does not have.
     # The named pipe RPC is NOT usable (requires signed client executable).
     # ====================================================================
     Log "[9/10] Waiting for Cowork workspace..." -Colour Yellow
@@ -4129,7 +4833,7 @@ if ($SkipLaunch) {
     # is what keeps this from hanging when vmcompute is unstable.
     function Test-HyperVReady {
         try {
-            $hcsList = Invoke-HcsDiag -Arguments "list"
+            $hcsList = Get-HcsList
             if (-not $hcsList) { return $null }
             # The Integration Services heartbeat probe that used to sit here is
             # gone. Get-VM enumerates VMMS virtual machines, and the Cowork VM
@@ -4170,6 +4874,9 @@ if ($SkipLaunch) {
     $svcRestartAttempts = 0
     $svcRestartLimit    = 3
     $script:NoProgressEscalated = $false
+    # Whether the note that the VM may be stuck has been logged for the
+    # current stretch with no log or guest activity.
+    $hcsStuckNoted = $false
 
     # Skip Hyper-V cmdlet checks if vmcompute was just restarted (may hang on unstable service)
     $skipHvChecks = [bool]$hcsDetected
@@ -4299,18 +5006,25 @@ if ($SkipLaunch) {
             $hasGuestActivity = ($guestState -and $guestState -ne "no-polling")
             $hasHcsVm = $false
             try {
-                $hcsCheck = Invoke-HcsDiag -Arguments "list"
+                $hcsCheck = Get-HcsList
                 $hasHcsVm = $hcsCheck -and ($hcsCheck -match "cowork-vm")
             } catch { $null = $_ }
-            if ($hasHcsVm) {
-                Log "HCS VM present but no log/guest activity, VM may be stuck" -Colour DarkGray -Indent
-            }
             if (-not $hasLogActivity -and -not $hasGuestActivity) {
+                # Once for each stretch with no activity, not on every pass.
+                # Until 6.3.0 it was logged on every pass after 60 s whenever
+                # hcsdiag listed the VM, so a slow boot that was making
+                # progress filled the log with it.
+                if ($hasHcsVm -and -not $hcsStuckNoted) {
+                    Log "HCS VM present but no log/guest activity, VM may be stuck" -Colour DarkGray -Indent
+                    $hcsStuckNoted = $true
+                }
                 if (-not $script:NoProgressEscalated) {
                     $script:NoProgressEscalated = $true
                     Log "[!] No progress after ${vmElapsed}s, no log activity, no guest polling" -Colour Red -Indent
                     Log "Escalating: killing Claude, cleaning HCS, relaunching..." -Colour Yellow -Indent
-                    # Kill the app, not the Claude Code CLI processes beside it
+                    # Kill the app, not the Claude Code CLI processes beside it,
+                    # and not while the relaunched app runs a session.
+                    Assert-NoNewAppSession -Before "the no-progress escalation" -ExitCode $script:StoppedPartWayExitCode
                     $null = Stop-ClaudeDesktopApp
                     Start-Sleep -Seconds 2
                     # Clean HCS
@@ -4327,6 +5041,8 @@ if ($SkipLaunch) {
                     Log "Waiting for workspace after relaunch..." -Colour DarkGray -Indent
                     continue
                 }
+            } else {
+                $hcsStuckNoted = $false
             }
         }
 
@@ -4344,7 +5060,7 @@ if ($SkipLaunch) {
         if (-not $logStatus -and $vmElapsed -ge 30) {
             foreach ($cand in @(Get-ClaudeVmLogCandidates -LogDir $vmLogDir)) {
                 try {
-                    $recentlyWritten = ($cand.LastWriteTime -gt (Get-Date).AddMinutes(-3))
+                    $recentlyWritten = ($cand.LastWriteTimeUtc -gt [datetime]::UtcNow.AddMinutes(-3))
                     if (-not $recentlyWritten -or $cand.Length -le 0) { continue }
                     $tailSize = [math]::Min([long]$cand.Length, 8192)
                     $tailContent = ''
@@ -4436,7 +5152,9 @@ if (-not $vmReady -and -not $SkipLaunch -and $script:IsAdmin -and
     $script:DeepEscalated = $true
     Log "" -Colour White
     Log "Smart mode: workspace not ready after quick fix, escalating to Deep" -Colour Yellow
-    # Phase 0: Kill the app (not the Claude Code CLI) + HCS cleanup
+    # Phase 0: Kill the app (not the Claude Code CLI) + HCS cleanup, and not
+    # while the relaunched app runs a session.
+    Assert-NoNewAppSession -Before "the escalation to Deep" -ExitCode $script:StoppedPartWayExitCode
     $null = Stop-ClaudeDesktopApp
     Start-Sleep -Seconds 2
     try { Close-StaleHcsVms -Action kill | Out-Null } catch { $null = $_ }
@@ -4608,9 +5326,10 @@ try {
         LogName      = "Application"
         ProviderName = "CoworkVMService"
         Level        = 2
-        StartTime    = (Get-Date).AddHours(-1)
+        # The UTC time as round-trip text: see Get-FixWinEvent.
+        StartTime    = [datetime]::UtcNow.AddHours(-1).ToString('o')
     }
-    $events = Get-WinEvent -FilterHashtable $evFilter -MaxEvents 3 -ErrorAction SilentlyContinue
+    $events = @(Get-FixWinEvent -Filter $evFilter -MaxEvents 3)
 
     if ($events) {
         Write-Host ""
@@ -4621,7 +5340,9 @@ try {
             Log "  [$evTime] $evMsg" -Colour DarkGray -Indent
         }
     }
-} catch { $null = $_ }
+} catch {
+    Log "Recent service errors: the Application log could not be read ($($_.Exception.Message))" -Colour DarkGray -Indent
+}
 
 Write-Host ""
 Log "Log saved to: $LogFile" -Colour DarkGray -Indent

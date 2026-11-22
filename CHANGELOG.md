@@ -8,6 +8,604 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.3.0] - 2026-11-22
+
+If you ran Prevent from an older version, run `Prevent-ClaudeIssues.bat`
+again. Several settings older versions reported as made were never made. The
+new run makes them, records what each one was before it changes it, and
+removes the boot-fix task. Until it runs, a boot-fix task an older version
+installed keeps running `Fix-ClaudeDesktop.ps1 -BootPrep` at every logon. In
+this version `-BootPrep` only says that it is retired and exits, so the task
+no longer restarts `vmcompute`, and only Prevent or `-Undo` removes the task.
+
+`-Undo` from 6.3.0 still cleans up after older versions. Its first step puts
+back what a 6.3.0 run recorded, and its second removes what versions before
+6.3.0 are known to have set, so it is the undo to run whichever version made
+the changes. What it cannot know, it leaves: hibernate and Fast Startup turned
+off before 6.3.0, and Ultimate Performance plans, because no record says what
+they were or which ones older versions made.
+
+### Fixed
+
+- `-Undo` puts back what the machine had, not fixed values.
+
+  It set the same values everywhere: hibernate and Fast Startup on, sleep
+  after 30 minutes, every Ultimate Performance plan deleted, a plan you made
+  yourself included, and the power plan it had recorded. Every setting Prevent
+  changes is now recorded before it is changed, with the value it had, in
+  `%LOCALAPPDATA%\ClaudeFix\prevent-undo.json`, and `-Undo` puts those values
+  back, newest first. The first record of a setting wins, so a rerun does not
+  record the value Prevent set as yours. `-Undo` deletes only the Ultimate
+  Performance plan Prevent created, and keeps that one while it is still the
+  active plan.
+
+  The record is in the local profile, not the roaming one, and it names the
+  computer that wrote it, so a roaming profile cannot carry it to another PC
+  and have that PC put back this one's values. A record written on another
+  computer is never used: Prevent moves it aside, as
+  `prevent-undo.from-<computer>.<time>.json` in the same folder, and starts
+  this computer's own record, and `-Undo` puts nothing back from it and says
+  why. A record that cannot be read, is not a version 1 record, or holds an
+  item with no Kind or Key stops Prevent and `-Undo` before anything changes,
+  rather than being overwritten with values Prevent set.
+
+- `-Undo` says when it did not put everything back, and exits 1.
+
+  It ended with UNDO COMPLETE whatever had happened. A setting it cannot put
+  back now stays in the record for the next `-Undo`, as one for a network
+  adapter that is not plugged in does, and the run ends with UNDO
+  INCOMPLETE, lists what is still in the record and exits 1. When `-Undo`
+  cannot read a list it needs to check (the NAT rules, the network adapters,
+  the Hyper-V VMs or the running processes), it warns, ends UNDO INCOMPLETE
+  and exits 1, and the next `-Undo` looks again. A run in which a step failed
+  ends with UNDO FINISHED WITH ERRORS. A power setting Windows no longer has,
+  and a driver option the adapter's driver no longer lists, are dropped from
+  the record with a warning: there is nothing left to put back.
+
+- `-Undo` checks what it removes, and leaves the RUNASADMIN flags alone.
+
+  A scheduled task the scheduler refused to delete was reported as not
+  found, a health monitor that did not stop as stopped, and a file that was
+  not deleted as removed. Each removal in its last three steps is now
+  checked, and one that did not happen fails the step. The `\Claude\` task
+  folder is removed too, once it holds no other task. `-Undo` also removed
+  every RUNASADMIN compatibility flag on `Claude.exe` it found, and now
+  leaves them: no version of this toolkit set them, so any there are someone
+  else's.
+
+- A second Prevent run no longer replaces the record of your power plan.
+
+  Every run wrote the active plan to its backup file, so a second run recorded
+  Prevent's own Ultimate Performance plan as yours, and `-Undo` "restored"
+  that. The plan you had is now recorded once, the first time. An older
+  version's backup file is carried over and deleted, and when it holds an
+  Ultimate Performance plan the run says that `-Undo` will return to Balanced.
+
+- Prevent no longer makes another Ultimate Performance plan on every run on a
+  non-English Windows.
+
+  It found the plans by the words "Ultimate Performance" in `powercfg /list`,
+  which shows the translated name, so on another language it found none and
+  made one more copy. It now finds them by their FriendlyName, the resource
+  reference every copy of the template carries.
+
+- A change powercfg refused is no longer reported as made.
+
+  powercfg's exit code was read only when an Ultimate Performance plan was
+  created, and no change was checked: the active plan was read back and
+  printed as verified, whichever plan it was. Each power setting is now read
+  back after it is written, and the plan switch, hibernate and the plan
+  deletion in `-Undo` are each checked the same way.
+
+- Modern Standby is turned off where the machine has it.
+
+  The step set `CsEnabled` to 0, which current Windows no longer reads, so on
+  a machine with Modern Standby nothing changed and the summary said it was
+  off. It now asks `powercfg /a` whether the machine uses Modern Standby and,
+  where it does, sets `PlatformAoAcOverride` to 0, the switch Windows reads
+  now. It takes effect at the next Windows restart.
+
+- Network adapter power saving is turned off where Windows reads it, and the
+  clock check after it can reach the time server.
+
+  `PnPCapabilities` was written to the adapter's Enum key, where nothing reads
+  it, so an adapter reported as done still had power saving on. It now goes in
+  the adapter's driver key, and only bit 0x08 is added: the wake bits beside
+  it are left as they are, and the key is never created. The adapters were
+  also restarted, which dropped the network link for about 14 seconds, and the
+  clock check later in the same run then failed. No adapter is restarted any
+  more: every change is made with `-NoRestart` or is a WMI setting or a
+  registry value, and takes effect at the next Windows restart, which the
+  summary says.
+
+- Only the Cowork VM's worker process is raised, and only its worker is
+  killed.
+
+  Prevent and the health monitor set every `vmwp.exe` on the machine to
+  AboveNormal: every Hyper-V VM, WSL2 and Windows Sandbox. Fix's Step 5 killed
+  every `vmwp.exe` on the machine, so one of those running beside Claude went
+  down with it. The Cowork VM's worker is now the `vmwp.exe` whose first
+  argument is the GUID of a Cowork compute system `hcsdiag list` showed, in
+  Fix at any point in the run, and when no list showed one, no worker is
+  touched. Fix stops it through hcsdiag, waits up to five seconds, and only
+  then force-kills it, and never a process that has since taken over its
+  PID. A worker counts as stopped only once it has exited, where any output
+  from hcsdiag, an error included, counted as a kill.
+
+- A single stale VM is removed, and a removal is reported only once it
+  happened.
+
+  With one stale VM, the case the removal exists for, the parse returned a
+  single string, and `.Count` on a string throws under StrictMode in Windows
+  PowerShell 5.1. Prevent logged "check failed" and removed nothing, and Fix
+  reported none found. An `hcsdiag list` that failed read as an empty one, so
+  Prevent said "HCS state clean". And every kill sent was counted: Fix printed
+  "Killed N" and the monitor logged "killed" whether hcsdiag had removed
+  anything or not.
+
+  Prevent now checks the list's exit code, and in Prevent, Fix and the monitor
+  a kill counts only when the compute system is gone from a second list. When
+  the monitor finds more than one Cowork VM, it keeps the one whose worker
+  process started last, compared in UTC, since in the hour the clocks go
+  back a later start can show an earlier local time. It kept the last entry
+  hcsdiag printed, on the belief that the list runs oldest to newest, which
+  nothing documents. With no worker to tell the live one by, it kills none.
+
+- An unattended repair no longer ends a Claude Code session the app started.
+
+  Fix's `-Quiet` guard, which the health monitor's repairs go through, checked
+  CPU, the VM log and input. A project thread waiting on a 25-minute command
+  uses almost no CPU and writes nothing, so an unattended run passed all three
+  and ended it. The guard now first holds the repair back while a Claude Code
+  CLI the app started is running, and while a Claude Code transcript was
+  written in the last 35 minutes, the same question the monitor asks before
+  its 30-second warning. Both fail closed: when the parent of a Claude Code
+  CLI process cannot be read, the repair waits. A CLI in a terminal is not
+  one the app started.
+
+  The guard asked once, at the start, and a Smart run takes minutes, long
+  enough for the app to start a project thread. A `-Quiet` run now asks
+  about the app's sessions again right before each step that stops the app:
+  Step 1, Step 4 when it finds the app's leftover processes, the
+  no-progress escalation in Step 9 and the escalation to Deep. Before Step 1
+  the run is held back (exit 3). After it the run stops part-way (exit 4),
+  and first starts CoworkVMService again when this run stopped it, since
+  Windows does not start a manually stopped service on its trigger; when
+  that start fails, it says so and asks you to run Fix when Cowork is
+  needed. When the app's sessions cannot be listed, the run stops. Manual
+  runs are not asked.
+
+- Fix's exit code says when a run was held back or stopped part-way.
+
+  A run held back before it stopped the app or the service exited 0, the
+  same as a finished repair: another Fix run holding the lock, and the
+  `-Quiet` guard finding Claude or the PC in use. The health monitor then
+  logged it as a completed fix and counted it toward "Auto-fix failed 3
+  times". Those runs now exit 3, and a `-Quiet` run that stops part-way,
+  above, exits 4. 0 is still a finished run, and 1 a workspace that was not
+  ready after the retries or an unexpected error. The README's new "Exit
+  codes" section lists them. Once a run is past every check that holds it
+  back, Fix logs "Repair under way", which the monitor reads to tell a Fix
+  run that started the repair from one that stopped before it.
+
+- The health monitor no longer counts a repair Fix held back, and tries a
+  held-back repair again once the hold clears.
+
+  A run Fix held back (exit 3) is logged as `HELD BACK` and is not counted
+  toward "Auto-fix failed 3 times". A run that stopped part-way (exit 4) is
+  logged as `STOPPED PART-WAY`, saying that a Claude Code session was found
+  or could not be ruled out, and is counted like any other repair: toward
+  the escalation, with the normal cooldown after it.
+
+  A check that is made again on every poll, such as the service check, fires
+  again while the fault lasts. A log error or an Event Log error fires once,
+  so a repair for one that Fix held back, or that the monitor BLOCKED or
+  DEFERRED, was lost. That repair is now kept pending in `watch-state.json`,
+  as is one for such an error that fires during the wait a hold leaves, and
+  it is tried again once the hold has cleared, with the 30-second warning at
+  most 3 times. It ends after 4 hours, when Claude Desktop is started again,
+  or when a Fix run logs that it started the repair. A Fix run that stopped
+  before the repair, such as a Diagnostic run, a Cancel or a No at
+  "Proceed?", does not end it, and while a Fix run holds Fix's lock the
+  repair waits for it to end. A log error or an Event Log error that fires
+  while a repair is pending takes it over: the repair is tried for the new
+  reason, its 4 hours start again from then, and its tries are kept. In the
+  cooldown, the COOLDOWN line for it is followed by one that says it takes
+  over the held-back repair, naming the reason that was pending, and is tried
+  again once the wait is over, for up to 4 hours. The error the repair is
+  already pending for, firing again, takes nothing over: its 4 hours start
+  again, and that line says only that it is tried again.
+
+  Each run Fix holds back in a row doubles the wait before the next repair:
+  2, 4, 8, 16, 32, then 60 minutes. The count starts again after a run Fix
+  does not hold back, after a hold 4 hours or more after the one before, and
+  after a Fix run by hand that started the repair, which also ends the wait
+  5 minutes after that run at the latest. A trigger in the cooldown after a
+  repair that ran, an escalation or a cancel is skipped, as before.
+
+  A repair you cancel by switching to Claude during the 30-second warning is
+  let through again about 2 minutes after the cancel. That was timed from
+  before the warning, so it came back a minute or so after the cancel.
+
+- The health monitor no longer repeats its BLOCKED, COOLDOWN and SKIPPED
+  lines on every poll, and COOLDOWN says when a fix is allowed again.
+
+  A trigger that is checked again came back to them each time it fired
+  while a hold lasted, which wrote the same lines about 30 times an hour,
+  and "AUTO-FIX SKIPPED: Fix-ClaudeDesktop is already running" up to 120
+  times an hour while a Fix run by hand waited in its menu. BLOCKED and
+  COOLDOWN lines for the same reason are now written at most once every 10
+  minutes, and so is SKIPPED when no repair is pending; with one pending,
+  SKIPPED is written once for each Fix run that holds Fix's lock. A pending
+  repair that is still waiting says why, at most once every 10 minutes.
+  COOLDOWN said "last fix N min ago", counted from a time that BLOCKED,
+  DEFERRED, CANCELLED and HELD BACK move back with no fix run, so after a
+  BLOCKED it named a fix that never ran. It now says "a fix is allowed again
+  in N min".
+
+- `Fix-ClaudeDesktop.bat` and `Stop-ClaudeDesktop.bat` say what exit codes 3
+  and 4 mean.
+
+  For 3 they say that the run was held back before the app or the service
+  was stopped, and for 4 that the repair ran part of the way and stopped
+  because a Claude Code session was found or could not be ruled out, and
+  that the lines above say which. Neither pauses for them, as neither does
+  for 0 and 1.
+  Any other code is still reported as PowerShell failing to run the script.
+  A manual run that finds another Fix run already going now waits for a key
+  before its window closes, where it closed at once.
+
+- An hcsdiag call that fails no longer reads as an answer, and an empty list
+  no longer reads as a failure.
+
+  Fix and the health monitor threw hcsdiag's exit code away, so an error it
+  printed came back as if it were the list. A call that exits with an error
+  code now counts as no answer, and its exit code and first line are logged
+  once, and again only when what hcsdiag says changes or after it has
+  answered in between, so a host where it keeps failing no longer gets the
+  same line on every check. `hcsdiag list` prints nothing when no compute
+  system is left, and that read as no answer: Fix's Step 0 said hcsdiag was
+  unavailable. It now counts as nothing listed. A compute system still in
+  the list after a kill is reported as still listed after the kill, since it
+  can take longer to leave the list than the check waits. While `-Close`
+  waits for the service to stop, an hcsdiag that does not answer is reported
+  as such, where it read as the VM gone.
+
+- Fix's Step 5 says "No orphan compute systems found" only when it looked
+  and found none.
+
+  It said so whenever nothing was killed: after a worker it could not stop,
+  when hcsdiag had not answered or the worker check failed, and when compute
+  systems were listed but not killed. It now says "Nothing was stopped, but"
+  and what was not checked, the compute systems or the VM worker, and how
+  many compute systems were listed and not killed. `-Close` says the same of
+  the ones it listed.
+
+- `-Close` and `Stop-ClaudeDesktop.bat` say Claude Desktop is shut down only
+  when it is.
+
+  The closing lines said in green that Claude Desktop was shut down after a
+  warning that Claude processes or a compute system were still there, and
+  when hcsdiag had not answered. That is now said only when the check found
+  no app process and hcsdiag listed no Cowork compute system. Otherwise it
+  says, in yellow, that the app is not fully shut down, or that its
+  processes are stopped but whether a compute system is left is not known,
+  and to run Fix if the relaunch fails. The log no longer says "Clean
+  shutdown complete" when hcsdiag did not answer.
+
+- Step 9 notes a VM that may be stuck once, and only while nothing happens.
+
+  "HCS VM present but no log/guest activity, VM may be stuck" was logged on
+  every pass after 60 seconds whenever hcsdiag listed the VM, so a slow boot
+  that was making progress filled the log with it. It is now logged once
+  for each stretch with no log or guest activity.
+
+- Ages are measured in UTC, so the change to or from summer time no longer
+  moves them by an hour.
+
+  Fix, the health monitor and the discovery code they share measured file
+  and event ages against local time, so at the change to summer time a file
+  written a minute ago read as an hour and a minute old. That moved the
+  activity checks, the log ages Steps 3 and 9 read, the shutdown failures
+  `-Mode Diagnostic` counts for the last hour, and when old logs, VHDX
+  backups and, with `-PurgeSessions`, session transcripts are deleted. The
+  monitor's cooldown, the escalation's 30-minute window, its startup grace
+  period and how long ago Claude started are in UTC too, and so are the
+  times in `watch-state.json`; one an older version wrote is converted when
+  it is read. Each Event Log read in Fix and the monitor now gives the start
+  of its window in UTC, so the window is right in the hour the clocks go
+  back, which a local time names twice. The times in the app's own log
+  lines, which it writes in local time with no offset, are still compared
+  with local time.
+
+- The storage check no longer reads a folder named Xbox as a Box sync folder.
+
+  It was a substring test for "OneDrive", "Google Drive", "Dropbox", "iCloud"
+  and "Box" anywhere in the path. A sync folder is now a OneDrive folder
+  Windows names in the environment, or a folder in the path that is named
+  after the service or starts with that name and then " - " or " (", as
+  "OneDrive - Contoso" and "Dropbox (Personal)" do. Below the user profile
+  only the part after it is tested, so a user named Box is not a Box folder.
+
+- Prevent's storage check says when a check could not be made, and finds a
+  mapped network drive.
+
+  Every read in step 11 dropped its errors, so a check that failed read as
+  a local drive and the step said the storage was OK. A check that cannot be
+  made, of which drive holds the Claude data folder, whether that drive is
+  external or a network drive, or whether the VM cache is on a network
+  drive, is now a warning that names it and why, and "Storage location OK"
+  is said only when every check was made. A data folder on a network share
+  with no drive letter gets a warning that neither check was made. The
+  network drive check ran only for a drive `Get-Volume` lists, which a
+  mapped network drive is not, so it never found one; it now runs for any
+  drive letter.
+
+- The clock check measures on every locale and reports a resync that failed.
+
+  The offset was read with a pattern that took a decimal point only, so where
+  the locale writes a comma neither Prevent nor the monitor measured anything,
+  and a resync that failed was reported as done. Both now read either
+  separator and the resync's exit code, and a failed resync is a warning.
+  Prevent also starts the Windows Time service if it is stopped, and waits up
+  to 30 seconds for `time.windows.com` to resolve before it asks. When it
+  cannot be reached in that time, the step warns that the clock was not
+  checked.
+
+- The health monitor logs a clock resync as repaired only when the clock is
+  right after it, and stops forcing one that does not help.
+
+  A resync that exited 0 was logged REPAIRED without measuring again, and
+  one that changed nothing was forced again every 5 minutes for as long as
+  the drift lasted. The clock is now measured again after the resync, and
+  REPAIRED, with the drift before and after, means it is within 5 seconds.
+  Otherwise the warning gives the drift, why the resync did not help and the
+  time source Windows syncs from, and no resync is forced for 60 minutes
+  while the drift lasts. The clock is still measured every 5 minutes, the
+  warning is repeated while the drift is over 30 seconds, and the monitor
+  logs when it is back within 5 seconds. A wait that reaches more than 60
+  minutes ahead, because the clock was set back during it, is ended. The
+  resync and the time source query now have the 15 seconds the measurement
+  had, where the resync could stall the monitor for as long as the network
+  took. A resync, a measurement after it or a time source query that fails
+  is named in the warning, and the drift is still reported.
+
+  A clock check that failed was passed over without a word, so it looked
+  like a clock that was right. When w32tm cannot be started, or answers with
+  an error and no offset, as when it cannot reach the time server, a TIME
+  WARNING now says that the clock check failed and names why. A measurement
+  that does not answer within 15 seconds is logged as a skipped check, a
+  line that was written on every check. Each is now logged at most once an
+  hour for the same error.
+
+- The health monitor says when one of its checks fails, and Fix's HCS error
+  check says when it cannot read a log.
+
+  Most of the monitor's checks passed a failure over without a word, so a
+  check that could not run looked like one that found nothing wrong. Each
+  now logs one line that names the check and the error: the Claude logs,
+  the four Event Logs, storage, VM log staleness, vmcompute, the HCS checks,
+  the VM worker processes, saving and restoring `watch-state.json`, the Fix
+  logs and Fix's lock, the lock that keeps a second monitor from running,
+  the session it runs in, the focus check before a repair, and the poll
+  itself, as `MONITOR ERROR`, which was written on every poll. The same
+  error is logged at most once an hour, and no more than 3 different errors
+  of one check in an hour. A vmcompute handle count that cannot be read is
+  said, where it was taken as 0. When the VM worker processes cannot be
+  listed, the monitor raises no worker and kills no VM. A Fix lock the
+  monitor may not open, as when Fix runs elevated and the monitor does not,
+  means Fix is running, where any error read as not running, and so does
+  one it cannot ask about at all. When the check that the monitor is
+  elevated fails, the line that skips the repair names the error, where it
+  said the monitor was not elevated and to reinstall its task.
+
+  Fix's Step 3 and `-Mode Diagnostic` say when the Hyper-V Compute event
+  logs, a Claude log or the Claude log folder cannot be read, naming the
+  error, and go on to the next Claude log, where each read as a log with
+  no HCS error. Fix's summary and `-Mode Diagnostic` also say when the
+  Application log, where they look for CoworkVMService errors, cannot be
+  read, where that read as no errors. A support bundle with no Service
+  Control Manager event for these services in the last 7 days reports 0
+  events and says so in `service-events.txt`, where it logged that the
+  System log could not be read.
+
+- `-Undo` removes the Defender exclusions Prevent added.
+
+  It left them all in place. Each exclusion is now recorded before it is
+  added, so `-Undo` removes the ones Prevent added and no others. One that
+  Defender refuses is taken back out of the record and fails the step. A
+  Defender whose settings cannot be read fails the step too, where it read as
+  nothing excluded yet. Where Defender hides its exclusion lists from
+  administrators, the step says that it cannot tell which exclusions exist
+  and adds none.
+
+- Prevent's antivirus check says when the antivirus products Windows knows
+  of cannot be read.
+
+  The list Windows Security Center keeps was read with its errors dropped,
+  so a list that could not be read meant no antivirus product registered,
+  and one that is not Defender could go unreported. That is now a warning,
+  and when no known antivirus process is running either, the step says "No
+  antivirus product found among the running processes" instead of "No
+  antivirus product detected". Where Windows has no such list, as Windows
+  Server has no Security Center, nothing is said, as before.
+
+- The Claude (Admin) and Claude (no GPU) shortcuts keep their icon across a
+  Claude update.
+
+  Their icon pointed at `Claude.exe` itself, which for an MSIX install sits in
+  a folder named after the version, and the first update removed that folder.
+  Prevent now copies Claude's icon to `Claude.ico` in `%APPDATA%\Claude`, uses
+  a stock Windows icon when there is no Claude to copy it from, and `-Undo`
+  removes the copy.
+
+- The health monitor task and the Claude (no GPU) launcher work from a path
+  with an apostrophe in it.
+
+  The path was put between single quotes as it was, so a `'` in it, as in a
+  user folder named O'Brien, ended the string early and the command failed.
+  Each `'` is now doubled, as PowerShell expects inside single quotes.
+
+- Prevent's health monitor step starts the new monitor only when no other
+  is left running, and says when it could not replace one.
+
+  Step 15 removed the old task and stopped the running monitor before it
+  registered the new task, and dropped every error: a registration that
+  failed left no monitor and was reported as installed, a monitor that did
+  not stop was not mentioned and the new one was started beside it, and a
+  start that failed was not said. The task is now registered first,
+  replacing the old one, and a registration that fails fails the step and
+  leaves the running monitor as it is. The new monitor is started at once
+  only when every running monitor was found and stopped: when the running
+  processes cannot be listed, or a monitor is still running 2 seconds after
+  it was stopped, the step warns, naming why, and the new monitor starts at
+  the next logon. A start that fails is a warning too. A monitor that ended
+  by itself before it could be stopped is said to have ended, here and in
+  `-Undo`, not to have been stopped.
+
+- The WSL2 check sees a running distro.
+
+  It read `wsl.exe`'s UTF-16 output as text, so the test for a running WSL2
+  distro never matched. It now sets `WSL_UTF8`. WSL or Docker Desktop merely
+  being installed is listed, no longer a warning.
+
+- Prevent says what each step did, and exits 1 when one failed.
+
+  The summary was a fixed list that called every setting configured, printed
+  after steps that had failed, said "not critical" or not run at all, and the
+  script exited 0 either way. Each step now reports changed, no change needed,
+  skipped, check the note or FAILED, with the reason. The summary lists what
+  needs a Windows restart to take effect, and the exit code is 1 when a step
+  failed or the run stopped.
+
+- `-WhatIf` on Prevent is refused instead of changing the machine.
+
+  It was accepted and carried across the elevation boundary, but the only step
+  that honoured it was the stale VM removal, so a "dry run" was a real run. It
+  is now refused before anything runs, elevation included, and the script
+  exits 1.
+
+### Changed
+
+- Prevent sets the active power plan to full performance on AC power.
+
+  It set five values, through `powercfg /change` and, on the active plan,
+  `powercfg /setacvalueindex`, and checked none. It now sets these on the
+  active plan and reads each one back: sleep, hibernate and hard disk
+  turn-off at Never, SATA link power management Active and adaptive link
+  power off, the NVMe idle timeouts off and NVMe latency tolerance 0 ms, USB
+  selective suspend and USB 3 link power management off, PCI Express link
+  state off, minimum and maximum processor state 100%, boost mode
+  Aggressive, no core parking, energy performance preference 0, processor
+  throttle states off, and wireless adapters at maximum performance. A
+  setting the machine does not have is left alone. Battery (DC) settings and
+  the screen timeout are not changed.
+
+- Network adapter power saving is turned off in the five places it lives,
+  and on hidden and virtual adapters too.
+
+  On each physical adapter: Windows' "allow the computer to turn off this
+  device to save power"; the driver framework's power-down while the PC is
+  running (`IdleInWorkingState` in the adapter's WDF key, set to 0 where it
+  is there); bit 0x08 of the driver key's `PnPCapabilities`; the driver's
+  own options by registry keyword (Energy Efficient Ethernet, Green
+  Ethernet, Gigabit Lite, Ultra Low Power Mode, System Idle Power Saver,
+  Wi-Fi power save and the rest, each set to its own off value and only
+  where the driver lists that value), and two hidden Realtek options,
+  `PowerDownPll` and `bFwCtrlLPS`, changed only when they read 1; and
+  selective suspend, sleep on disconnect and D0 packet coalescing. Hidden
+  adapters, such as Wi-Fi Direct, and virtual ones, such as a VPN's, have
+  the "allow the computer to turn off this device" box cleared, even when
+  the physical adapters cannot be listed, which fails the step for those,
+  naming why. Wake settings are no longer turned off.
+
+- Prevent turns off Windows power throttling.
+
+  Power throttling runs background processes on efficient cores at low clocks,
+  and the VM's worker can be one of them. Prevent sets `PowerThrottlingOff` to
+  1, which turns it off for every process from the next Windows restart.
+
+- The vmcompute recovery Prevent replaces is recorded first, so `-Undo` puts
+  it back. Without `vmcompute`, the step is skipped.
+
+- Prevent runs 19 steps and `-Undo` 5. Prevent's last step removes what older
+  versions set up that now does harm or nothing, and lists as "Left in place"
+  these settings they made, which `-Undo` removes:
+  `LocalAccountTokenFilterPolicy`, `FilterAdministratorToken`,
+  `ServicesPipeTimeout`, `CsEnabled`, the restart recovery on
+  CoworkVMService, the `CoworkNAT` rule, an adapter's `PnPCapabilities` with
+  its wake settings, and Dynamic Memory left off on a Hyper-V VM named like
+  Claude. The first three are listed, and removed, only where an older
+  install is found; elsewhere the step says that they match what older
+  versions set and that `-Undo` leaves them.
+
+### Removed
+
+- The boot-fix task.
+
+  `\Claude\ClaudeCoworkBootFix` ran `Fix-ClaudeDesktop.ps1 -BootPrep -Quiet`
+  45 seconds after every logon. It restarted `vmcompute` while Claude was not
+  yet running, which is a restart of the service every VM on the machine
+  depends on. Prevent and `-Undo` remove it.
+
+- What Fix's `-BootPrep` did.
+
+  `-BootPrep` restarted `vmcompute`, and removed a stale Cowork compute
+  system, when no Cowork workspace was up. The switch is kept, because a
+  boot-fix task an older version installed still passes it until Prevent or
+  `-Undo` removes the task, but it now exits 0 before anything else runs,
+  saying only that it is retired: it writes no log or file, deletes nothing,
+  and touches neither `vmcompute` nor any VM.
+
+- Dynamic Memory pinning and its flag file.
+
+  `disable-dynamic-memory.flag` asked the monitor to turn off Dynamic Memory
+  on a Hyper-V VM named like Claude. The Cowork VM is not a Hyper-V VM and has
+  no such setting. Prevent and `-Undo` delete the flag. Where an older
+  install is found, `-Undo` turns Dynamic Memory back on for such a VM that
+  is turned off, and for one that is running says to turn it off and run
+  `-Undo` again.
+
+- The health monitor's guest-connection and NAT checks.
+
+  The guest-connection check read `cowork-service.log` for a message that file
+  has never held, and the file is no longer written. The NAT check looked for
+  a WinNAT rule, and the Cowork VM does not use one. A `Request timed out:
+  isGuestConnected` the app logs at `[error]` in its VM or main log still
+  starts a repair through the log check.
+
+- The health monitor's Hyper-V heartbeat check.
+
+  It read the heartbeat through `Get-VM`, which never lists an HCS compute
+  system such as the Cowork VM, so it could not fire, and from 6.0.0 it did
+  nothing. The monitor's help no longer lists it, nor the guest-connection
+  and NAT checks, and the startup banner still says the heartbeat is not
+  monitored.
+
+- Prevent's WinNAT and firewall policy checks.
+
+  The Cowork VM does not use a WinNAT rule. The `CoworkNAT` rule older
+  versions created, and the monitor re-created, is listed by a new run when it
+  is still there, and `-Undo` removes it. A machine without WinNAT has no such
+  rule, and is not warned about. When the NAT rules cannot be read, Prevent
+  and `-Undo` warn that `CoworkNAT` was not checked.
+
+- Four settings Prevent no longer makes: Connected Standby (`CsEnabled`),
+  `ServicesPipeTimeout`, the admin token policy
+  (`LocalAccountTokenFilterPolicy` and `FilterAdministratorToken`), and the
+  CoworkVMService recovery.
+
+  Current Windows no longer reads `CsEnabled`; the Modern Standby step sets
+  `PlatformAoAcOverride` instead. A new run lists what older versions left
+  of these as left in place. `-Undo` puts `CsEnabled` back from its backup.
+  It removes `ServicesPipeTimeout`, `LocalAccountTokenFilterPolicy` and
+  `FilterAdministratorToken` while they hold exactly what those versions
+  wrote, 120000, 1 and 0, and only where an older install is found: a
+  backup file, flag file, script or launcher an older version left, or the
+  boot-fix task. It clears the restart after 30, 60 and 120 seconds on
+  CoworkVMService and `vmcompute` where it is still exactly that, except
+  while Prevent's record of it is kept, since its first step puts that back.
+
 ## [6.2.1] - 2026-11-21
 
 ### Fixed

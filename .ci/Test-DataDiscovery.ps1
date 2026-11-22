@@ -18,7 +18,8 @@
     and refusing a fallback. Then the VM logs: their age, Watch's Cowork
     guard, and Fix's wait for a booted VM, each reading every VM log in its
     own format. Last, which Defender exclusions Prevent counts as covering
-    the data root. Watch's, Fix's and Prevent's functions are pulled out of
+    the data root, and its Defender step, with Defender faked. Watch's,
+    Fix's and Prevent's functions are pulled out of
     their scripts with the language parser, so the code under test is the
     shipped code, not a copy.
 
@@ -61,6 +62,20 @@ function Get-FunctionSource {
 $watchPath = Join-Path $Root 'Watch-ClaudeHealth.ps1'
 foreach ($fn in @('Test-ClaudeCodeActive', 'Sync-ClaudeDataPaths', 'Get-StealthMarkerPath', 'Test-CoworkSessionActive')) {
     . ([scriptblock]::Create((Get-FunctionSource $watchPath $fn)))
+}
+
+# The sessions the app started are read from live processes, which a fixture
+# cannot make, and the real ones on the machine running this would answer
+# every case below. Test-ProcessInventory drives the real function against
+# fake processes; here it answers from $script:AppCli, or throws when
+# $script:AppCliThrows is set. Defined after the region, so it wins.
+$script:AppCli       = @()
+$script:AppCliThrows = $false
+function Get-ClaudeAppCliProcess {
+    param($Environment)
+    $null = $Environment
+    if ($script:AppCliThrows) { throw 'WMI is not answering' }
+    return @($script:AppCli)
 }
 
 function Test-StartsWith {
@@ -220,6 +235,19 @@ try {
     $env:CLAUDE_CONFIG_DIR = $cfg
     Assert-Case "the same transcript under CLAUDE_CONFIG_DIR: active" (Test-ClaudeCodeActive)
     Remove-Item Env:\CLAUDE_CONFIG_DIR
+
+    # A session the app started counts by its process alone. One waiting on a
+    # long command uses no CPU and writes nothing anywhere this reads.
+    $script:AppCli = @([pscustomobject]@{ Id = 201 })
+    Assert-Case "an app-started CLI, every other signal old: active" (Test-ClaudeCodeActive)
+    $script:AppCli = @()
+    $script:AppCliThrows = $true
+    $logBefore = @($script:WatchLogLines).Count
+    Assert-Case "the app's sessions cannot be listed: active (fails closed)" (Test-ClaudeCodeActive)
+    Assert-Case "and the log says why" (@(@($script:WatchLogLines) | Select-Object -Skip $logBefore |
+        Where-Object { $_ -match 'WMI is not answering.*assuming a Code session IS active' }).Count -eq 1)
+    $script:AppCliThrows = $false
+    Assert-Case "no app session and every signal old: not active" (-not (Test-ClaudeCodeActive))
 
     # -----------------------------------------------------------------
     Write-Host ""
@@ -526,6 +554,12 @@ $preventPath = Join-Path $Root 'Prevent-ClaudeIssues.ps1'
 $coversSrc = $null
 try { $coversSrc = Get-FunctionSource $preventPath 'Test-DefenderExclusionCovers' } catch { $null = $_ }
 Assert-Case "Test-DefenderExclusionCovers was found in Prevent" ($null -ne $coversSrc)
+# The step asks Test-DefenderListHidden of each list before it reads it. It
+# looks only at the list it is given, so it is lifted as it is, not faked.
+$hiddenSrc = $null
+try { $hiddenSrc = Get-FunctionSource $preventPath 'Test-DefenderListHidden' } catch { $null = $_ }
+Assert-Case "Test-DefenderListHidden was found in Prevent" ($null -ne $hiddenSrc)
+if ($hiddenSrc) { . ([scriptblock]::Create($hiddenSrc)) }
 $preventText = [System.IO.File]::ReadAllText($preventPath)
 Assert-Case "the needed-paths loop asks Test-DefenderExclusionCovers" `
     ($preventText -match '(?s)foreach \(\$np in \$neededPaths\) \{\s*if \(-not \(Test-DefenderExclusionCovers -Path \$np -Exclusions \$exclusions\)\)')
@@ -565,7 +599,9 @@ if ($coversSrc) {
 
 # Then the step itself: its try block, lifted out of Prevent and run with
 # Get-MpPreference and Add-MpPreference faked, so nothing real is read or
-# changed.
+# changed. Since 6.3.0 every exclusion is written to the undo record before it
+# is added, and taken out again when adding it fails, so -Undo removes the
+# ones Prevent added and no others; the fakes below record both.
 Write-Host ""
 Write-Host "--- Prevent: the Defender exclusion step"
 $preventAst = [System.Management.Automation.Language.Parser]::ParseFile($preventPath, [ref]$null, [ref]$null)
@@ -581,27 +617,47 @@ if ($defTry.Count -eq 1) {
     $vmms   = "$env:SystemRoot\System32\vmms.exe"
     $allProcs = @('vmwp.exe', 'vmms.exe', 'vmcompute.exe', 'CoworkVMService.exe')
     $runStep = {
-        param([string[]]$Paths, [string[]]$Procs)
+        param([string[]]$Paths, [string[]]$Procs, [string[]]$FailOn = @(), [switch]$ReadFails)
         & {
             $state = @{ Paths = [System.Collections.ArrayList]@($Paths); Procs = [System.Collections.ArrayList]@($Procs)
-                        AddedPaths = @(); AddedProcs = @(); Logged = @() }
+                        AddedPaths = @(); AddedProcs = @(); Logged = @()
+                        Records = (New-Object System.Collections.ArrayList); Statuses = @() }
             function Get-MpPreference {
                 param($ErrorAction)
                 $null = $ErrorAction
+                if ($ReadFails) { throw "Get-MpPreference: access denied" }
                 [pscustomobject]@{ ExclusionPath = @($state.Paths); ExclusionProcess = @($state.Procs) }
             }
             function Add-MpPreference {
                 param([string[]]$ExclusionPath, [string[]]$ExclusionProcess, $ErrorAction)
                 $null = $ErrorAction
+                foreach ($x in @($ExclusionPath) + @($ExclusionProcess)) {
+                    if ($x -and $FailOn -contains $x) { throw "Add-MpPreference: refused $x" }
+                }
                 foreach ($x in @($ExclusionPath))    { if ($x) { $state.AddedPaths += $x; $null = $state.Paths.Add($x) } }
                 foreach ($x in @($ExclusionProcess)) { if ($x) { $state.AddedProcs += $x; $null = $state.Procs.Add($x) } }
             }
             function Log { param([string]$Message, [string]$Colour, [switch]$Indent) $null = $Colour, $Indent; $state.Logged += $Message }
+            function Add-PreventUndoItem {
+                param([string]$Kind, [string]$Key, $Original)
+                $null = $Original
+                $null = $state.Records.Add("${Kind}|${Key}")
+            }
+            function Clear-PreventUndoItem {
+                param([string]$Kind, [string]$Key)
+                $state.Records.Remove("${Kind}|${Key}")
+            }
+            function Add-StepResult {
+                param([string]$Status, [string]$Detail, [switch]$Reboot)
+                $null = $Detail, $Reboot
+                $state.Statuses += $Status
+            }
             $ClaudeDataRoot = $dr
             $ServiceExe     = 'CoworkVMService'
             . ([scriptblock]::Create($stepText))
             [pscustomobject]@{ AddedPaths = ($state.AddedPaths -join ','); AddedProcs = ($state.AddedProcs -join ',')
-                               Logged = ($state.Logged -join ' | ') }
+                               Logged = ($state.Logged -join ' | '); Records = (@($state.Records) -join ',')
+                               Statuses = (@($state.Statuses | Sort-Object -Unique) -join ',') }
         }
     }
 
@@ -610,22 +666,55 @@ if ($defTry.Count -eq 1) {
     $r = & $runStep @("$U\Claude", $hyperV, $vmwp, $vmms) $allProcs
     Assert-Case "with only %LOCALAPPDATA%\Claude excluded, the data root is added" ($r.AddedPaths -eq $dr) "added $($r.AddedPaths)"
     Assert-Case "and nothing else" ($r.AddedProcs -eq '') "added processes $($r.AddedProcs)"
+    Assert-Case "and it is in the undo record" ($r.Records -eq "DefenderPath|$dr") "recorded $($r.Records)"
+    Assert-Case "and the step reports it done" ($r.Statuses -eq 'Done,Unchanged') "statuses $($r.Statuses)"
 
     $r = & $runStep @("$U\Claude-Data", $hyperV, $vmwp, $vmms) $allProcs
     Assert-Case "with everything excluded, nothing is added" ($r.AddedPaths -eq '' -and $r.AddedProcs -eq '') `
         "added $($r.AddedPaths) / $($r.AddedProcs)"
     Assert-Case "and it says so" ($r.Logged -match 'path exclusions already configured' -and
                                   $r.Logged -match 'process exclusions already configured') "logged: $($r.Logged)"
+    Assert-Case "and records nothing, so -Undo leaves exclusions it did not add" ($r.Records -eq '') "recorded $($r.Records)"
+    Assert-Case "and reports nothing changed" ($r.Statuses -eq 'Unchanged') "statuses $($r.Statuses)"
 
     $r = & $runStep @("$U\Claude-Data", $hyperV, $vmwp, $vmms) @('vmwp.exe')
     Assert-Case "with every path excluded, missing process exclusions are still added" `
         ($r.AddedPaths -eq '' -and $r.AddedProcs -eq 'vmms.exe,vmcompute.exe,CoworkVMService.exe') "added $($r.AddedPaths) / $($r.AddedProcs)"
     Assert-Case "and verified" ($r.Logged -match 'All process exclusions verified') "logged: $($r.Logged)"
+    Assert-Case "and those three are in the undo record" (
+        $r.Records -eq 'DefenderProcess|vmms.exe,DefenderProcess|vmcompute.exe,DefenderProcess|CoworkVMService.exe') "recorded $($r.Records)"
 
     $r = & $runStep @() @()
     Assert-Case "with no exclusions, all four paths and four processes are added" (
         $r.AddedPaths -eq (@($dr, $hyperV, $vmwp, $vmms) -join ',') -and
         $r.AddedProcs -eq ($allProcs -join ',')) "added $($r.AddedPaths) / $($r.AddedProcs)"
+    Assert-Case "and all eight are in the undo record" (@($r.Records -split ',').Count -eq 8) "recorded $($r.Records)"
+
+    # An exclusion Defender refuses is taken back out of the record, so -Undo
+    # does not try to remove what was never added, and the step fails.
+    $r = & $runStep @() @() @($vmwp, 'vmcompute.exe')
+    Assert-Case "a refused path is not added" ($r.AddedPaths -eq (@($dr, $hyperV, $vmms) -join ',')) "added $($r.AddedPaths)"
+    Assert-Case "a refused path and process are not left in the undo record" (
+        $r.Records -notmatch [regex]::Escape($vmwp) -and $r.Records -notmatch 'vmcompute' -and
+        @($r.Records -split ',').Count -eq 6) "recorded $($r.Records)"
+    Assert-Case "and the step fails" ($r.Statuses -match 'Failed') "statuses $($r.Statuses)"
+
+    # Until 6.3.0 Get-MpPreference was read with SilentlyContinue, so a Defender
+    # that could not be read looked like one with nothing excluded.
+    $r = & $runStep @() @() -ReadFails
+    Assert-Case "a Defender that cannot be read adds nothing" ($r.AddedPaths -eq '' -and $r.AddedProcs -eq '') "added $($r.AddedPaths) / $($r.AddedProcs)"
+    Assert-Case "records nothing" ($r.Records -eq '') "recorded $($r.Records)"
+    Assert-Case "and fails the step" ($r.Statuses -eq 'Failed') "statuses $($r.Statuses)"
+
+    # A list Defender hides from administrators holds only its "N/A"
+    # placeholder, which says nothing of what is excluded.
+    $na = 'N/A: Must be an administrator to view exclusions'
+    $r = & $runStep @($na) @($na)
+    Assert-Case "lists Defender hides: nothing is added" ($r.AddedPaths -eq '' -and $r.AddedProcs -eq '') "added $($r.AddedPaths) / $($r.AddedProcs)"
+    Assert-Case "nothing is recorded, so -Undo removes nothing" ($r.Records -eq '') "recorded $($r.Records)"
+    Assert-Case "and the step warns, once for each list" ($r.Statuses -eq 'Unchanged,Warning' -and
+        $r.Logged -match 'which path exclusions exist; none were added' -and
+        $r.Logged -match 'which process exclusions exist; none were added') "statuses $($r.Statuses); logged: $($r.Logged)"
 }
 
 Write-Host ""
