@@ -8,6 +8,35 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.3.3] - 2026-11-23
+
+Prevent's step 6, network adapter power saving, no longer warns on every run
+that "Allow the computer to turn off this device to save power" still reads
+on, on an adapter where it is off. Run `Prevent-ClaudeIssues.bat` again; this
+fix needs no restart.
+
+### Fixed
+
+- "Allow the computer to turn off this device to save power" is read the way
+  Device Manager reads it.
+
+  Step 6 read `MSPower_DeviceEnable` for the whole class and took each
+  adapter's setting from that list. On a driver built on NetAdapterCx, such
+  as Realtek's 2.5GbE `rt25cx21`, NDIS answers that list, while the driver
+  framework, which holds the setting, answers a read of one instance.
+  Measured on the PC this was written for, after 6.3.2 had cleared the box
+  and Windows had restarted: the list read `True`, the instance `False`, and
+  Device Manager showed the box cleared. So every run recorded the box as on,
+  cleared it again, and warned that it "still reads on until Windows
+  restarts", which no restart changed. Each instance is now read by itself
+  (`Get-CimInstance -InputObject`), both to decide and to check, on physical,
+  hidden and virtual adapters alike. An instance that cannot be read that
+  way is named in a warning and not written. A box that really does not take
+  now warns that it "still reads on after it was cleared", and promises no
+  restart. `-Undo`, turning "Allow this device to wake the computer" back on
+  for adapters a version before 6.3.0 touched, reads each instance the same
+  way.
+
 ## [6.3.2] - 2026-11-23
 
 Prevent's step 6, network adapter power saving, no longer fails on the

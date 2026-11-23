@@ -1047,13 +1047,48 @@ function Get-Process {
     }
     return @($script:Procs)
 }
+# The MSPower instances. A read of the whole class returns a copy of each,
+# as CIM does, stamped with its class. Where $script:DevEnableListed or
+# $script:WakeEnableListed names an instance, the class read gives that
+# Enable whatever the instance holds: on a NetAdapterCx driver NDIS answers
+# the class read and the driver framework the instance (measured on this
+# PC: the Realtek's class read True and its instance False). -InputObject
+# reads one instance by itself, as CIM GetInstance does: what it holds. A
+# name in $script:DevEnableReadFault cannot be read that way. Every
+# instance read is in $script:CimCalls as "<class> GetInstance <name>".
+function Copy-FakePowerInstance {
+    param($Instance, [string]$Class, [hashtable]$Listed)
+    $e = $Instance.Enable
+    $n = [string]$Instance.InstanceName
+    if ($null -ne $Listed -and $Listed.ContainsKey($n)) { $e = $Listed[$n] }
+    return [pscustomobject]@{ InstanceName = $Instance.InstanceName; Enable = $e; FakeClass = $Class }
+}
+function Get-FakePowerPool {
+    param($Instance)
+    $c = $Instance.PSObject.Properties['FakeClass']
+    if ($null -ne $c -and $c.Value -eq 'MSPower_DeviceWakeEnable') { return @($script:WakeEnable) }
+    return @($script:DevEnable)
+}
 function Get-CimInstance {
     [CmdletBinding()]
-    param([Parameter(Position = 0)][string]$ClassName, [string]$Namespace, [string]$Filter)
+    param([Parameter(Position = 0)][string]$ClassName, [string]$Namespace, [string]$Filter, $InputObject)
+    if ($PSBoundParameters.ContainsKey('InputObject')) {
+        $c = $InputObject.PSObject.Properties['FakeClass']
+        $cls = 'MSPower_DeviceEnable'
+        if ($null -ne $c) { $cls = [string]$c.Value }
+        $n = [string]$InputObject.InstanceName
+        [void]$script:CimCalls.Add("$cls GetInstance $n")
+        if (@($script:DevEnableReadFault) -contains $n) { Write-Error -Message 'Generic failure ' -Category NotSpecified; return }
+        foreach ($d in (Get-FakePowerPool $InputObject)) {
+            if ([string]$d.InstanceName -eq $n) { return (Copy-FakePowerInstance $d $cls $null) }
+        }
+        Write-Error -Message 'Not found ' -Category ObjectNotFound
+        return
+    }
     [void]$script:CimCalls.Add($ClassName)
     if ($ClassName -eq 'MSPower_DeviceEnable') {
         if ($script:DevEnableThrows) { throw 'Invalid namespace'; return }
-        return @($script:DevEnable)
+        return @($script:DevEnable | ForEach-Object { Copy-FakePowerInstance $_ 'MSPower_DeviceEnable' $script:DevEnableListed })
     }
     # $script:AvReadCim is the CIM error the antivirus read writes, and
     # $script:AvReadFault one that is not a CIM error.
@@ -1083,7 +1118,7 @@ function Get-CimInstance {
             $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new($f.Exception, $f.Id, $f.Category, $null))
             return
         }
-        return @($script:WakeEnable)
+        return @($script:WakeEnable | ForEach-Object { Copy-FakePowerInstance $_ 'MSPower_DeviceWakeEnable' $script:WakeEnableListed })
     }
     if ($ClassName -eq 'Win32_Process' -and $Filter -match 'powershell\.exe') {
         if ($script:PsProcsFault) { Write-Error -Message 'The RPC server is unavailable.' -Category ResourceUnavailable; return }
@@ -1102,7 +1137,12 @@ function Set-CimInstance {
     process {
         [void]$script:NicCalls.Add("Set-CimInstance $($InputObject.InstanceName) Enable=$($Property['Enable'])")
         if ($script:SetCimThrows) { throw 'Access denied'; return }
-        if (-not $script:SetCimNoop) { $InputObject.Enable = [bool]$Property['Enable'] }
+        if (-not $script:SetCimNoop) {
+            $InputObject.Enable = [bool]$Property['Enable']
+            foreach ($d in (Get-FakePowerPool $InputObject)) {
+                if ([string]$d.InstanceName -eq [string]$InputObject.InstanceName) { $d.Enable = [bool]$Property['Enable'] }
+            }
+        }
     }
 }
 
@@ -1834,6 +1874,9 @@ function Reset-State {
     $script:HiddenNicThrows = $false
     $script:DevEnable      = @()
     $script:DevEnableThrows = $false
+    $script:DevEnableListed = @{}
+    $script:WakeEnableListed = @{}
+    $script:DevEnableReadFault = @()
     $script:SetCimThrows   = $false
     $script:SetCimNoop     = $false
     $script:DrvKeys        = @{}
@@ -2021,7 +2064,7 @@ $preventFns = @(
     'Get-CoworkHcsGuids', 'Get-CoworkWorkerProcessIds', 'Get-VmWorkerGuid', 'Get-CoworkHcsSurvivors',
     'Get-W32tmOffsetSeconds', 'Write-Box', 'Write-UndoOutcome', 'Get-PreventUndoItemLabel', 'Move-ForeignPreventUndo',
     'Get-PreventMachineGuid', 'Test-DefenderListHidden', 'Test-DefenderExclusionCovers', 'Get-PreventNicAdvanced',
-    'Get-PreventNicPower', 'Test-PowerSettingGone', 'Add-LegacyInstallRecord', 'Get-LegacyInstallTrace',
+    'Get-PreventNicPower', 'Get-PreventDeviceEnable', 'Test-PowerSettingGone', 'Add-LegacyInstallRecord', 'Get-LegacyInstallTrace',
     'Get-ClaudeVmWithoutDynamicMemory', 'Remove-PreventTask', 'Remove-PreventTaskFolder', 'Remove-PreventFile',
     'Test-CoworkNat', 'Test-WinNatMissingError', 'Install-HealthMonitorTask', 'Test-CimClassMissingError',
     'Test-ClaudeNotFoundError', 'Get-ClaudeErrorText', 'Get-ClaudeServiceOrNull', 'Get-ClaudeProcessByName',
@@ -3177,6 +3220,98 @@ function Get-FakeDevEnable {
     return $null
 }
 
+Invoke-Section 'Network adapter power saving: each checkbox read by itself (6.3.3)' {
+    # Measured on this PC after 6.3.2 had run and Windows had restarted: the
+    # Realtek's "allow the computer to turn off this device" read True from a
+    # read of the whole class and False read by itself, as Device Manager
+    # showed it. 6.3.2 decided and checked by the class read, so every run
+    # warned, recorded it and cleared it again.
+    $ethLabel = 'Ethernet (Realtek Gaming 2.5GbE Family Controller)'
+
+    Reset-State
+    Set-NicFixture
+    $script:DevEnable[0].Enable = $false
+    $script:DevEnableListed["${ethPnp}_0"] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a checkbox the class read gives as on and the instance as off is taken as off: not written, not recorded, no warning" (
+        @($script:NicCalls | Where-Object { $_ -like "Set-CimInstance ${ethPnp}_0 *" }).Count -eq 0 -and
+        $null -eq (Find-Undo 'NicDeviceEnable' $ethPnp) -and -not ((Get-StepNotes) -match 'allow the computer') -and
+        -not ((Get-StepNotes) -match 'could not read')) "$(Get-StepNotes); $($script:NicCalls -join ' / ')"
+    Assert-Case "and it was read by itself" (@($script:CimCalls) -contains "MSPower_DeviceEnable GetInstance ${ethPnp}_0") ($script:CimCalls -join ' / ')
+
+    Reset-State
+    Set-NicFixture
+    $script:DevEnableListed["${ethPnp}_0"] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a checkbox that is on is cleared and checked by itself: changed, with no warning, though the class read still gives it as on" (
+        (Get-FakeDevEnable "${ethPnp}_0") -eq $false -and
+        @($script:NicCalls | Where-Object { $_ -eq "Set-CimInstance ${ethPnp}_0 Enable=False" }).Count -eq 1 -and
+        (Test-LogHas ('^\+ ' + [regex]::Escape('Windows may no longer turn it off to save power') + '$')) -and
+        -not ((Get-StepNotes) -match 'still reads on')) "$(Get-StepNotes); $($script:LogLines -join ' / ')"
+    Assert-Case "and recorded as on" ((Find-Undo 'NicDeviceEnable' $ethPnp).Original -eq $true)
+
+    Reset-State
+    Set-NicFixture
+    $script:DevEnableListed["${ethPnp}_0"] = $false
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a checkbox the class read gives as off and the instance as on is still cleared" ((Get-FakeDevEnable "${ethPnp}_0") -eq $false -and
+        (Find-Undo 'NicDeviceEnable' $ethPnp).Original -eq $true) "$(Get-StepNotes); $($script:NicCalls -join ' / ')"
+
+    Reset-State
+    Set-NicFixture
+    $script:DevEnableReadFault = @("${ethPnp}_0")
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    $s = Get-LastStep
+    Assert-Case "a checkbox that cannot be read by itself is not written or recorded: a warning naming the adapter and why, the rest still done" (
+        $s.Status -eq 'Warning' -and
+        (Get-StepNotes) -match [regex]::Escape("${ethLabel}: could not read whether Windows may turn it off: Generic failure") -and
+        @($script:NicCalls | Where-Object { $_ -like "Set-CimInstance ${ethPnp}_0 *" }).Count -eq 0 -and
+        $null -eq (Find-Undo 'NicDeviceEnable' $ethPnp) -and (Get-FakeDevEnable "${ethPnp}_0") -eq $true -and
+        @($script:NicCalls | Where-Object { $_ -like 'Set-Adv *' }).Count -eq 4) "$(Get-StepNotes); $($script:NicCalls -join ' / ')"
+
+    Reset-State
+    Set-NicFixture
+    $script:SetCimNoop = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a checkbox that does not take: a warning that says it still reads on after it was cleared, and no restart promised to fix it" (
+        (Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -match [regex]::Escape("${ethLabel}: 'allow the computer to turn off this device' still reads on after it was cleared") -and
+        -not ((Get-StepNotes) -match 'until Windows restarts')) (Get-StepNotes)
+
+    # The hidden and virtual adapters, the same way.
+    Reset-State
+    Set-NicMoreFixture
+    foreach ($d in $script:DevEnable) { if ($d.InstanceName -eq "${wfd1}_0") { $d.Enable = $false } }
+    $script:DevEnableListed["${wfd1}_0"] = $true
+    $script:DevEnableListed["${wfd2}_0"] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a hidden adapter the class read gives as on and the instance as off is left alone, with no record and no line" (
+        @($script:NicCalls | Where-Object { $_ -like "Set-CimInstance ${wfd1}_0 *" }).Count -eq 0 -and
+        $null -eq (Find-Undo 'NicDeviceEnable' $wfd1) -and
+        @($script:LogLines | Where-Object { ([string]$_).Contains('Local Area Connection* 1 (') }).Count -eq 0) "$($script:LogLines -join ' / ')"
+    Assert-Case "a hidden adapter that is on is cleared and checked by itself: done, though the class read still gives it as on" (
+        (Get-FakeDevEnable "${wfd2}_0") -eq $false -and
+        (Get-StepNotes) -match [regex]::Escape("Local Area Connection* 2 (Microsoft Wi-Fi Direct Virtual Adapter #2), a hidden adapter: Windows may no longer turn it off to save power") -and
+        -not ((Get-StepNotes) -match 'still reads on')) (Get-StepNotes)
+
+    Reset-State
+    Set-NicMoreFixture
+    $script:DevEnableReadFault = @("${wfd1}_0")
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a hidden adapter that cannot be read by itself: a warning naming it and why, not written, and the other one still cleared" (
+        (Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -match [regex]::Escape("Local Area Connection* 1 (Microsoft Wi-Fi Direct Virtual Adapter), a hidden adapter: could not read whether Windows may turn it off: Generic failure") -and
+        @($script:NicCalls | Where-Object { $_ -like "Set-CimInstance ${wfd1}_0 *" }).Count -eq 0 -and $null -eq (Find-Undo 'NicDeviceEnable' $wfd1) -and
+        (Get-FakeDevEnable "${wfd2}_0") -eq $false) "$(Get-StepNotes); $($script:NicCalls -join ' / ')"
+}
+
 Invoke-Section 'Network adapter power saving: the framework idle power-down, hidden options, hidden and virtual adapters' {
     Reset-State
     Set-NicMoreFixture
@@ -3489,8 +3624,8 @@ Invoke-Section 'Network adapter power saving: the framework idle power-down, hid
         $null -eq (Find-Undo 'NicDeviceEnable' $wfd1) -and $null -eq (Find-Undo 'NicDeviceEnable' $wfd2) -and
         -not ($script:LogLines -match 'hidden') -and -not ((Get-StepNotes) -match 'hidden')) ($script:LogLines -join ' / ')
 
-    # Windows' own read-back can lag: the physical adapter's checkbox still
-    # reads on, and it is not taken again as a hidden one.
+    # A checkbox that does not take: the physical adapter's still reads on,
+    # and it is not taken again as a hidden one.
     Reset-State
     Set-NicMoreFixture
     $script:SetCimNoop = $true
@@ -3500,7 +3635,7 @@ Invoke-Section 'Network adapter power saving: the framework idle power-down, hid
     Assert-Case "a physical adapter whose checkbox still reads on is not taken again as a hidden one" ($ethSets.Count -eq 1 -and
         -not ($script:LogLines -match 'Realtek.*hidden adapter')) ($script:NicCalls -join ' / ')
     Assert-Case "a hidden adapter whose checkbox still reads on: a warning that says so" ((Get-StepStatus) -eq 'Warning' -and
-        (Get-StepNotes) -match [regex]::Escape("Local Area Connection* 2 (Microsoft Wi-Fi Direct Virtual Adapter #2), a hidden adapter: 'allow the computer to turn off this device' still reads on until Windows restarts")) (Get-StepNotes)
+        (Get-StepNotes) -match [regex]::Escape("Local Area Connection* 2 (Microsoft Wi-Fi Direct Virtual Adapter #2), a hidden adapter: 'allow the computer to turn off this device' still reads on after it was cleared")) (Get-StepNotes)
 
     # The same, with no ConnectorPresent on the physical adapters: the
     # -Physical list's device ids alone leave them out of the hidden ones.
@@ -3514,8 +3649,8 @@ Invoke-Section 'Network adapter power saving: the framework idle power-down, hid
     Assert-Case "a physical adapter with no ConnectorPresent is known by its device id, and not taken again as a hidden one" ($ethSets.Count -eq 1 -and
         -not ($script:LogLines -match 'Realtek.*hidden adapter')) ($script:NicCalls -join ' / ')
 
-    # The same adapter listed twice, with the read-back lagging so that its
-    # checkbox still reads on the second time; and Teredo, with no device
+    # The same adapter listed twice, with its checkbox not taking so that
+    # it still reads on the second time; and Teredo, with no device
     # id, beside an instance whose name an empty id would match.
     Reset-State
     Set-NicMoreFixture
@@ -5222,6 +5357,32 @@ Invoke-Section "-Undo step 2: an older version's wake settings on a network adap
     Assert-Case "no device can wake the computer (Not supported): the wake options go back on, the 24 is removed, and nothing fails" ((Get-StepStatus) -eq 'Done' -and
         $disp -eq $both -and @($script:NicCalls | Where-Object { $_.StartsWith('Set-CimInstance ') }).Count -eq 0 -and
         -not (Test-FakeRegValue $enumKey 'PnPCapabilities')) "$(Get-StepStatus): $(Get-StepNotes); $($script:NicCalls -join ' / ')"
+
+    # 'Allow this device to wake the computer' is read by itself (6.3.3): on
+    # a NetAdapterCx driver the class read is NDIS's answer, not the setting.
+    Set-LegacyWakeFixture
+    $script:WakeEnableListed["${ethPnp}_0"] = $true
+    Invoke-UndoStep2
+    $cim = @($script:NicCalls | Where-Object { $_.StartsWith('Set-CimInstance ') }) -join ' / '
+    Assert-Case "wake the class read gives as on and the instance as off goes back on" ($cim -eq "Set-CimInstance ${ethPnp}_0 Enable=True" -and
+        $script:WakeEnable[0].Enable -eq $true -and (Get-StepStatus) -eq 'Done' -and
+        @($script:CimCalls) -contains "MSPower_DeviceWakeEnable GetInstance ${ethPnp}_0") "$cim; $($script:CimCalls -join ' / ')"
+
+    Reset-State
+    Set-NicFixture
+    Set-FakeRegValue $enumKey 'PnPCapabilities' ([int]24)
+    $script:WakeEnable = @([pscustomobject]@{ InstanceName = "${ethPnp}_0"; Enable = $true })
+    $script:WakeEnableListed["${ethPnp}_0"] = $false
+    Invoke-UndoStep2
+    Assert-Case "wake the class read gives as off and the instance as on is not set" ($script:NicCalls.Count -eq 0 -and (Get-StepStatus) -eq 'Done' -and
+        -not (Test-FakeRegValue $enumKey 'PnPCapabilities')) "$(Get-StepStatus): $($script:NicCalls -join ' / ')"
+
+    Set-LegacyWakeFixture
+    $script:DevEnableReadFault = @("${ethPnp}_0")
+    Invoke-UndoStep2
+    Assert-Case "wake that cannot be read by itself: Failed, naming the adapter and why, nothing set, and the 24 stays" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -match [regex]::Escape("${label}: Generic failure") -and (Get-FakeRegValue $enumKey 'PnPCapabilities') -eq 24 -and
+        @($script:NicCalls | Where-Object { $_.StartsWith('Set-CimInstance ') }).Count -eq 0) "$(Get-StepStatus): $(Get-StepNotes); $($script:NicCalls -join ' / ')"
 }
 
 # =====================================================================

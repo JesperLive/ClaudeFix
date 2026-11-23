@@ -57,7 +57,7 @@
     -Undo also exits 1 while a setting is still in the undo record.
     -WhatIf is refused: this script cannot preview its changes.
 
-    Version : 6.3.2
+    Version : 6.3.3
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -1569,7 +1569,7 @@ function Get-W32tmOffsetSeconds {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.3.2"
+$ToolkitVersion   = "6.3.3"
 $TaskName         = "ClaudeCoworkWatchdog"
 # The logon-time fix task, retired in 6.3.0. Setup removes it where an older
 # version installed it, and so does -Undo.
@@ -3551,6 +3551,33 @@ function Get-PreventNicPower {
     $rows | Where-Object { [string]$_.Name -eq $Name }
 }
 
+function Get-PreventDeviceEnable {
+    <#
+    .SYNOPSIS
+        Whether one MSPower_DeviceEnable or MSPower_DeviceWakeEnable
+        instance reads on, read by itself.
+    .DESCRIPTION
+        The instance is read on its own, with Get-CimInstance -InputObject,
+        which is how Device Manager reads it, and never taken from a read of
+        the whole class. On an adapter whose driver is built on NetAdapterCx,
+        such as Realtek's 2.5GbE rt25cx21, the driver framework answers a
+        read of one instance, and it holds the setting; NDIS answers a read
+        of the whole class, and it does not. Measured on this PC after 6.3.2
+        had cleared "Allow the computer to turn off this device to save
+        power" on the Realtek and Windows had restarted: the class read True,
+        the instance False, and Device Manager showed the box cleared. Until
+        6.3.3 the class read decided and checked this switch, so every run
+        warned that the box "still reads on until Windows restarts", which a
+        restart never changed, recorded it as on, and cleared it again.
+
+        A read that fails, or that returns nothing, throws.
+    #>
+    param([Parameter(Mandatory)]$Instance)
+    $one = @(Get-CimInstance -InputObject $Instance -ErrorAction Stop)
+    if ($one.Count -eq 0) { throw "Windows returned nothing for $([string]$Instance.InstanceName)." }
+    return [bool]$one[0].Enable
+}
+
 function Disable-NicPowerSaving {
     <#
     .SYNOPSIS
@@ -3562,7 +3589,10 @@ function Disable-NicPowerSaving {
 
         1. "Allow the computer to turn off this device to save power", the
            checkbox on the adapter's Power Management tab. In WMI that is
-           MSPower_DeviceEnable, which is what the checkbox reads and writes.
+           MSPower_DeviceEnable. Each instance is read by itself, as Device
+           Manager reads it, to decide whether to clear it and to check that
+           it took: on some drivers a read of the whole class gives another
+           answer (see Get-PreventDeviceEnable).
         2. IdleInWorkingState in the WDF key under the device's Enum key,
            Enum\<device id>\Device Parameters\WDF. A driver written on the
            Windows Driver Framework reads it to decide whether it may power
@@ -3656,23 +3686,32 @@ function Disable-NicPowerSaving {
         Log $label -Colour Cyan -Indent
 
         try {
-            # 1. Allow the computer to turn off this device to save power
+            # 1. Allow the computer to turn off this device to save power.
+            #    The class read above names the adapter's instances; each is
+            #    then read by itself, before it is cleared and after, since
+            #    on some drivers the class read gives another answer (see
+            #    Get-PreventDeviceEnable). One that cannot be read is not
+            #    written.
             if ($null -ne $devEnableError) {
                 $null = $warned.Add("could not read whether Windows may turn it off: $devEnableError")
             } else {
                 $inst = @($devEnable | Where-Object { ([string]$_.InstanceName).StartsWith($pnp + '_', [StringComparison]::OrdinalIgnoreCase) })
                 foreach ($in in $inst) {
-                    if (-not $in.Enable) { continue }
+                    try {
+                        $on = Get-PreventDeviceEnable -Instance $in
+                    } catch {
+                        $null = $warned.Add("could not read whether Windows may turn it off: $($_.Exception.Message)")
+                        continue
+                    }
+                    if (-not $on) { continue }
                     Add-PreventUndoItem -Kind NicDeviceEnable -Key $pnp -Original $true
                     try {
                         $in | Set-CimInstance -Property @{ Enable = $false } -ErrorAction Stop
                         $wrote = $true
-                        $after = @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction Stop |
-                                   Where-Object { $_.InstanceName -eq $in.InstanceName })
-                        if ($after.Count -gt 0 -and -not $after[0].Enable) {
+                        if (-not (Get-PreventDeviceEnable -Instance $in)) {
                             $null = $changed.Add("Windows may no longer turn it off to save power")
                         } else {
-                            $null = $warned.Add("'allow the computer to turn off this device' still reads on until Windows restarts")
+                            $null = $warned.Add("'allow the computer to turn off this device' still reads on after it was cleared")
                         }
                     } catch {
                         $null = $failed.Add("'allow the computer to turn off this device': $($_.Exception.Message)")
@@ -3883,8 +3922,8 @@ function Disable-NicPowerSaving {
     }
     foreach ($h in $hidden) {
         $hPnp = [string]$h.PnPDeviceID
-        $hOn = @($devEnable | Where-Object { $_.Enable -and ([string]$_.InstanceName).StartsWith($hPnp + '_', [StringComparison]::OrdinalIgnoreCase) })
-        if ($hOn.Count -eq 0) { continue }
+        $hInst = @($devEnable | Where-Object { ([string]$_.InstanceName).StartsWith($hPnp + '_', [StringComparison]::OrdinalIgnoreCase) })
+        if ($hInst.Count -eq 0) { continue }
         # Hidden is read only where the adapter has it: one without it counts
         # as not hidden, and under StrictMode reading a property an object
         # lacks throws.
@@ -3892,18 +3931,33 @@ function Disable-NicPowerSaving {
         $hKind = 'a virtual adapter'
         if ($null -ne $hHidden -and $hHidden.Value -eq $true) { $hKind = 'a hidden adapter' }
         $hLabel = "$($h.Name) ($($h.InterfaceDescription)), $hKind"
+        # Each instance is read by itself, as on the physical adapters (see
+        # Get-PreventDeviceEnable). One that cannot be read is said and not
+        # written; the others are still taken.
+        $hOn = @()
+        $hReadError = $null
+        foreach ($hi in $hInst) {
+            try {
+                if (Get-PreventDeviceEnable -Instance $hi) { $hOn += $hi }
+            } catch {
+                $hReadError = $_.Exception.Message
+            }
+        }
+        if ($null -ne $hReadError) {
+            Log "! ${hLabel}: could not read whether Windows may turn it off: $hReadError" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail "${hLabel}: could not read whether Windows may turn it off: $hReadError"
+        }
+        if ($hOn.Count -eq 0) { continue }
         try {
             Add-PreventUndoItem -Kind NicDeviceEnable -Key $hPnp -Original $true
             $hOn | Set-CimInstance -Property @{ Enable = $false } -ErrorAction Stop
-            $hNames = @($hOn | ForEach-Object { [string]$_.InstanceName })
-            $hAfter = @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction Stop |
-                        Where-Object { $hNames -contains [string]$_.InstanceName })
-            if ($hAfter.Count -gt 0 -and @($hAfter | Where-Object { $_.Enable }).Count -eq 0) {
+            $hStill = @($hOn | Where-Object { Get-PreventDeviceEnable -Instance $_ })
+            if ($hStill.Count -eq 0) {
                 Log "+ ${hLabel}: Windows may no longer turn it off to save power" -Colour Green -Indent
                 Add-StepResult -Status Done -Detail "${hLabel}: Windows may no longer turn it off to save power" -Reboot
             } else {
-                Log "! ${hLabel}: 'allow the computer to turn off this device' still reads on until Windows restarts" -Colour Yellow -Indent
-                Add-StepResult -Status Warning -Detail "${hLabel}: 'allow the computer to turn off this device' still reads on until Windows restarts" -Reboot
+                Log "! ${hLabel}: 'allow the computer to turn off this device' still reads on after it was cleared" -Colour Yellow -Indent
+                Add-StepResult -Status Warning -Detail "${hLabel}: 'allow the computer to turn off this device' still reads on after it was cleared" -Reboot
             }
         } catch {
             Log "[!] ${hLabel}: 'allow the computer to turn off this device': $($_.Exception.Message)" -Colour Red -Indent
@@ -4509,8 +4563,11 @@ if ($Undo) {
                         $wakeInst = @()
                     }
                 }
+                # Each instance is read by itself, as Device Manager reads
+                # it: the class read names them, and on some drivers gives
+                # another answer for the setting (see Get-PreventDeviceEnable).
                 foreach ($wi in @($wakeInst | Where-Object { ([string]$_.InstanceName).StartsWith($pnp + '_', [StringComparison]::OrdinalIgnoreCase) })) {
-                    if (-not $wi.Enable) { $wi | Set-CimInstance -Property @{ Enable = $true } -ErrorAction Stop }
+                    if (-not (Get-PreventDeviceEnable -Instance $wi)) { $wi | Set-CimInstance -Property @{ Enable = $true } -ErrorAction Stop }
                 }
                 Remove-ItemProperty -LiteralPath $devPath -Name 'PnPCapabilities' -ErrorAction Stop
                 Log "${label}: removed an older version's settings and turned wake back on" -Colour Green -Indent
