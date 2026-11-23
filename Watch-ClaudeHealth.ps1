@@ -98,7 +98,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 6.3.2
+    Version : 6.3.3
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -1573,7 +1573,7 @@ function Get-W32tmOffsetSeconds {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -----------------------------------------------------------
-$ToolkitVersion = "6.3.2"
+$ToolkitVersion = "6.3.3"
 $ServiceName    = $script:ClaudeEnv.ServiceName
 $ProcessName    = $script:ClaudeEnv.ProcessName
 # This toolkit's folder, %APPDATA%\Claude: watch-logs and watch-state.json
