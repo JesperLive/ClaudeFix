@@ -57,7 +57,7 @@
     -Undo also exits 1 while a setting is still in the undo record.
     -WhatIf is refused: this script cannot preview its changes.
 
-    Version : 6.3.0
+    Version : 6.3.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -122,6 +122,169 @@ Set-StrictMode -Version Latest
 # 53 happened.
 # =====================================================================
 #region ClaudeEnv
+# -- Reads that tell "not there" from "could not read" ----------------------
+# Until 6.3.1 most reads in this toolkit passed -ErrorAction SilentlyContinue,
+# so a read that failed (access denied, a broken WMI, a service manager that
+# did not answer) came back empty and was taken as "nothing there": no such
+# service, no Claude process running. The helpers below answer "not there"
+# only for the one error that says so, told by its identity, and throw any
+# other error unchanged, so the caller can say what it could not read and
+# hold back what that read would have justified.
+
+function Test-ClaudeNotFoundError {
+    <#
+    .SYNOPSIS
+        Whether an error says the thing asked for is not there, rather than
+        that it could not be read.
+    .DESCRIPTION
+        Told by the error's identity, never by its message, which Windows
+        translates into the display language. All three must match: the
+        error id, the category, which must be ObjectNotFound, and the full
+        name of the exception type.
+
+        The error id is the FullyQualifiedErrorId up to its first comma.
+        PowerShell adds the name of the command that wrote the error after
+        the comma, and a test's stand-in for a cmdlet has a different name
+        from the cmdlet: measured 2026-11-22, a function named Get-FakeA that
+        writes id NoServiceFoundForGivenName arrives as
+        "NoServiceFoundForGivenName,Get-FakeA".
+    .PARAMETER ErrorId
+        The ids that mean "not there" for the command that was run.
+    .PARAMETER ExceptionType
+        The full name of the exception type that command raises for it.
+    #>
+    param(
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [string[]]$ErrorId,
+        [string]$ExceptionType
+    )
+    if ($null -eq $ErrorRecord -or $null -eq $ErrorRecord.Exception) { return $false }
+    $id = @("$($ErrorRecord.FullyQualifiedErrorId)" -split ',')[0]
+    return (($ErrorId -contains $id) -and
+            $ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound -and
+            $ErrorRecord.Exception.GetType().FullName -eq $ExceptionType)
+}
+
+function Get-ClaudeErrorText {
+    <#
+    .SYNOPSIS
+        An error's message on one line, or the name of its type when it has
+        no message, for a line that says what could not be read and why.
+    #>
+    param($ErrorRecord)
+    $ex = $ErrorRecord
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ex = $ErrorRecord.Exception }
+    if ($null -eq $ex) { return 'unknown error' }
+    $text = ([string]$ex.Message -replace '\s*[\r\n]+\s*', ' ').Trim()
+    if (-not $text) { $text = $ex.GetType().FullName }
+    return $text
+}
+
+function Get-ClaudeServiceOrNull {
+    <#
+    .SYNOPSIS
+        The service of that name, $null when no service has that name, and
+        throws, with the error Get-Service gave, when it could not be read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with a
+        read-only probe (Get-Service -Name NoSuchSvc_cf): error id
+        NoServiceFoundForGivenName, category ObjectNotFound, exception
+        Microsoft.PowerShell.Commands.ServiceCommandException. Any other
+        error means the service could not be read.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    try {
+        return (Get-Service -Name $Name -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'NoServiceFoundForGivenName' `
+                -ExceptionType 'Microsoft.PowerShell.Commands.ServiceCommandException') { return $null }
+        throw
+    }
+}
+
+function Get-ClaudeProcessByName {
+    <#
+    .SYNOPSIS
+        Every running process of that name, nothing when none runs, and
+        throws, with the error Get-Process gave, when the list could not be
+        read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with a
+        read-only probe (Get-Process -Name NoSuchProc_cf): error id
+        NoProcessFoundForGivenName, category ObjectNotFound, exception
+        Microsoft.PowerShell.Commands.ProcessCommandException. Any other
+        error means the list could not be read. Wrap a call in @() for an
+        array: none running outputs nothing.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    try {
+        return @(Get-Process -Name $Name -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'NoProcessFoundForGivenName' `
+                -ExceptionType 'Microsoft.PowerShell.Commands.ProcessCommandException') { return }
+        throw
+    }
+}
+
+function Get-ClaudeScheduledTaskOrNull {
+    <#
+    .SYNOPSIS
+        The scheduled task of that name in that folder, $null when there is
+        no such task, and throws, with the error Get-ScheduledTask gave, when
+        it could not be read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with a
+        read-only probe (Get-ScheduledTask -TaskName NoSuch_cf -TaskPath
+        \NoSuch_cf\, and again with -TaskPath \): error id
+        CmdletizationQuery_NotFound, category ObjectNotFound, exception
+        Microsoft.PowerShell.Cmdletization.Cim.CimJobException, whether or
+        not the folder exists. Without -TaskPath the id is
+        CmdletizationQuery_NotFound_TaskName, which is why the path is
+        required here. Any other error means the task could not be read.
+    .PARAMETER TaskPath
+        The task's folder, with a backslash at each end: \Claude\.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][string]$TaskPath
+    )
+    try {
+        return (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'CmdletizationQuery_NotFound' `
+                -ExceptionType 'Microsoft.PowerShell.Cmdletization.Cim.CimJobException') { return $null }
+        throw
+    }
+}
+
+function Get-ClaudeItemOrNull {
+    <#
+    .SYNOPSIS
+        The file, folder or registry key at that path, $null when there is
+        nothing there, and throws, with the error Get-Item gave, when it
+        could not be read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with
+        read-only probes of a missing file, a file under a missing folder
+        and a missing registry key: error id PathNotFound, category
+        ObjectNotFound, exception
+        System.Management.Automation.ItemNotFoundException, all three. Any
+        other error means the path could not be read. Hidden items count
+        as there (-Force).
+
+        Test-Path cannot be used for this: it answers $false for a path it
+        could not read, which is the confusion this exists to end.
+    #>
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    try {
+        return (Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' `
+                -ExceptionType 'System.Management.Automation.ItemNotFoundException') { return $null }
+        throw
+    }
+}
+
 function Get-ClaudeEnvironment {
     <#
     .SYNOPSIS
@@ -132,6 +295,14 @@ function Get-ClaudeEnvironment {
         determined stays $null and is recorded in Warnings, so a partial result
         is still usable by a caller that only needs some of the fields.
 
+        A read that failed, as opposed to one that found nothing, is also
+        listed in ReadErrors, one line each naming the read and the error,
+        for the scripts to show: Warnings holds notes about the choices made
+        as well. ServiceFound and ServiceRecoveryConfigured are $null when
+        they could not be read. Until 6.3.1 a failed read of the package, the
+        processes, the service or its recovery settings looked the same as
+        finding nothing.
+
         Locations are discoverable and are discovered. Thresholds and log
         signatures are NOT in scope here: those are not location problems and
         cannot be fixed by looking harder at the filesystem.
@@ -139,13 +310,15 @@ function Get-ClaudeEnvironment {
         Skip the recursive walk of the VM cache. That walk is the expensive half
         of discovery and only the backup and purge paths consume its results, so
         anything that polls should pass this. CacheSizeBytes is left at -1 when
-        skipped, which is distinguishable from a genuine zero.
+        skipped, which is distinguishable from a genuine zero, and is -1 as
+        well when the walk failed.
     #>
     param([switch]$SkipCacheInventory)
 
     # Version 2 (6.2.0): the app's folders come from Resolve-ClaudeDataPaths
-    # instead of %APPDATA%\Claude. A version 1 record names the old folders,
-    # so Import-ClaudeEnvironment turns it away.
+    # instead of %APPDATA%\Claude. The version is written into claude-env.json
+    # so that a person reading the record knows which fields it has; nothing in
+    # this toolkit reads the record back, since every run discovers afresh.
     $info = [ordered]@{
         SchemaVersion = 2
         DiscoveredUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -197,7 +370,16 @@ function Get-ClaudeEnvironment {
         HasTickCount64 = $false
         IsAdmin        = $false
 
-        Warnings = @()
+        Warnings   = @()
+        ReadErrors = @()
+    }
+
+    # A read that failed: said in Warnings and in ReadErrors.
+    $readFailed = {
+        param([string]$What, $ErrorRecord)
+        $line = "$What could not be read: $(Get-ClaudeErrorText $ErrorRecord)"
+        $info.Warnings   += $line
+        $info.ReadErrors += $line
     }
 
     # -- Host capabilities ------------------------------------------------
@@ -205,18 +387,26 @@ function Get-ClaudeEnvironment {
         $info.IsAdmin = ([Security.Principal.WindowsPrincipal] `
             [Security.Principal.WindowsIdentity]::GetCurrent()
             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { $info.Warnings += "Could not determine admin status: $($_.Exception.Message)" }
+    } catch { & $readFailed 'Whether this shell is elevated' $_ }
 
     # TickCount64 is .NET Core and up. Windows PowerShell 5.1 runs on .NET
     # Framework and does not have it, which is why the idle-time maths has to
     # survive the 24.9 day TickCount wrap instead of just using the 64-bit call.
+    # A probe: the error is the answer "not there".
     try { $null = [Environment]::TickCount64; $info.HasTickCount64 = $true }
     catch { $info.HasTickCount64 = $false }
 
+    # hcsdiag.exe ships with Windows. Not there is said as not present, and
+    # one that could not be read is a read error (Get-ClaudeItemOrNull); HCS
+    # cleanup is unavailable either way, since a run of it would fail the same
+    # way. Until 6.3.1 Test-Path said "not present" for both. The outer catch
+    # is for a SystemRoot that is not set, and says so.
     try {
         $hcs = Join-Path $env:SystemRoot "System32\hcsdiag.exe"
-        if (Test-Path $hcs) { $info.HcsDiagPath = $hcs }
-        else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
+        try {
+            if (Get-ClaudeItemOrNull -LiteralPath $hcs) { $info.HcsDiagPath = $hcs }
+            else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
+        } catch { & $readFailed "hcsdiag.exe ($hcs)" $_ }
     } catch { $info.Warnings += "hcsdiag probe failed: $($_.Exception.Message)" }
 
     # -- This toolkit's own folder -----------------------------------------
@@ -233,8 +423,12 @@ function Get-ClaudeEnvironment {
     } catch { $info.Warnings += "AppData probe failed: $($_.Exception.Message)" }
 
     # -- MSIX package -------------------------------------------------------
+    # No match is an empty answer with no error (measured 2026-11-22 with
+    # Get-AppxPackage -Name NoSuch_cf*), so any error is a failed read. Until
+    # 6.3.1 it was passed over and read as "no package installed".
+    $pkgs = @()
     try {
-        $pkgs = @(Get-AppxPackage -Name "Claude*" -ErrorAction SilentlyContinue |
+        $pkgs = @(Get-AppxPackage -Name "Claude*" -ErrorAction Stop |
                   Where-Object { $_.Name -like "Claude*" })
         if ($pkgs.Count -gt 1) {
             $info.Warnings += "$($pkgs.Count) Claude packages registered; duplicates make the service start fail with error 87"
@@ -251,35 +445,44 @@ function Get-ClaudeEnvironment {
             $info.InstallLocation  = "$($p.InstallLocation)"
             # Get-AppxPackage hands back Version as a String on Windows
             # PowerShell 5.1, so the PackageVersion struct accessors are not
-            # there. PackageFullName carries the same version as a second source.
+            # there. PackageFullName carries the same version as a second source,
+            # which is why a failure of the first is not said: the second is
+            # read next.
             try { $info.PackageVersion = "$($p.Version)" } catch { $null = $_ }
             if (-not $info.PackageVersion -and $info.PackageFullName) {
+                # String work on text already read; nothing here can fail to
+                # read, and a version not found stays $null.
                 try {
                     $parts = @($info.PackageFullName -split '_')
                     if ($parts.Count -ge 2) { $info.PackageVersion = $parts[1] }
                 } catch { $null = $_ }
             }
         }
-    } catch { $info.Warnings += "Package query failed: $($_.Exception.Message)" }
+    } catch { & $readFailed 'The Claude package (Get-AppxPackage)' $_ }
 
     # Application Id comes from the manifest. The old hardcoded "App" fallback
     # produced an invalid AUMID, and it only ever ran when the manifest read had
     # already failed, which is precisely when a wrong guess does damage.
     if ($info.InstallLocation) {
+        # A manifest that is not there leaves the fallback below, which says
+        # so. One that could not be read is said as well: until 6.3.1
+        # Test-Path answered "not there" for it.
         try {
             $manifestPath = Join-Path $info.InstallLocation "AppxManifest.xml"
-            if (Test-Path $manifestPath) {
-                [xml]$mx = Get-Content $manifestPath -ErrorAction Stop
+            if (Get-ClaudeItemOrNull -LiteralPath $manifestPath) {
+                [xml]$mx = Get-Content -LiteralPath $manifestPath -ErrorAction Stop
                 $ns = New-Object Xml.XmlNamespaceManager($mx.NameTable)
                 $ns.AddNamespace("x", "http://schemas.microsoft.com/appx/manifest/foundation/windows10")
                 $appNode = $mx.SelectSingleNode("//x:Application", $ns)
                 if ($appNode) { $info.ApplicationId = $appNode.GetAttribute("Id") }
             }
-        } catch { $info.Warnings += "Manifest read failed: $($_.Exception.Message)" }
+        } catch { & $readFailed 'The package manifest' $_ }
     }
     if (-not $info.ApplicationId -and $info.PackageFound) {
         # Every shipped Claude manifest to date uses Id="Claude", matching the
         # package Name. Better than a literal guess, and it is recorded as one.
+        # The name was read with the package; a failure here leaves no Id,
+        # which the line below does not claim.
         try { $info.ApplicationId = "$($pkgs[0].Name)" } catch { $null = $_ }
         if ($info.ApplicationId) {
             $info.Warnings += "Application Id fell back to package name '$($info.ApplicationId)'"
@@ -302,7 +505,9 @@ function Get-ClaudeEnvironment {
             $info[$k] = $paths.$k
         }
         $info.Warnings += @($paths.Notes)
-    } catch { $info.Warnings += "Data folder discovery failed: $($_.Exception.Message)" }
+        # Each candidate folder that could not be read is in Notes already.
+        foreach ($e in @($paths.Errors)) { $info.ReadErrors += "Data folder candidate $e" }
+    } catch { & $readFailed "The app's data folders" $_ }
 
     # -- Claude executable ---------------------------------------------------
     # Ordered by authority, not by convenience. The package branch runs first
@@ -319,11 +524,34 @@ function Get-ClaudeEnvironment {
     # therefore cache the CLI path and turn every later relaunch into a CLI
     # start instead of an app start. Test-ClaudeCodeCliPath rejects both kinds;
     # the path pattern it replaced here only knew the first.
+    # Each source below that cannot be read is said in ReadErrors, and the
+    # next one is tried. A candidate path that is there but could not be read
+    # is passed over too, since the search is for a file that is there and
+    # the next source may have it; when no source has one, each such path is
+    # said in ReadErrors, so that "not located" is not taken for "not
+    # installed". Until 6.3.1 Test-Path answered "not there" for such a path,
+    # without a word, and answered "there" for a folder.
+    $exeUnread = New-Object 'System.Collections.Generic.List[string]'
+    # $true for a file at that path. Nothing there, or a folder, is $false; a
+    # path that could not be read is $false and noted in $exeUnread.
+    $exeAt = {
+        param([string]$Path)
+        if (-not $Path) { return $false }
+        try {
+            $it = Get-ClaudeItemOrNull -LiteralPath $Path
+        } catch {
+            $exeUnread.Add("Claude executable candidate $Path could not be read: $(Get-ClaudeErrorText $_)")
+            return $false
+        }
+        return ($null -ne $it -and -not $it.PSIsContainer)
+    }
     if ($info.InstallLocation) {
         foreach ($rel in @('app\claude.exe', 'claude.exe')) {
+            # Join-Path fails only for a drive that is not there; such a
+            # candidate is passed over like one with nothing there.
             try {
                 $cand = Join-Path $info.InstallLocation $rel
-                if (Test-Path $cand) {
+                if (& $exeAt $cand) {
                     $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'package'; break
                 }
             } catch { $null = $_ }
@@ -331,94 +559,132 @@ function Get-ClaudeEnvironment {
     }
     if (-not $info.ClaudeExe) {
         try {
-            foreach ($rp in @(Get-Process -Name $info.ProcessName -ErrorAction SilentlyContinue)) {
+            foreach ($rp in @(Get-ClaudeProcessByName -Name $info.ProcessName)) {
                 try {
                     $cand = $rp.MainModule.FileName
-                    if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
+                    if ($cand -and (& $exeAt $cand) -and -not (Test-ClaudeCodeCliPath $cand)) {
                         $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'process'; break
                     }
-                } catch { $null = $_ }
+                } catch {
+                    # MainModule needs more access than the image name does,
+                    # and the process may have exited since the list was
+                    # read. The CIM query below answers for such a process.
+                    $null = $_
+                }
             }
-        } catch { $null = $_ }
+        } catch { & $readFailed 'The processes named claude' $_ }
     }
     if (-not $info.ClaudeExe) {
+        # No match is an empty answer with no error (measured 2026-11-22), so
+        # any error is a failed read.
         try {
             foreach ($wp in @(Get-CimInstance Win32_Process -Filter "Name LIKE '%claude%'" `
-                              -ErrorAction SilentlyContinue)) {
+                              -ErrorAction Stop)) {
                 $cand = "$($wp.ExecutablePath)"
-                if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
+                if ($cand -and (& $exeAt $cand) -and -not (Test-ClaudeCodeCliPath $cand)) {
                     $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'wmi'; break
                 }
             }
-        } catch { $null = $_ }
+        } catch { & $readFailed 'The process list (CIM Win32_Process)' $_ }
     }
     if (-not $info.ClaudeExe) {
-        foreach ($cand in @(
-            (Join-Path $env:LOCALAPPDATA "Programs\claude\Claude.exe"),
-            (Join-Path $env:LOCALAPPDATA "AnthropicClaude\Claude.exe"),
-            (Join-Path $env:LOCALAPPDATA "Anthropic\Claude\Claude.exe"),
-            (Join-Path $env:ProgramFiles "Claude\Claude.exe")
+        # Guesses at the usual install folders. A folder variable that is not
+        # set has no guess: until 6.3.1 Join-Path of $null threw out of the
+        # whole discovery when LOCALAPPDATA was not set. Join-Path fails only
+        # for a drive that is not there, which is passed over as well.
+        $guesses = @()
+        foreach ($g in @(
+            @($env:LOCALAPPDATA, 'Programs\claude\Claude.exe'),
+            @($env:LOCALAPPDATA, 'AnthropicClaude\Claude.exe'),
+            @($env:LOCALAPPDATA, 'Anthropic\Claude\Claude.exe'),
+            @($env:ProgramFiles, 'Claude\Claude.exe')
         )) {
-            try { if ($cand -and (Test-Path $cand)) {
-                $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'commonpath'; break
-            } } catch { $null = $_ }
+            if ($g[0]) { try { $guesses += (Join-Path $g[0] $g[1]) } catch { $null = $_ } }
+        }
+        foreach ($cand in $guesses) {
+            if (& $exeAt $cand) { $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'commonpath'; break }
         }
     }
-    if (-not $info.ClaudeExe) { $info.Warnings += "Claude executable not located" }
+    if (-not $info.ClaudeExe) {
+        $info.Warnings += "Claude executable not located"
+        foreach ($u in $exeUnread) { $info.Warnings += $u; $info.ReadErrors += $u }
+    }
 
     # -- Service -------------------------------------------------------------
+    # Not registered and could not be read are told apart
+    # (Get-ClaudeServiceOrNull). Until 6.3.1 a failed read said "is not
+    # registered".
+    $svc = $null
     try {
-        $svc = Get-Service -Name $info.ServiceName -ErrorAction SilentlyContinue
-        if ($svc) {
-            $info.ServiceFound = $true
-            try {
-                $cim = Get-CimInstance Win32_Service `
-                       -Filter "Name='$($info.ServiceName)'" -ErrorAction Stop
-                if ($cim) {
-                    $info.ServiceStartMode = "$($cim.StartMode)"
-                    $raw = "$($cim.PathName)"
-                    if ($raw) {
-                        # PathName may be quoted and may carry arguments.
-                        if ($raw -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
-                        elseif ($raw -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
-                        else { $exe = $raw.Trim() }
-                        $info.ServiceBinaryPath = $exe
-                        try {
-                            $leaf = [System.IO.Path]::GetFileNameWithoutExtension($exe)
-                            if ($leaf) { $info.ServiceProcessName = $leaf }
-                        } catch { $null = $_ }
+        $svc = Get-ClaudeServiceOrNull -Name $info.ServiceName
+        if (-not $svc) { $info.Warnings += "$($info.ServiceName) is not registered" }
+    } catch {
+        $info.ServiceFound = $null
+        & $readFailed "Service $($info.ServiceName)" $_
+    }
+    if ($svc) {
+        $info.ServiceFound = $true
+        try {
+            $cim = Get-CimInstance Win32_Service `
+                   -Filter "Name='$($info.ServiceName)'" -ErrorAction Stop
+            if ($cim) {
+                $info.ServiceStartMode = "$($cim.StartMode)"
+                $raw = "$($cim.PathName)"
+                if ($raw) {
+                    # PathName may be quoted and may carry arguments.
+                    if ($raw -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
+                    elseif ($raw -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
+                    else { $exe = $raw.Trim() }
+                    $info.ServiceBinaryPath = $exe
+                    try {
+                        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+                        if ($leaf) { $info.ServiceProcessName = $leaf }
+                    } catch {
+                        $info.Warnings += "The service's process name could not be taken from '$exe'; it stays $($info.ServiceProcessName)"
                     }
                 }
-            } catch {
-                try { $info.ServiceStartMode = "$($svc.StartType)" } catch { $null = $_ }
             }
-        } else {
-            $info.Warnings += "$($info.ServiceName) is not registered"
+        } catch {
+            # The start mode is on the service object as well. The binary
+            # path is not, and the process name stays the one measured on
+            # app 6.18355.
+            & $readFailed "The details of service $($info.ServiceName) (CIM Win32_Service)" $_
+            if ($null -ne $svc.StartType) { $info.ServiceStartMode = "$($svc.StartType)" }
         }
-    } catch { $info.Warnings += "Service query failed: $($_.Exception.Message)" }
+    }
 
     # Recovery actions are read from the registry, not from parsed sc.exe output.
     # Matching the literal string RESTART in console text fails on any Windows
     # whose display language is not English.
+    #
+    # No key means no such service, and GetValue answers $null for a value
+    # that is not there, so neither is an error. Any error is a failed read,
+    # and the answer is then $null, not "not configured": until 6.3.1 an
+    # error here read as not configured, and Fix's report said so.
     try {
-        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($info.ServiceName)"
-        if (Test-Path $svcKey) {
-            $fa = (Get-ItemProperty -Path $svcKey -Name FailureActions `
-                   -ErrorAction SilentlyContinue).FailureActions
+        $svcKey = Get-ClaudeItemOrNull -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($info.ServiceName)"
+        if ($svcKey) {
+            $fa = $svcKey.GetValue('FailureActions')
             if ($fa) { $info.ServiceRecoveryConfigured = $true }
         }
-    } catch { $null = $_ }
+    } catch {
+        $info.ServiceRecoveryConfigured = $null
+        & $readFailed "The recovery settings of service $($info.ServiceName)" $_
+    }
 
     # -- VM log selection ----------------------------------------------------
-    # See Get-ClaudeVmLogCandidates for which logs count and why.
+    # See Get-ClaudeVmLogCandidates for which logs count and why. A log folder
+    # with nothing there holds no VM log and is passed over, as before; one
+    # that could not be read is a read error (Get-ClaudeItemOrNull), where
+    # until 6.3.1 Test-Path passed over it without a word.
     try {
-        if ($info.LogDir -and (Test-Path $info.LogDir)) {
+        if ($info.LogDir -and (Get-ClaudeItemOrNull -LiteralPath $info.LogDir)) {
             $cands = @(Get-ClaudeVmLogCandidates -LogDir $info.LogDir)
             $info.VmLogCandidates = $cands
             if ($cands.Count -gt 0) { $info.VmLogFile = $cands[0].Path }
             else { $info.Warnings += "No VM log present in $($info.LogDir)" }
         }
-    } catch { $info.Warnings += "VM log probe failed: $($_.Exception.Message)" }
+    } catch { & $readFailed "The VM logs in $($info.LogDir)" $_ }
 
     # -- VM cache inventory --------------------------------------------------
     # One walk yields both the real cache size and the real VHDX sizes, so the
@@ -430,9 +696,29 @@ function Get-ClaudeEnvironment {
         try {
             $vhdx  = @()
             $total = [long]0
+            # A file or folder the walk cannot read is left out of the total
+            # and counted, and Warnings says the total is then a lower bound.
+            # An estimate, not a decision: the backup measures what it copies.
+            $unread = 0
+            $firstUnread = $null
             foreach ($dir in @($info.VmCachePath, $info.BundlePath)) {
-                if (-not $dir -or -not (Test-Path $dir)) { continue }
-                foreach ($f in @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue)) {
+                if (-not $dir) { continue }
+                # A folder with nothing there holds nothing to count. One that
+                # could not be read is counted as unread, so the total is said
+                # to be a lower bound; until 6.3.1 Test-Path passed over it and
+                # the total read as complete.
+                try {
+                    if ($null -eq (Get-ClaudeItemOrNull -LiteralPath $dir)) { continue }
+                } catch {
+                    # Get-Item's message for a path it may not read does not
+                    # name the path (measured 2026-11-23: "Access is denied"),
+                    # so the folder is named here.
+                    $unread++
+                    if (-not $firstUnread) { $firstUnread = $dir + ': ' + (Get-ClaudeErrorText $_) }
+                    continue
+                }
+                $walkErrors = $null
+                foreach ($f in @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue -ErrorVariable walkErrors)) {
                     $total += $f.Length
                     if ($f.Extension -eq '.vhdx') {
                         $vhdx += [pscustomobject]@{
@@ -442,10 +728,22 @@ function Get-ClaudeEnvironment {
                         }
                     }
                 }
+                foreach ($we in @($walkErrors)) {
+                    if ($null -eq $we) { continue }
+                    $unread++
+                    if (-not $firstUnread) { $firstUnread = Get-ClaudeErrorText $we }
+                }
             }
             $info.VhdxFiles      = @($vhdx)
             $info.CacheSizeBytes = $total
-        } catch { $info.Warnings += "Cache inventory failed: $($_.Exception.Message)" }
+            if ($unread -gt 0) {
+                $info.Warnings += "Cache inventory: $unread item(s) could not be read, so CacheSizeBytes is a lower bound (first: $firstUnread)"
+            }
+        } catch {
+            # -1 as when skipped: not known, which a 0 would not say.
+            $info.CacheSizeBytes = [long](-1)
+            & $readFailed 'The VM cache inventory' $_
+        }
     }
 
     return $info
@@ -454,9 +752,11 @@ function Get-ClaudeEnvironment {
 function Save-ClaudeEnvironment {
     <#
     .SYNOPSIS
-        Persists a discovery result so sibling scripts and bug reports can use it.
+        Writes a discovery result to a file, claude-env.json, for a person
+        reading what discovery found and for bug reports.
     .DESCRIPTION
-        Written as UTF-8 without a BOM. Out-File -Encoding utf8 emits a BOM on
+        Nothing in this toolkit reads the file back: every run discovers
+        afresh. Written as UTF-8 without a BOM. Out-File -Encoding utf8 emits a BOM on
         Windows PowerShell 5.1, which breaks anything reading the file as plain
         JSON. Never throws: persistence is a convenience, not a dependency.
     #>
@@ -466,6 +766,10 @@ function Save-ClaudeEnvironment {
     )
     try {
         $dir = Split-Path $Path -Parent
+        # A folder Test-Path could not read is made again here, which is
+        # harmless: New-Item -Force hands back a folder that is there as it
+        # is (measured 2026-11-23), and one that cannot be written to fails
+        # the write below, which answers $false.
         if ($dir -and -not (Test-Path $dir)) {
             New-Item $dir -ItemType Directory -Force | Out-Null
         }
@@ -474,38 +778,6 @@ function Save-ClaudeEnvironment {
             (New-Object System.Text.UTF8Encoding($false)))
         return $true
     } catch { return $false }
-}
-
-function Import-ClaudeEnvironment {
-    <#
-    .SYNOPSIS
-        Reads a persisted discovery result, but only if it still describes this
-        machine's current install.
-    .DESCRIPTION
-        Returns $null when the file is missing, unreadable, from a different
-        schema, or stamped with a package version other than the one asked for.
-        That version stamp is the whole point: the existing .claude-exe-path
-        cache has no stamp, which is why a stale entry there survives until
-        something downstream trips over it.
-
-        Pass -ExpectedPackageVersion from a live query when correctness matters.
-        Omit it to accept whatever was recorded, which is fine for bug reports.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [string]$ExpectedPackageVersion
-    )
-    try {
-        if (-not (Test-Path $Path)) { return $null }
-        $raw = Get-Content $Path -Raw -ErrorAction Stop
-        if (-not $raw) { return $null }
-        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
-        if (-not $obj) { return $null }
-        if ($obj.SchemaVersion -ne 2) { return $null }
-        if ($ExpectedPackageVersion -and
-            "$($obj.PackageVersion)" -ne "$ExpectedPackageVersion") { return $null }
-        return $obj
-    } catch { return $null }
 }
 
 function Get-CoworkHcsGuids {
@@ -571,15 +843,39 @@ function Test-ClaudeCodeCliPath {
         it, %USERPROFILE%\.local\bin on this machine, so the file's ProductName
         decides the rest. Measured 2026-11-21 on app 6.18355: the app's
         Claude.exe says "Claude", both CLI copies say "Claude Code".
+
+        Every caller asks so that it never takes the CLI for the app. The
+        answers:
+          $false  an empty path.
+          $true   a path with a claude-code folder in it.
+          $false  a path with nothing there; the caller's own check of
+                  whether it is there passes it over.
+          $false  a folder: it is not the CLI. Whether a folder may be used
+                  as an exe is the caller's question.
+          $true   a path that is there but could not be read, or whose
+                  product name could not be read: not one to start or
+                  record as the app.
+          $true   a file whose product name is "Claude Code".
+          $false  any other file.
+        Until 6.3.1 any failed read answered $false, "not the CLI".
     #>
     param([string]$Path)
     if (-not $Path) { return $false }
     if ($Path -match '[\\/]claude-code[\\/]') { return $true }
     try {
-        $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
-        if ($vi -and "$($vi.ProductName)" -eq 'Claude Code') { return $true }
-    } catch { $null = $_ }
-    return $false
+        $item = Get-ClaudeItemOrNull -LiteralPath $Path
+    } catch {
+        return $true
+    }
+    if (-not $item) { return $false }
+    # A folder is not the CLI, and it has no VersionInfo: reading a property
+    # an object does not have throws under StrictMode Latest.
+    if ($item.PSIsContainer) { return $false }
+    # VersionInfo is read when asked for, and a getter that throws reads as
+    # $null, so $null here is a product name that could not be read.
+    $vi = $item.VersionInfo
+    if ($null -eq $vi) { return $true }
+    return ("$($vi.ProductName)" -eq 'Claude Code')
 }
 
 function Get-ClaudeProcessInventory {
@@ -605,6 +901,14 @@ function Get-ClaudeProcessInventory {
 
         A process whose path cannot be read is not counted as the desktop app.
         A process this function cannot place is not one the toolkit may kill.
+        Kind is unknown for it, and for a process whose product name was
+        needed and could not be read.
+
+        Throws, with the original error, when the processes could not be
+        listed, and when a process's path could not be read and the one CIM
+        query that answers for it failed. Until 6.3.1 a list that could not
+        be read came back empty, which every caller took for "Claude is not
+        running".
 
         Each result carries Process, Id, Path, Kind and IsDesktop. Kind is
         desktop, cli, other or unknown.
@@ -636,25 +940,32 @@ function Get-ClaudeProcessInventory {
             if ((Split-Path $dir -Leaf) -match '^app-\d') { $dir = Split-Path $dir -Parent }
             $roots += $dir.TrimEnd('\') + '\'
         }
-    } catch { $null = $_ }
+    } catch {
+        # String work on fields discovery already read. With no roots the
+        # product name decides below, so a failure here places nothing wrong.
+        $null = $_
+    }
 
     $result = @()
     $cimPaths = $null
     $products = @{}
-    foreach ($p in @(Get-Process -Name $Environment.ProcessName -ErrorAction SilentlyContinue)) {
+    # Throws when the list cannot be read (Get-ClaudeProcessByName).
+    foreach ($p in @(Get-ClaudeProcessByName -Name $Environment.ProcessName)) {
         $path = $null
+        # MainModule needs more access than the image name does, and the
+        # process may have exited since the list was read. The CIM query
+        # below answers for either.
         try { $path = $p.MainModule.FileName } catch { $null = $_ }
         if (-not $path) {
-            # MainModule needs more access than the image name does. One CIM
-            # query answers for every process it could not read.
+            # One CIM query answers for every process MainModule could not
+            # read. When it fails, this process cannot be placed, so the
+            # inventory cannot be told: the error is thrown as it came.
             if ($null -eq $cimPaths) {
                 $cimPaths = @{}
-                try {
-                    $flt = "Name='$($Environment.ProcessName).exe'"
-                    foreach ($w in @(Get-CimInstance Win32_Process -Filter $flt -ErrorAction Stop)) {
-                        if ($w.ExecutablePath) { $cimPaths[[int]$w.ProcessId] = "$($w.ExecutablePath)" }
-                    }
-                } catch { $null = $_ }
+                $flt = "Name='$($Environment.ProcessName).exe'"
+                foreach ($w in @(Get-CimInstance Win32_Process -Filter $flt -ErrorAction Stop)) {
+                    if ($w.ExecutablePath) { $cimPaths[[int]$w.ProcessId] = "$($w.ExecutablePath)" }
+                }
             }
             if ($cimPaths.ContainsKey([int]$p.Id)) { $path = $cimPaths[[int]$p.Id] }
         }
@@ -671,13 +982,21 @@ function Get-ClaudeProcessInventory {
                 if ($kind -eq 'other') {
                     # Read once per distinct path: fourteen desktop processes
                     # share one executable.
+                    # A product name that could not be read is $null, and the
+                    # process is then unknown, not other: it may be the CLI,
+                    # or with no roots the app. Until 6.3.1 it was other.
                     if (-not $products.ContainsKey($path)) {
-                        $products[$path] = ''
+                        $products[$path] = $null
                         try {
-                            $products[$path] = "$((Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductName)"
-                        } catch { $null = $_ }
+                            $vi = (Get-Item -LiteralPath $path -Force -ErrorAction Stop).VersionInfo
+                            if ($null -ne $vi) { $products[$path] = "$($vi.ProductName)" }
+                        } catch {
+                            # Said through Kind, which every caller reads.
+                            $null = $_
+                        }
                     }
-                    if ($products[$path] -eq 'Claude Code') { $kind = 'cli' }
+                    if ($null -eq $products[$path]) { $kind = 'unknown' }
+                    elseif ($products[$path] -eq 'Claude Code') { $kind = 'cli' }
                     elseif ($roots.Count -eq 0 -and $products[$path] -eq 'Claude') { $kind = 'desktop' }
                 }
             }
@@ -702,7 +1021,9 @@ function Get-ClaudeDesktopProcess {
         whether the app is running before it does something. A check that only
         holds a repair back because Claude looks busy may keep counting every
         "claude" process: a busy CLI is a reason to wait as well.
-        Get-ClaudeProcessInventory says how the two are told apart.
+        Get-ClaudeProcessInventory says how the two are told apart, and when
+        it throws, which this passes on: a caller must not read a list that
+        could not be read as "not running".
     .PARAMETER Environment
         A Get-ClaudeEnvironment result.
     #>
@@ -726,17 +1047,20 @@ function Get-ClaudeAppCliProcess {
 
         A CLI counts when its parent is any desktop process, so which of the
         app's processes started it does not matter. A terminal CLI is not
-        counted: a repair does not end it.
+        counted: a repair does not end it. A child of the app whose kind
+        could not be told (unknown) counts as well, since it may be a
+        session; until 6.3.1 one whose product name could not be read was
+        not counted.
 
-        Throws when the parent ids cannot be read, so a caller deciding
-        whether a repair may run can fail closed.
+        Throws when the processes or their parent ids cannot be read, so a
+        caller deciding whether a repair may run can fail closed.
     .PARAMETER Environment
         A Get-ClaudeEnvironment result.
     #>
     param([Parameter(Mandatory)]$Environment)
 
     $inventory = @(Get-ClaudeProcessInventory -Environment $Environment)
-    $cli = @($inventory | Where-Object { $_.Kind -eq 'cli' })
+    $cli = @($inventory | Where-Object { $_.Kind -eq 'cli' -or $_.Kind -eq 'unknown' })
     if ($cli.Count -eq 0) { return @() }
     $desktop = @{}
     foreach ($e in $inventory) { if ($e.IsDesktop) { $desktop[[int]$e.Id] = $true } }
@@ -770,19 +1094,48 @@ function Test-ClaudeCodeTranscriptRecent {
         change, and until 6.3.0 a transcript written 20 minutes before the
         spring change read as 80 minutes old, so an unattended repair could
         start while a session was working.
+
+        Throws when it cannot tell: no config dir to look in, a projects
+        folder that could not be read, or a folder in it that could not be
+        listed and no recent transcript elsewhere. A caller deciding whether
+        a repair may run holds back on the throw and says why. Until 6.3.1
+        each of these answered $false, "no session busy", and let the repair
+        run. No projects folder at all is $false: nothing has been written.
     #>
     param([int]$Minutes = 35)
 
     $cfgDir = $env:CLAUDE_CONFIG_DIR
     if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
-    if (-not $cfgDir) { return $false }
+    if (-not $cfgDir) { throw 'Neither CLAUDE_CONFIG_DIR nor USERPROFILE is set, so there is no transcript folder to read' }
     $projects = Join-Path $cfgDir "projects"
-    if (-not (Test-Path -LiteralPath $projects -PathType Container)) { return $false }
+    # Named here: the error Get-Item gives for a folder it may not open says
+    # only "Access is denied" (measured 2026-11-23), and a caller says this
+    # error as why it could not tell. Until 6.3.1 the monitor's line was
+    # "Test-ClaudeCodeActive failed (Access is denied)".
+    try {
+        $folder = Get-ClaudeItemOrNull -LiteralPath $projects
+    } catch {
+        throw "The Claude Code transcript folder $projects could not be read: $(Get-ClaudeErrorText $_)"
+    }
+    if (-not $folder -or -not $folder.PSIsContainer) { return $false }
     $now = [datetime]::UtcNow
-    $recent = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
+    # Errors are gathered, not shown: a recent transcript answers the
+    # question whatever else could not be listed. Without one, the first
+    # error is thrown, unless it is a file or folder that went away during
+    # the walk (PathNotFound), which a session does when it ends.
+    $walkErrors = $null
+    $recent = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -Force `
+            -ErrorAction SilentlyContinue -ErrorVariable walkErrors |
         Where-Object { ($now - $_.LastWriteTimeUtc).TotalMinutes -lt $Minutes } |
         Select-Object -First 1
-    return [bool]$recent
+    if ($recent) { return $true }
+    # @($null) holds one element, so a $null is passed over.
+    foreach ($we in @($walkErrors)) {
+        if ($null -eq $we) { continue }
+        if (-not (Test-ClaudeNotFoundError -ErrorRecord $we -ErrorId 'PathNotFound' `
+                -ExceptionType 'System.Management.Automation.ItemNotFoundException')) { throw $we }
+    }
+    return $false
 }
 
 function Get-ClaudeDataCandidates {
@@ -811,8 +1164,16 @@ function Get-ClaudeDataCandidates {
         LogDirs: the logs folder of each candidate, where it exists. Newest is
         the latest write to a *.log directly in it.
 
-        Cheap enough to call on every poll: Test-Path and one directory listing
-        per candidate, nothing recursive. Never throws.
+        Cheap enough to call on every poll: one item read and one directory
+        listing per candidate, nothing recursive. Never throws.
+
+        Errors: one line for each folder or file that is there but could not
+        be read, naming it and the error. A candidate behind such an error
+        may be missing from DataRoots or LogDirs, or carry a Newest that is
+        too old, so a caller that would act on the choice (move a folder,
+        call the app idle) must not while Errors holds anything. Until 6.3.1
+        a folder that could not be read looked the same as one that was not
+        there.
     .PARAMETER PackageFamilyName
         The MSIX package family. Its LocalCache, where Windows redirects a
         packaged app's AppData writes, is probed as well.
@@ -832,16 +1193,25 @@ function Get-ClaudeDataCandidates {
     if ($env:CLAUDE_USER_DATA_DIR) {
         $wanted += @{ Path = $env:CLAUDE_USER_DATA_DIR; Source = 'CLAUDE_USER_DATA_DIR' }
     }
+    $errors = @()
+    $readError = { param($What, $ErrorRecord) "$What could not be read: $(Get-ClaudeErrorText $ErrorRecord)" }
+    # A folder found and then gone when listed (PathNotFound, the identity
+    # Get-ChildItem gives for a path not there, measured 2026-11-22) holds
+    # nothing, as one never found does: an update that removes the folder it
+    # moved from must not read as a folder that could not be read.
+    $goneError = { param($ErrorRecord) Test-ClaudeNotFoundError -ErrorRecord $ErrorRecord -ErrorId 'PathNotFound' `
+            -ExceptionType 'System.Management.Automation.ItemNotFoundException' }
     foreach ($b in $bases) {
         foreach ($n in @('Claude-Data', 'Claude-3p')) {
+            $parent = Join-Path $b.Path $n
             try {
-                $parent = Join-Path $b.Path $n
-                if (Test-Path -LiteralPath $parent -PathType Container) {
-                    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue)) {
+                $pi = Get-ClaudeItemOrNull -LiteralPath $parent
+                if ($pi -and $pi.PSIsContainer) {
+                    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction Stop)) {
                         $wanted += @{ Path = $d.FullName; Source = "$($b.Tag)\$n" }
                     }
                 }
-            } catch { $null = $_ }
+            } catch { if (-not (& $goneError $_)) { $errors += & $readError $parent $_ } }
         }
         $wanted += @{ Path = (Join-Path $b.Path 'Claude'); Source = "$($b.Tag)\Claude" }
     }
@@ -852,37 +1222,45 @@ function Get-ClaudeDataCandidates {
     $logs  = @()
     $seen  = @{}
     foreach ($w in $wanted) {
+        $full = "$($w.Path)".TrimEnd('\')
+        if (-not $full -or $seen.ContainsKey($full.ToLowerInvariant())) { continue }
+        $seen[$full.ToLowerInvariant()] = $true
         try {
-            $full = "$($w.Path)".TrimEnd('\')
-            if (-not $full -or $seen.ContainsKey($full.ToLowerInvariant())) { continue }
-            $seen[$full.ToLowerInvariant()] = $true
-            if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
+            $fi = Get-ClaudeItemOrNull -LiteralPath $full
+        } catch { $errors += & $readError $full $_; continue }
+        if (-not $fi -or -not $fi.PSIsContainer) { continue }
 
-            $newest = $null
-            $isApp  = $false
-            foreach ($m in $markers) {
-                $mi = Get-Item -LiteralPath (Join-Path $full $m) -Force -ErrorAction SilentlyContinue
-                if (-not $mi) { continue }
-                if ($m -eq 'Preferences' -or $m -eq 'Local State') { $isApp = $true }
-                if ($null -eq $newest -or $mi.LastWriteTime -gt $newest) { $newest = $mi.LastWriteTime }
-            }
-            $roots += [pscustomobject]@{ Path = $full; Source = $w.Source; IsAppData = $isApp; Newest = $newest }
+        $newest = $null
+        $isApp  = $false
+        foreach ($m in $markers) {
+            $mp = Join-Path $full $m
+            try {
+                $mi = Get-ClaudeItemOrNull -LiteralPath $mp
+            } catch { $errors += & $readError $mp $_; continue }
+            if (-not $mi) { continue }
+            if ($m -eq 'Preferences' -or $m -eq 'Local State') { $isApp = $true }
+            if ($null -eq $newest -or $mi.LastWriteTime -gt $newest) { $newest = $mi.LastWriteTime }
+        }
+        $roots += [pscustomobject]@{ Path = $full; Source = $w.Source; IsAppData = $isApp; Newest = $newest }
 
-            $ld = Join-Path $full 'logs'
-            if (Test-Path -LiteralPath $ld -PathType Container) {
+        $ld = Join-Path $full 'logs'
+        try {
+            $li = Get-ClaudeItemOrNull -LiteralPath $ld
+            if ($li -and $li.PSIsContainer) {
                 $lnewest = $null
-                foreach ($f in @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -Force -ErrorAction SilentlyContinue)) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -Force -ErrorAction Stop)) {
                     if ($null -eq $lnewest -or $f.LastWriteTime -gt $lnewest) { $lnewest = $f.LastWriteTime }
                 }
                 $logs += [pscustomobject]@{ Path = $ld; Source = $w.Source; Newest = $lnewest }
             }
-        } catch { $null = $_ }
+        } catch { if (-not (& $goneError $_)) { $errors += & $readError $ld $_ } }
     }
 
     $byNewest = @{ Expression = { if ($_.Newest) { $_.Newest } else { [datetime]::MinValue } }; Descending = $true }
     return [pscustomobject]@{
         DataRoots = @($roots | Sort-Object -Property @{ Expression = { [int]$_.IsAppData }; Descending = $true }, $byNewest)
         LogDirs   = @($logs | Sort-Object -Property $byNewest)
+        Errors    = @($errors)
     }
 }
 
@@ -912,6 +1290,10 @@ function Resolve-ClaudeDataPaths {
         generated launchers) stays in AppDataDir whatever is chosen here.
         Never throws: Get-ClaudeDataCandidates does not, and the rest is string
         work.
+
+        Errors passes on Get-ClaudeDataCandidates' Errors, and Notes has a
+        line for each: a choice made while one of them stands may be the
+        wrong one, and a caller that would act on it must not.
     .PARAMETER PackageFamilyName
         Passed to Get-ClaudeDataCandidates for the MSIX LocalCache candidates.
     .PARAMETER AppDataDir
@@ -957,6 +1339,9 @@ function Resolve-ClaudeDataPaths {
         $logSource = 'fallback'
         $notes += "No logs folder holding a *.log was found; the log folder falls back to $logDir"
     }
+    foreach ($e in @($c.Errors)) {
+        $notes += "Candidate not read, so the choice above may be wrong: $e"
+    }
 
     $under = { param($leaf) if ($dataRoot) { Join-Path $dataRoot $leaf } else { $null } }
     return [pscustomobject]@{
@@ -975,6 +1360,7 @@ function Resolve-ClaudeDataPaths {
             '{0} ({1}, newest log {2})' -f $_.Path, $_.Source, (& $stamp $_.Newest)
         })
         Notes              = @($notes)
+        Errors             = @($c.Errors)
     }
 }
 
@@ -990,30 +1376,30 @@ function Get-ClaudeVmLogCandidates {
         caller can reject a candidate that predates its own lookback window.
 
         A function of its own since 6.2.0 so Watch can pick the VM log again
-        when the log folder moves under it. Never throws.
+        when the log folder moves under it.
+
+        Throws, with the original error, when a VM log, or the folder, could
+        not be read. A log that is not there is left out. Until 6.3.1 a log
+        that could not be read was left out as well, so the newest log could
+        be one that had stopped while the live one went unseen.
     #>
     param([string]$LogDir)
 
     $cands = @()
     if (-not $LogDir) { return $cands }
     foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
-        try {
-            $p = Join-Path $LogDir $n
-            if (Test-Path -LiteralPath $p) {
-                $fi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
-                if ($fi) {
-                    $cands += [pscustomobject]@{
-                        Name          = $n
-                        Path          = $fi.FullName
-                        LastWriteTime = $fi.LastWriteTime
-                        LastWriteTimeUtc = $fi.LastWriteTimeUtc
-                        AgeHours      = [math]::Round( `
-                            ([datetime]::UtcNow - $fi.LastWriteTimeUtc).TotalHours, 2)
-                        Length        = $fi.Length
-                    }
-                }
+        $fi = Get-ClaudeItemOrNull -LiteralPath (Join-Path $LogDir $n)
+        if ($fi) {
+            $cands += [pscustomobject]@{
+                Name          = $n
+                Path          = $fi.FullName
+                LastWriteTime = $fi.LastWriteTime
+                LastWriteTimeUtc = $fi.LastWriteTimeUtc
+                AgeHours      = [math]::Round( `
+                    ([datetime]::UtcNow - $fi.LastWriteTimeUtc).TotalHours, 2)
+                Length        = $fi.Length
             }
-        } catch { $null = $_ }
+        }
     }
     return @($cands | Sort-Object LastWriteTimeUtc -Descending)
 }
@@ -1029,8 +1415,12 @@ function Get-ClaudeVmLogAge {
         (each boot, each Cowork command) and coworkd.log is the daemon inside
         the VM (each command again, and a clock line every few hours). A
         freshness test that read only the log that happened to be newest when
-        the script started could be reading the quiet one. Never throws.
-        Measured in UTC, so a daylight-saving change does not move it an hour.
+        the script started could be reading the quiet one. Throws when a VM
+        log could not be read (Get-ClaudeVmLogCandidates): until 6.3.1 the
+        age was then that of the logs that could be read, or $null, "no VM
+        log", and an age is what the staleness repair and the repair gate
+        act on. Measured in UTC, so a daylight-saving change does not move
+        it an hour.
     #>
     param([string]$LogDir)
 
@@ -1179,7 +1569,7 @@ function Get-W32tmOffsetSeconds {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.3.0"
+$ToolkitVersion   = "6.3.1"
 $TaskName         = "ClaudeCoworkWatchdog"
 # The logon-time fix task, retired in 6.3.0. Setup removes it where an older
 # version installed it, and so does -Undo.
@@ -1456,13 +1846,24 @@ function Initialize-ClaudeAppData {
     # has never launched Claude. Either way the folder may not exist yet, and
     # every file this script writes lives inside it, except the undo record,
     # which is in %LOCALAPPDATA%\ClaudeFix.
-    if (Test-Path -LiteralPath $script:ClaudeAppData) { return $true }
+    # Returns $true when the folder is there or was made, and throws, naming
+    # the folder and why, when it could not be read or made. Until 6.3.1
+    # Test-Path was asked, which answers $false for a folder that cannot be
+    # read as for one that is not there (measured 2026-11-23), and a folder
+    # that could not be read was said to be one that could not be created.
+    $item = $null
+    try {
+        $item = Get-ClaudeItemOrNull -LiteralPath $script:ClaudeAppData
+    } catch {
+        throw "$($script:ClaudeAppData) could not be read ($(Get-ClaudeErrorText $_))"
+    }
+    if ($null -ne $item) { return $true }
     try {
         New-Item -Path $script:ClaudeAppData -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        return $true
     } catch {
-        return $false
+        throw "$($script:ClaudeAppData) could not be created ($(Get-ClaudeErrorText $_))"
     }
+    return $true
 }
 
 function Test-DefenderExclusionCovers {
@@ -1589,6 +1990,32 @@ function Add-StepResult {
     if ($Reboot) { $s.Reboot = $true }
 }
 
+function Add-DiscoveryReadError {
+    <#
+    .SYNOPSIS
+        Says each read the discovery at start could not make (the
+        environment's ReadErrors), now and in the summary, where they are a
+        step of their own, numbered 0, with the outcome Warning. Until 6.3.1
+        they were not said, and a read that failed looked the same as one
+        that found nothing. Nothing is recorded when every read was made.
+    #>
+    param([string[]]$ReadErrors)
+    $lines = @($ReadErrors | Where-Object { $_ })
+    if ($lines.Count -eq 0) { return }
+    $s = [pscustomobject]@{
+        Num    = 0
+        Name   = 'Looking at this PC'
+        Status = 'Warning'
+        Notes  = (New-Object System.Collections.ArrayList)
+        Reboot = $false
+    }
+    foreach ($line in $lines) {
+        Log "[!] $line" -Colour Yellow -Indent
+        $null = $s.Notes.Add($line)
+    }
+    $null = $script:StepResults.Add($s)
+}
+
 function Write-StepSummary {
     $words   = @{ None = 'ran'; Skipped = 'skipped'; Unchanged = 'no change needed'; Done = 'changed'; Warning = 'check the note'; Failed = 'FAILED' }
     $colours = @{ None = 'White'; Skipped = 'DarkGray'; Unchanged = 'Gray'; Done = 'Green'; Warning = 'Yellow'; Failed = 'Red' }
@@ -1661,7 +2088,15 @@ function Get-PreventMachineGuid {
         read. Renaming the computer does not change it, and a profile copied
         to another computer does not take it along.
     #>
-    $g = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid'
+    # Best effort: one that cannot be read is '', as one that is not there,
+    # and Read-PreventUndo then tells the record's computer by its name
+    # alone, as for a record that holds no MachineGuid. Nothing is said
+    # about it, because nothing is claimed from it.
+    try {
+        $g = Get-RegistryValue -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid'
+    } catch {
+        return ''
+    }
     if ($null -eq $g) { return '' }
     return ([string]$g).Trim()
 }
@@ -1685,7 +2120,17 @@ function Read-PreventUndo {
     $script:UndoRecord = New-Object System.Collections.ArrayList
     $script:UndoForeign = $null
     $script:UndoForeignByGuid = $false
-    if (-not (Test-Path -LiteralPath $UndoFile)) { return }
+    # Until 6.3.1 Test-Path was asked, which answers $false for a file that
+    # cannot be read as for one that is not there (measured 2026-11-23): a
+    # record that could not be read was an empty one, and -Undo said there
+    # was nothing to undo.
+    $there = $null
+    try {
+        $there = Get-ClaudeItemOrNull -LiteralPath $UndoFile
+    } catch {
+        throw "The undo record $UndoFile could not be read ($(Get-ClaudeErrorText $_)). Nothing was changed. Move the file aside and rerun."
+    }
+    if ($null -eq $there) { return }
     $doc = $null
     try {
         $doc = [System.IO.File]::ReadAllText($UndoFile) | ConvertFrom-Json -ErrorAction Stop
@@ -1736,7 +2181,16 @@ function Save-PreventUndo {
         throw "The undo record $UndoFile was written on another computer ($($script:UndoForeign)), so it is not overwritten."
     }
     if ($script:UndoRecord.Count -eq 0) {
-        if (Test-Path -LiteralPath $UndoFile) { Remove-Item -LiteralPath $UndoFile -Force -ErrorAction Stop }
+        # A record that could not be read is not one that is gone. Until
+        # 6.3.1 Test-Path was asked, which answers $false for both
+        # (measured 2026-11-23), and the record was left as it was, unsaid.
+        $there = $null
+        try {
+            $there = Get-ClaudeItemOrNull -LiteralPath $UndoFile
+        } catch {
+            throw "The undo record $UndoFile could not be read ($(Get-ClaudeErrorText $_)), so it was not emptied."
+        }
+        if ($null -ne $there) { Remove-PreventItem -Path $UndoFile }
         return
     }
     if (-not (Test-Path -LiteralPath $UndoDir)) {
@@ -1757,6 +2211,8 @@ function Save-PreventUndo {
             [System.IO.File]::Move($tmp, $UndoFile)
         }
     } catch {
+        # Best effort: the error that matters is the one thrown on the next
+        # line, and a temporary file left behind is overwritten next time.
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         throw
     }
@@ -1866,6 +2322,10 @@ function Get-LegacyInstallTrace {
         what an administrator, another tool or a policy can set for reasons
         of their own. -Undo removes them only where this finds an older
         version, and setup's step 19 says which of the two it is.
+
+        Throws, naming what could not be read, when it cannot tell. Until
+        6.3.1 a file or a task that could not be read counted as not there,
+        and so as no older version.
     #>
     foreach ($it in $script:UndoRecord) {
         if ($it.Kind -eq 'LegacyInstall') { return [pscustomobject]@{ What = [string]$it.Key; Where = [string]$it.Original } }
@@ -1878,10 +2338,23 @@ function Get-LegacyInstallTrace {
         'admin launcher'           = (Join-Path $ClaudeAppData 'Launch-Claude-Admin.cmd')
     }
     foreach ($k in $files.Keys) {
-        if (Test-Path -LiteralPath $files[$k]) { return [pscustomobject]@{ What = $k; Where = [string]$files[$k] } }
+        # Test-Path answers $false for a path it could not read as well.
+        try {
+            $item = Get-ClaudeItemOrNull -LiteralPath $files[$k]
+        } catch {
+            throw "$($files[$k]) could not be read ($(Get-ClaudeErrorText $_))"
+        }
+        if ($null -ne $item) { return [pscustomobject]@{ What = $k; Where = [string]$files[$k] } }
     }
+    # Get-Command answers nothing for a command that is not installed, and
+    # without the ScheduledTasks module there is no logon task to find.
     if (Get-Command -Name Get-ScheduledTask -ErrorAction SilentlyContinue) {
-        if (Get-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue) {
+        try {
+            $boot = Get-ClaudeScheduledTaskOrNull -TaskName $BootTaskName -TaskPath $TaskPath
+        } catch {
+            throw "the scheduled task $TaskPath$BootTaskName could not be read ($(Get-ClaudeErrorText $_))"
+        }
+        if ($null -ne $boot) {
             return [pscustomobject]@{ What = 'boot-fix task'; Where = "$TaskPath$BootTaskName" }
         }
     }
@@ -1897,6 +2370,8 @@ function Get-ClaudeVmWithoutDynamicMemory {
         without DynamicMemoryEnabled, which another product's Get-VM gives,
         is not a Hyper-V VM and is left out.
     #>
+    # Get-Command answers nothing for a command that is not installed:
+    # without Hyper-V's cmdlets there are no Hyper-V VMs to read.
     if (-not (Get-Command -Name Get-VM -ErrorAction SilentlyContinue)) { return }
     Get-VM -ErrorAction Stop | Where-Object {
         $_.PSObject.Properties['DynamicMemoryEnabled'] -and [string]$_.Name -match 'claude' -and -not $_.DynamicMemoryEnabled
@@ -1992,6 +2467,8 @@ function Test-CoworkNat {
         other error is thrown, so that a rule that could not be read is
         reported rather than passed over as gone.
     #>
+    # Get-Command answers nothing for a command that is not installed:
+    # without the NetNat module there is no NAT rule to read.
     if (-not (Get-Command -Name Get-NetNat -ErrorAction SilentlyContinue)) { return $null }
     try {
         return (@(Get-NetNat -Name 'CoworkNAT' -ErrorAction Stop).Count -gt 0)
@@ -2000,6 +2477,60 @@ function Test-CoworkNat {
         if (Test-WinNatMissingError -ErrorRecord $_) { return $null }
         throw
     }
+}
+
+function Get-PreventProcessByIdOrNull {
+    <#
+    .SYNOPSIS
+        The process with that id, $null when no process has it, and throws,
+        with the error Get-Process gave, when it could not be read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with a
+        read-only probe (Get-Process -Id 999999): error id
+        NoProcessFoundForGivenId, category ObjectNotFound, exception
+        Microsoft.PowerShell.Commands.ProcessCommandException. Any other
+        error means the process could not be read. Until 6.3.1 every error
+        read as a process that had exited.
+    #>
+    param([Parameter(Mandatory)][int]$Id)
+    try {
+        return (Get-Process -Id $Id -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'NoProcessFoundForGivenId' `
+                -ExceptionType 'Microsoft.PowerShell.Commands.ProcessCommandException') { return $null }
+        throw
+    }
+}
+
+function Wait-PreventProcessExit {
+    <#
+    .SYNOPSIS
+        Waits up to two seconds for the process with that id to go: $true
+        once it is gone, $false when it still runs after that, and throws
+        when it could not be read.
+    .DESCRIPTION
+        A process that was stopped can take a moment to go, and one that
+        ended by itself before the stop is gone as well.
+    #>
+    param([Parameter(Mandatory)][int]$Id)
+    for ($i = 0; $i -lt 10; $i++) {
+        if ($null -eq (Get-PreventProcessByIdOrNull -Id $Id)) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
+function Get-PreventTaskState {
+    <#
+    .SYNOPSIS
+        The state of the scheduled task $TaskPath$Name, such as Ready or
+        Running, '' when there is no such task, and throws when it could
+        not be read (see Get-ClaudeScheduledTaskOrNull).
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    $t = Get-ClaudeScheduledTaskOrNull -TaskName $Name -TaskPath $TaskPath
+    if ($null -eq $t) { return '' }
+    return [string]$t.State
 }
 
 function Remove-PreventTask {
@@ -2094,26 +2625,111 @@ function Remove-PreventTaskFolder {
     return 'it is still there after it was removed'
 }
 
+function Test-PreventPathThere {
+    <#
+    .SYNOPSIS
+        $true when there is a file or folder at Path, $false when there is
+        none, and $null when that could not be read. That one is said as a
+        Warning on the current step, naming the path, why, and what was
+        therefore not done ($NotDone); in -Undo it also marks the undo as
+        not complete.
+    .DESCRIPTION
+        Test-Path cannot tell these apart: for a file or folder the user
+        cannot read it answers $false, as for one that is not there
+        (measured 2026-11-23, an explicit Deny on the folder that holds it:
+        Test-Path writes ItemExistsUnauthorizedAccessError and returns
+        $false). Until 6.3.1 every file an older version left was looked
+        for with it, so one that could not be read was reported as gone.
+    #>
+    param([string]$Path, [string]$NotDone)
+    try {
+        return ($null -ne (Get-ClaudeItemOrNull -LiteralPath $Path))
+    } catch {
+        $said = "$Path could not be read ($(Get-ClaudeErrorText $_)), so $NotDone"
+        Log "[!] $said" -Colour Yellow -Indent
+        Add-StepResult -Status Warning -Detail $said
+        if ($script:UndoMode) { $script:UndoUnread = $true }
+        return $null
+    }
+}
+
+function Find-PreventKitFile {
+    <#
+    .SYNOPSIS
+        The first of Candidates that is a file, or $null when none is. A
+        place that could not be read throws, naming it and why: the search
+        does not go on to a later place, so nothing is installed from
+        another copy in its stead. Until 6.3.1 Test-Path was asked, which
+        answers $false for a file that cannot be read as for one that is
+        not there (measured 2026-11-23).
+    #>
+    param([string[]]$Candidates)
+    foreach ($c in @($Candidates)) {
+        if (-not $c) { continue }
+        $item = $null
+        try {
+            $item = Get-ClaudeItemOrNull -LiteralPath $c
+        } catch {
+            throw "$c could not be read ($(Get-ClaudeErrorText $_))"
+        }
+        if ($null -ne $item -and -not $item.PSIsContainer) { return $c }
+    }
+    return $null
+}
+
+function Remove-PreventItem {
+    <#
+    .SYNOPSIS
+        Removes one file, and throws, naming it and why, when it cannot.
+    .DESCRIPTION
+        For a file the user may not delete, the error Remove-Item gives does
+        not name it ("Access to the path is denied.", measured 2026-11-23),
+        and the steps that remove a file this way report the error as it
+        comes. Until 6.3.1 they said what failed, but not on which file.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = '-WhatIf is refused at the top of the script')]
+    param([string]$Path)
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    } catch {
+        throw "$Path could not be removed ($(Get-ClaudeErrorText $_))"
+    }
+}
+
 function Remove-PreventFile {
     <#
     .SYNOPSIS
         Deletes a file this script or an older version made, and reports it
         to the current step: Done once it is gone, Failed while it is still
-        there. Returns $true when there was a file. Until 6.3.0 -Undo logged
-        every file it tried to delete as removed.
+        there or whether it is gone could not be read, and a Warning when
+        whether it is there could not be read. Returns $true when there was
+        a file, or one could not be ruled out. Until 6.3.0 -Undo logged
+        every file it tried to delete as removed. Until 6.3.1 a file that
+        could not be read was taken for none, so -Undo said "No shortcuts
+        found" while one was left.
     #>
     # -WhatIf is refused before anything runs, so there is no preview for
     # ShouldProcess to serve. -Undo reports what each removal did instead.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = '-WhatIf is refused at the top of the script')]
     param([string]$Path, [string]$What = 'Removed')
-    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $there = Test-PreventPathThere -Path $Path -NotDone 'it was not removed'
+    if ($null -eq $there) { return $true }
+    if (-not $there) { return $false }
     $why = $null
     try {
         Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
     } catch {
         $why = $_.Exception.Message
     }
-    if (Test-Path -LiteralPath $Path) {
+    $left = $null
+    try {
+        $left = Get-ClaudeItemOrNull -LiteralPath $Path
+    } catch {
+        $gone = "whether it is gone could not be read ($(Get-ClaudeErrorText $_))"
+        if ($why) { $why = "$why; $gone" } else { $why = $gone }
+        $left = $true
+    }
+    if ($null -ne $left) {
         if (-not $why) { $why = 'it is still there' }
         Log "[!] Could not remove ${Path}: $why" -Colour Red -Indent
         Add-StepResult -Status Failed -Detail "Could not remove ${Path}: $why"
@@ -2222,12 +2838,15 @@ function Install-HealthMonitorTask {
         } catch {
             $why = $_.Exception.Message
         }
-        # A process that was stopped can take a moment to go, and one that
-        # ended by itself before the stop is gone as well.
-        $alive = $true
-        for ($i = 0; $i -lt 10; $i++) {
-            if (-not (Get-Process -Id $monId -ErrorAction SilentlyContinue)) { $alive = $false; break }
-            Start-Sleep -Milliseconds 200
+        # Until 6.3.1 a process that could not be read counted as gone.
+        try {
+            $alive = -not (Wait-PreventProcessExit -Id $monId)
+        } catch {
+            $startNow = $false
+            $said = "Could not read whether the health monitor already running (PID $monId) stopped, so the new one was not started now; it starts at the next logon: $(Get-ClaudeErrorText $_)"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+            continue
         }
         if ($alive) {
             $startNow = $false
@@ -2244,13 +2863,66 @@ function Install-HealthMonitorTask {
     }
 
     if ($startNow) {
+        # The task runs one instance at a time: MultipleInstances is
+        # IgnoreNew, the default of New-ScheduledTaskSettingsSet (read
+        # 2026-11-22 from the monitor's task on Windows 11), and the scheduler
+        # ignores a start, with no error, while it reads an instance as
+        # running. After the old monitor is stopped the task can read running
+        # a moment longer. So the start waits up to 5 seconds for that to
+        # end, and afterwards checks that the task runs: its action waits 120
+        # seconds before the monitor starts, so a start that took reads
+        # running for that long. Until 6.3.1 neither was checked, and
+        # "Started it now" was said of a start the scheduler ignored.
+        $notStarted = $null
         try {
-            Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
-            Log "Started it now: the monitor begins watching in 120 seconds" -Colour Green -Indent
+            $state = Get-PreventTaskState -Name $TaskName
+            for ($i = 0; $i -lt 20 -and $state -eq 'Running'; $i++) {
+                Start-Sleep -Milliseconds 250
+                $state = Get-PreventTaskState -Name $TaskName
+            }
+            if ($state -eq 'Running') {
+                $notStarted = "it still reads as running 5 seconds after the old monitor was stopped, and the scheduler ignores a start while it does"
+            }
         } catch {
-            $said = "The health monitor task could not be started now, so the monitor starts at the next logon: $($_.Exception.Message)"
+            $notStarted = "its state could not be read ($(Get-ClaudeErrorText $_))"
+        }
+        $started = $false
+        if ($notStarted) {
+            $said = "The health monitor task was not started now, because $notStarted; the monitor starts at the next logon"
             Log "[!] $said" -Colour Yellow -Indent
             Add-StepResult -Status Warning -Detail $said
+        } else {
+            try {
+                Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop
+                $started = $true
+            } catch {
+                $said = "The health monitor task could not be started now, so the monitor starts at the next logon: $($_.Exception.Message)"
+                Log "[!] $said" -Colour Yellow -Indent
+                Add-StepResult -Status Warning -Detail $said
+            }
+        }
+        if ($started) {
+            $said = $null
+            try {
+                $state = Get-PreventTaskState -Name $TaskName
+                for ($i = 0; $i -lt 12 -and $state -ne 'Running'; $i++) {
+                    Start-Sleep -Milliseconds 250
+                    $state = Get-PreventTaskState -Name $TaskName
+                }
+                if ($state -eq 'Running') {
+                    Log "Started it now: the monitor begins watching in 120 seconds" -Colour Green -Indent
+                } elseif ($state) {
+                    $said = "The scheduler accepted the start of the health monitor task, but the task did not start: it reads $state 3 seconds later. The monitor starts at the next logon"
+                } else {
+                    $said = "The scheduler accepted the start of the health monitor task, but the task is no longer there 3 seconds later"
+                }
+            } catch {
+                $said = "The health monitor task was started, but its state could not be read to check that it runs: $(Get-ClaudeErrorText $_)"
+            }
+            if ($said) {
+                Log "[!] $said" -Colour Yellow -Indent
+                Add-StepResult -Status Warning -Detail $said
+            }
         }
     }
 
@@ -2413,10 +3085,27 @@ function Get-UltimatePlanGuids {
         so the test the earlier versions used, the words "Ultimate
         Performance" in that list, found nothing on a non-English Windows
         and every run made one more copy.
+
+        Throws when the plans could not be read. A key that is not there
+        holds no plan: Get-ChildItem says so with error id PathNotFound,
+        category ObjectNotFound, exception
+        System.Management.Automation.ItemNotFoundException (measured
+        2026-11-22 on Windows 11, Windows PowerShell 5.1, with a read-only
+        probe of a missing registry key). Until 6.3.1 every error read as no
+        plan, and setup then made one more copy.
     #>
     $root = "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes"
     $found = @()
-    foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+    $keys = @()
+    try {
+        $keys = @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)
+    } catch {
+        if (-not (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' `
+                -ExceptionType 'System.Management.Automation.ItemNotFoundException')) {
+            throw "the power plans in the registry could not be read ($(Get-ClaudeErrorText $_))"
+        }
+    }
+    foreach ($k in $keys) {
         $g = ([string]$k.PSChildName).ToLowerInvariant()
         if ($g -eq $UltimateTemplateGuid -or $g -notmatch "^$GuidPattern$") { continue }
         $fn = $k.GetValue('FriendlyName')
@@ -2535,24 +3224,41 @@ function Get-ModernStandbyState {
 function Get-RegistryValue {
     <#
     .SYNOPSIS
-        A registry value as stored, or $null when the key or the value is absent.
+        A registry value as stored, or $null when the key or the value is
+        absent. Throws, naming the value, the key and why, when it could not
+        be read.
     .DESCRIPTION
         A REG_BINARY or REG_MULTI_SZ value is returned whole, as the byte[] or
         string[] it is. A bare "return" of an array hands its elements down
         the pipeline one by one, and the caller gets an object[] of them, so
         a FailureActions value never read as a byte[] and step 9 could not
         recognise the recovery it had just set.
+
+        Until 6.3.1 every error here was read as $null, the answer for a
+        value that is not there. A key Windows will not open (measured
+        2026-11-23, HKLM:\SAM\SAM: System.Security.SecurityException,
+        PermissionDenied) was then one with no value: a step recorded that
+        there was none before it wrote one, so -Undo would delete the value
+        instead of putting it back, and -Undo said it had removed a value
+        it never looked at. Get-ClaudeItemOrNull tells the key that is not
+        there from the one that cannot be read; Test-Path cannot, as it
+        answers $true for a key it cannot open, and even for a child of it
+        that does not exist (measured the same day). Get-PreventMachineGuid
+        catches the error; every other caller runs inside a try that reports
+        it as the step's outcome, so nothing is changed from a value that
+        was not read.
     #>
     param([string]$Path, [string]$Name)
     try {
-        $k = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $k = Get-ClaudeItemOrNull -LiteralPath $Path
+        if ($null -eq $k) { return $null }
         if (@($k.GetValueNames()) -notcontains $Name) { return $null }
         $v = $k.GetValue($Name)
-        if ($v -is [array]) { return ,$v }
-        return $v
     } catch {
-        return $null
+        throw "The registry value $Name in $Path could not be read ($(Get-ClaudeErrorText $_))"
     }
+    if ($v -is [array]) { return ,$v }
+    return $v
 }
 
 function Write-RecordedDword {
@@ -2734,6 +3440,8 @@ function Save-ClaudeIcon {
             $ok = $false
         }
     }
+    # Best effort: $ok already says whether the icon was saved, and a
+    # temporary file left behind is overwritten next time.
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     return $ok
 }
@@ -3369,7 +4077,15 @@ function Restore-PreventUndoItem {
         }
 
         'ServiceFailureActions' {
-            if (-not (Get-Service -Name $key -ErrorAction SilentlyContinue)) { return $true }
+            # A service that is gone has no recovery to put back. Until 6.3.1
+            # one that could not be read counted as gone, and its record
+            # was dropped.
+            try {
+                $svc = Get-ClaudeServiceOrNull -Name $key
+            } catch {
+                throw "the service could not be read, so its recovery settings stay recorded ($(Get-ClaudeErrorText $_))"
+            }
+            if ($null -eq $svc) { return $true }
             $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$key"
             $reboot = $false
             if ($null -eq $orig) {
@@ -3445,6 +4161,8 @@ if ($Undo) {
     Write-Host "  MODE: UNDO, putting back what this script changed" -ForegroundColor Yellow
     Write-Host ""
 }
+# Each read the discovery could not make, said before the first step.
+Add-DiscoveryReadError -ReadErrors @($script:ClaudeEnv.ReadErrors)
 
 try {
     # Before anything changes: a record that cannot be read stops the run
@@ -3600,7 +4318,20 @@ if ($Undo) {
         # Whether an older version ran here, decided before this step deletes
         # the files that show it, and recorded so that a -Undo which cannot
         # finish here still knows it next time.
-        $legacyTrace = Get-LegacyInstallTrace
+        # One that cannot be told is said, and what is removed only where an
+        # older version ran is left. Until 6.3.1 it read as no older version.
+        $legacyTrace = $null
+        $legacyUnread = $false
+        try {
+            $legacyTrace = Get-LegacyInstallTrace
+        } catch {
+            $legacyUnread = $true
+            $unreadCount++
+            $script:UndoUnread = $true
+            $said = "Whether a version before 6.3.0 ran here could not be told, because $(Get-ClaudeErrorText $_), so what -Undo removes only where one ran is left as it is"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+        }
         $legacySeen = $null -ne $legacyTrace
         if ($legacySeen -and -not $script:UndoForeign -and $null -eq (Get-PreventUndoItem -Kind LegacyInstall -Key $legacyTrace.What)) {
             try {
@@ -3614,23 +4345,52 @@ if ($Undo) {
         # The power plan. Versions before 6.3.0 kept the plan they replaced in
         # $BackupFile. A 6.3.0 setup carries it over to the undo record and
         # deletes it, so it is here only when no 6.3.0 setup has run.
-        if (Test-Path -LiteralPath $BackupFile) {
+        # Until 6.3.1 each file below was looked for with Test-Path, which
+        # answers $false for a file that cannot be read as for one that is
+        # not there (measured 2026-11-23): one that could not be read was
+        # not counted, and "Nothing from older versions found" was said.
+        $there = Test-PreventPathThere -Path $BackupFile -NotDone 'the plan it holds was not put back, and it was not removed'
+        if ($null -eq $there) { $unreadCount++ }
+        if ($there) {
             $legacyCount++
             if ($planRestored) {
-                Remove-Item -LiteralPath $BackupFile -Force -ErrorAction Stop
+                Remove-PreventItem -Path $BackupFile
             } else {
+                # A record or a plan list that could not be read keeps the
+                # record for the next -Undo. Until 6.3.1 a record that could
+                # not be read was taken for one that held no plan: Balanced
+                # was made active and the record deleted.
                 $legacyPlan = $null
-                try { $legacyPlan = ([string](Get-Content -LiteralPath $BackupFile -Raw -ErrorAction Stop)).Trim().ToLowerInvariant() } catch { $legacyPlan = $null }
+                $legacyUnreadWhy = $null
+                try {
+                    $legacyPlan = ([string](Get-Content -LiteralPath $BackupFile -Raw -ErrorAction Stop)).Trim().ToLowerInvariant()
+                } catch {
+                    $legacyUnreadWhy = "$BackupFile could not be read ($(Get-ClaudeErrorText $_))"
+                }
                 $legacyExists = $false
-                if ($legacyPlan -match "^$GuidPattern$") { $legacyExists = Test-PowerPlanExists -Plan $legacyPlan }
-                if ($null -eq $legacyExists) {
+                $ultimateNow = @()
+                if ($null -eq $legacyUnreadWhy -and $legacyPlan -match "^$GuidPattern$") {
+                    $legacyExists = Test-PowerPlanExists -Plan $legacyPlan
+                    if ($legacyExists) {
+                        try {
+                            $ultimateNow = @(Get-UltimatePlanGuids)
+                        } catch {
+                            $legacyUnreadWhy = $_.Exception.Message
+                        }
+                    }
+                }
+                if ($null -ne $legacyUnreadWhy) {
+                    $said = "The plan an older version recorded was not put back, because $legacyUnreadWhy; its record is kept for the next -Undo"
+                    Log "[!] $said" -Colour Red -Indent
+                    Add-StepResult -Status Failed -Detail $said
+                } elseif ($null -eq $legacyExists) {
                     # Not known whether that plan is there: the older
                     # version's record stays for the next -Undo.
                     Log "[!] powercfg could not list the power plans, so the plan an older version recorded was not put back" -Colour Red -Indent
                     Add-StepResult -Status Failed -Detail "powercfg could not list the power plans: the older version's record of your plan is kept for the next -Undo"
                 } else {
                     $target = $BalancedGuid
-                    if ($legacyExists -and (@(Get-UltimatePlanGuids) -notcontains $legacyPlan)) {
+                    if ($legacyExists -and ($ultimateNow -notcontains $legacyPlan)) {
                         $target = $legacyPlan
                     } else {
                         Log "[!] The older version's record does not hold the plan you had, so Balanced is made active" -Colour Yellow -Indent
@@ -3640,7 +4400,7 @@ if ($Undo) {
                     if ((Get-ActivePlanGuid) -eq $target) {
                         Log "Power plan put back: $(Get-PowerPlanName -Plan $target)" -Colour Green -Indent
                         Add-StepResult -Status Done
-                        Remove-Item -LiteralPath $BackupFile -Force -ErrorAction Stop
+                        Remove-PreventItem -Path $BackupFile
                     } else {
                         Log "[!] Could not make $target the active plan: $($r.Output)" -Colour Red -Indent
                         Add-StepResult -Status Failed -Detail "powercfg could not make $target the active plan"
@@ -3713,17 +4473,29 @@ if ($Undo) {
 
         # Connected Standby. Versions before 6.3.0 set CsEnabled to 0 and kept
         # the value it had in $CsBackupFile.
-        if (Test-Path -LiteralPath $CsBackupFile) {
+        $there = Test-PreventPathThere -Path $CsBackupFile -NotDone 'Connected Standby was not put back from it, and it was not removed'
+        if ($null -eq $there) { $unreadCount++ }
+        if ($there) {
             $legacyCount++
+            $csPut = $false
             try {
                 $cs = [int]([string](Get-Content -LiteralPath $CsBackupFile -Raw -ErrorAction Stop)).Trim()
                 Set-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name 'CsEnabled' -Value $cs -Type DWord -ErrorAction Stop
-                Remove-Item -LiteralPath $CsBackupFile -Force -ErrorAction Stop
+                $csPut = $true
+                Remove-PreventItem -Path $CsBackupFile
                 Log "CsEnabled (Connected Standby): put back to $cs" -Colour Green -Indent
                 Add-StepResult -Status Done -Reboot
             } catch {
-                Log "[!] Could not put back CsEnabled: $($_.Exception.Message)" -Colour Red -Indent
-                Add-StepResult -Status Failed -Detail "Could not put back CsEnabled: $($_.Exception.Message)"
+                # A record that cannot be removed once CsEnabled is put back is
+                # said as that. Until 6.3.1 it was "Could not put back
+                # CsEnabled", with an error that did not name the record.
+                if ($csPut) {
+                    Log "[!] CsEnabled (Connected Standby) was put back to $cs, but $($_.Exception.Message)" -Colour Red -Indent
+                    Add-StepResult -Status Failed -Detail "CsEnabled (Connected Standby) was put back to $cs, but $($_.Exception.Message)" -Reboot
+                } else {
+                    Log "[!] Could not put back CsEnabled: $($_.Exception.Message)" -Colour Red -Indent
+                    Add-StepResult -Status Failed -Detail "Could not put back CsEnabled: $($_.Exception.Message)"
+                }
             }
         }
 
@@ -3739,6 +4511,12 @@ if ($Undo) {
         foreach ($lv in $legacyValues) {
             $v = Get-RegistryValue -Path $lv.Path -Name $lv.Name
             if (-not ($v -is [int] -and $v -eq $lv.Value)) { continue }
+            if ($legacyUnread) {
+                $said = "$($lv.Name) = $($lv.Value) matches what older versions set, but whether one ran here could not be told, so it is left as it is"
+                Log $said -Colour DarkGray -Indent
+                Add-StepResult -Status Unchanged -Detail $said
+                continue
+            }
             if (-not $legacySeen) {
                 $unseenCount++
                 $said = "$($lv.Name) = $($lv.Value) matches what older versions set, but no older install was found here, so it is left as it is"
@@ -3783,9 +4561,11 @@ if ($Undo) {
         }
 
         $flagFile = Join-Path $ClaudeAppData "disable-dynamic-memory.flag"
-        if (Test-Path -LiteralPath $flagFile) {
+        $there = Test-PreventPathThere -Path $flagFile -NotDone 'it was not removed'
+        if ($null -eq $there) { $unreadCount++ }
+        if ($there) {
             $legacyCount++
-            Remove-Item -LiteralPath $flagFile -Force -ErrorAction Stop
+            Remove-PreventItem -Path $flagFile
             Log "Removed $flagFile" -Colour Green -Indent
             Add-StepResult -Status Done
         }
@@ -3795,6 +4575,8 @@ if ($Undo) {
         # where an older version is known to have run. Hyper-V changes it only
         # while a VM is off, so a VM that is not is named, and the record that
         # an older version ran here stays for the next -Undo.
+        # Get-Command answers nothing for a command that is not installed:
+        # without Hyper-V's cmdlets there is no Dynamic Memory to turn on.
         if ($legacySeen -and (Get-Command -Name Set-VMMemory -ErrorAction SilentlyContinue)) {
             $dmVms = @()
             try {
@@ -3838,7 +4620,19 @@ if ($Undo) {
         # record to put back, the recovery is cleared as it was before.
         foreach ($svcName in @('vmcompute', $ServiceName)) {
             if (-not $svcName) { continue }
-            if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) { continue }
+            # A service that is not installed has no recovery to clear. Until
+            # 6.3.1 one that could not be read counted as not installed.
+            try {
+                $svc = Get-ClaudeServiceOrNull -Name $svcName
+            } catch {
+                $unreadCount++
+                $script:UndoUnread = $true
+                $said = "Could not read the service $svcName, so the restart recovery older versions set on it was not checked: $(Get-ClaudeErrorText $_)"
+                Log "[!] $said" -Colour Yellow -Indent
+                Add-StepResult -Status Warning -Detail $said
+                continue
+            }
+            if ($null -eq $svc) { continue }
             if (-not (Test-RestartRecovery (ConvertFrom-FailureActionsBlob -Bytes (Get-ServiceFailureBytes -Service $svcName)))) { continue }
             # A record step 1 could not put back is what the next -Undo puts
             # back. Clearing the recovery here would leave it as neither.
@@ -3873,7 +4667,11 @@ if ($Undo) {
         } else {
             Log "Hibernate and Fast Startup turned off before 6.3.0 were not recorded, so they are left as they are" -Colour DarkGray -Indent
             Add-StepResult -Status Unchanged -Detail "Hibernate and Fast Startup turned off by a version before 6.3.0 are left as they are: there is no record of what they were"
-            if (@(Get-UltimatePlanGuids).Count -gt 0) {
+            # A note, not a check: plans that could not be read are not
+            # named, and the note is left out.
+            $ultimateLeft = @()
+            try { $ultimateLeft = @(Get-UltimatePlanGuids) } catch { $ultimateLeft = @() }
+            if ($ultimateLeft.Count -gt 0) {
                 Log "Ultimate Performance plans are left in place: there is no record of which ones older versions made" -Colour DarkGray -Indent
             }
         }
@@ -3910,12 +4708,14 @@ if ($Undo) {
         } catch {
             $why = $_.Exception.Message
         }
-        # A process that was stopped can take a moment to go, and one that
-        # ended by itself before the stop is gone as well.
-        $alive = $true
-        for ($i = 0; $i -lt 10; $i++) {
-            if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { $alive = $false; break }
-            Start-Sleep -Milliseconds 200
+        # Until 6.3.1 a process that could not be read counted as gone.
+        try {
+            $alive = -not (Wait-PreventProcessExit -Id $procId)
+        } catch {
+            $said = "Could not read whether the health monitor (PID $procId) stopped: $(Get-ClaudeErrorText $_)"
+            Log "[!] $said" -Colour Red -Indent
+            Add-StepResult -Status Failed -Detail $said
+            continue
         }
         if ($alive) {
             if (-not $why) { $why = 'it is still running' }
@@ -4032,8 +4832,10 @@ if ($Undo) {
     # Claude Desktop may not be installed yet, so its AppData folder may not
     # exist. Later steps write their files there. The undo record's folder is
     # made here too: no setting is changed without a record.
-    if (-not (Initialize-ClaudeAppData)) {
-        throw "Could not create $ClaudeAppData. Nothing was changed."
+    try {
+        $null = Initialize-ClaudeAppData
+    } catch {
+        throw "$($_.Exception.Message). Nothing was changed."
     }
     if (-not (Test-Path -LiteralPath $UndoDir)) {
         try {
@@ -4063,14 +4865,33 @@ if ($Undo) {
         $ultimates = @(Get-UltimatePlanGuids)
         if ($null -eq (Get-PreventUndoItem -Kind PowerPlan -Key Active)) {
             $original = $current
-            if (Test-Path -LiteralPath $BackupFile) {
+            # Until 6.3.1 Test-Path was asked, which answers $false for a
+            # file that cannot be read as for one that is not there
+            # (measured 2026-11-23): such a record was taken for none, and
+            # the plan active now, likely the older version's own copy, was
+            # recorded as yours.
+            $legacyThere = $null
+            try {
+                $legacyThere = Get-ClaudeItemOrNull -LiteralPath $BackupFile
+            } catch {
+                throw "the older version's record of your plan, $BackupFile, could not be read ($(Get-ClaudeErrorText $_)), so the plan you had is not recorded yet, and the record is kept"
+            }
+            if ($null -ne $legacyThere) {
                 # An older version ran, and the active plan is likely its own
                 # Ultimate Performance copy. The plan you had is the one in its
                 # record, or Balanced when that record is no use. Until this
                 # was checked, a record naming a plan since deleted left its
                 # copy recorded as yours, and -Undo kept it active.
+                # A record that could not be read is not one that holds no
+                # plan: the step stops, and the record is kept. Until 6.3.1 it
+                # was taken for one, Balanced was recorded as the plan you
+                # had, and the record was deleted below.
                 $legacy = $null
-                try { $legacy = ([string](Get-Content -LiteralPath $BackupFile -Raw -ErrorAction Stop)).Trim().ToLowerInvariant() } catch { $legacy = $null }
+                try {
+                    $legacy = ([string](Get-Content -LiteralPath $BackupFile -Raw -ErrorAction Stop)).Trim().ToLowerInvariant()
+                } catch {
+                    throw "the older version's record of your plan, $BackupFile, could not be read ($(Get-ClaudeErrorText $_)), so the plan you had is not recorded yet, and the record is kept"
+                }
                 $why = $null
                 if ($legacy -notmatch "^$GuidPattern$") {
                     $why = "an older version's record of your original plan cannot be read"
@@ -4099,11 +4920,11 @@ if ($Undo) {
             Add-PreventUndoItem -Kind PowerPlan -Key Active -Original $original
             Log "Recorded the plan to return to on -Undo: $(Get-PowerPlanName -Plan $original)" -Colour DarkGray -Indent
         }
-        if (Test-Path -LiteralPath $BackupFile) {
+        if (Test-PreventPathThere -Path $BackupFile -NotDone 'it was not recorded or removed') {
             # It shows an older version ran here, which -Undo needs to know
             # once the file is gone.
             Add-LegacyInstallRecord -What 'power plan record' -Where $BackupFile
-            Remove-Item -LiteralPath $BackupFile -Force -ErrorAction Stop
+            Remove-PreventItem -Path $BackupFile
         }
 
         $target = $null
@@ -4335,8 +5156,17 @@ if ($Undo) {
     try {
         $hcsExe = $script:ClaudeEnv.HcsDiagPath
         if (-not $hcsExe) {
-            Log "hcsdiag.exe not available, so the Cowork VM's worker cannot be told from other VMs'" -Colour DarkGray -Indent
-            Add-StepResult -Status Skipped -Detail "hcsdiag.exe is not available"
+            # The discovery leaves HcsDiagPath unset for an hcsdiag.exe that
+            # is not there and for one that could not be read, and says the
+            # second before step 1. The step says which: one that could not
+            # be read is a Warning that names it and why. Until 6.3.1 both
+            # were Skipped, "hcsdiag.exe is not available", as if Windows did
+            # not have it.
+            $hcsThere = Test-PreventPathThere -Path "$env:SystemRoot\System32\hcsdiag.exe" -NotDone "the Cowork VM's worker cannot be told from other VMs' and was not raised"
+            if ($null -ne $hcsThere) {
+                Log "hcsdiag.exe not available, so the Cowork VM's worker cannot be told from other VMs'" -Colour DarkGray -Indent
+                Add-StepResult -Status Skipped -Detail "hcsdiag.exe is not available"
+            }
         } else {
             $hcsList = & $hcsExe list 2>&1 | Out-String
             $listCode = $LASTEXITCODE
@@ -4356,8 +5186,16 @@ if ($Undo) {
             }
             foreach ($id in $ids) {
                 # A worker can exit between the query and here, when the VM
-                # shuts down. Until 6.3.0 that failed the whole step.
-                $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+                # shuts down. Until 6.3.0 that failed the whole step, and
+                # until 6.3.1 a worker that could not be read had "exited".
+                try {
+                    $proc = Get-PreventProcessByIdOrNull -Id $id
+                } catch {
+                    $said = "Could not read the Cowork VM worker (PID $id), so its priority was not checked or raised: $(Get-ClaudeErrorText $_)"
+                    Log "[!] $said" -Colour Yellow -Indent
+                    Add-StepResult -Status Warning -Detail $said
+                    continue
+                }
                 if (-not $proc) {
                     Log "Cowork VM worker (PID $id) has exited" -Colour DarkGray -Indent
                     Add-StepResult -Status Skipped -Detail "The Cowork VM's worker exited"
@@ -4381,7 +5219,13 @@ if ($Undo) {
     # ----------------------------------------------------------------
     Step 9 $steps "Configuring Hyper-V compute service recovery..." -Name "vmcompute recovery"
     try {
-        if (-not (Get-Service -Name vmcompute -ErrorAction SilentlyContinue)) {
+        # Until 6.3.1 a service that could not be read was "not installed".
+        try {
+            $vmc = Get-ClaudeServiceOrNull -Name vmcompute
+        } catch {
+            throw "Could not read the service vmcompute, so its restart recovery was not checked or set: $(Get-ClaudeErrorText $_)"
+        }
+        if ($null -eq $vmc) {
             Log "vmcompute is not installed (Hyper-V is off)" -Colour DarkGray -Indent
             Add-StepResult -Status Skipped
         } else {
@@ -4431,7 +5275,15 @@ if ($Undo) {
         try {
             # Every process named claude counts, the Claude Code CLI included:
             # this only decides to leave the VM alone, and erring that way is safe.
-            $claudeLive = @(Get-Process -Name claude -ErrorAction SilentlyContinue).Count -gt 0
+            # A list that could not be read leaves them alone too, and says so:
+            # until 6.3.1 it read as Claude not running, and the VMs were killed.
+            $claudeLive = $false
+            $claudeUnread = $null
+            try {
+                $claudeLive = @(Get-ClaudeProcessByName -Name claude).Count -gt 0
+            } catch {
+                $claudeUnread = Get-ClaudeErrorText $_
+            }
             $hcsList = & $hcsExe list 2>&1 | Out-String
             # Until 6.3.0 a list that failed read as an empty one: "HCS state clean".
             $listCode = $LASTEXITCODE
@@ -4441,6 +5293,10 @@ if ($Undo) {
             if ($guids.Count -eq 0) {
                 Log "HCS state clean" -Colour Green -Indent
                 Add-StepResult -Status Unchanged
+            } elseif ($null -ne $claudeUnread) {
+                $said = "Could not list the processes named claude, so it is not known whether Claude is running, and the $($guids.Count) cowork-vm instance(s) are left alone: $claudeUnread"
+                Log "[!] $said" -Colour Yellow -Indent
+                Add-StepResult -Status Warning -Detail $said
             } elseif ($claudeLive) {
                 Log "$($guids.Count) cowork-vm instance(s) present but Claude is running, leaving them alone" -Colour DarkGray -Indent
                 Add-StepResult -Status Skipped -Detail "Claude is running, so its VM is in use"
@@ -4486,8 +5342,14 @@ if ($Undo) {
             Add-StepResult -Status Failed -Detail "HCS cleanup check failed: $($_.Exception.Message)"
         }
     } else {
-        Log "hcsdiag.exe not available" -Colour DarkGray -Indent
-        Add-StepResult -Status Skipped -Detail "hcsdiag.exe is not available"
+        # As in step 8: an hcsdiag.exe that could not be read is a Warning
+        # that names it and why, not Skipped as one that is not there. Until
+        # 6.3.1 both were "not available".
+        $hcsThere = Test-PreventPathThere -Path "$env:SystemRoot\System32\hcsdiag.exe" -NotDone "stale Cowork VMs were not looked for"
+        if ($null -ne $hcsThere) {
+            Log "hcsdiag.exe not available" -Colour DarkGray -Indent
+            Add-StepResult -Status Skipped -Detail "hcsdiag.exe is not available"
+        }
     }
     Complete-Step
 
@@ -4553,8 +5415,22 @@ if ($Undo) {
         }
     }
 
-    # Check the VM cache path specifically for problematic locations
-    if ($vmCachePath -and (Test-Path $vmCachePath)) {
+    # Check the VM cache path specifically for problematic locations. A
+    # cache folder that could not be read is said, and its drive, which is
+    # in its path, is checked all the same. Until 6.3.1 Test-Path was asked,
+    # which answers $false for a folder that cannot be read as for one that
+    # is not there (measured 2026-11-23): neither was checked, and the step
+    # said "Storage location OK".
+    $vmCacheThere = $false
+    if ($vmCachePath) {
+        try {
+            $vmCacheThere = ($null -ne (Get-ClaudeItemOrNull -LiteralPath $vmCachePath))
+        } catch {
+            $storageUnread += "Could not read the VM cache folder ${vmCachePath}: $(Get-ClaudeErrorText $_)"
+            $vmCacheThere = $true
+        }
+    }
+    if ($vmCacheThere) {
         try {
             $vmDrive = (Split-Path $vmCachePath -Qualifier -ErrorAction Stop) + "\"
             $vmDisk = @(Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($vmDrive.TrimEnd('\'))'" -ErrorAction Stop)
@@ -4592,8 +5468,19 @@ if ($Undo) {
     # was reported as done.
     Step 12 $steps "Checking the clock..." -Name "Clock"
     try {
-        $w32 = Get-Service -Name W32Time -ErrorAction SilentlyContinue
-        if (-not $w32) {
+        # Until 6.3.1 a service that could not be read was "not installed".
+        $w32 = $null
+        $w32Unread = $null
+        try {
+            $w32 = Get-ClaudeServiceOrNull -Name W32Time
+        } catch {
+            $w32Unread = Get-ClaudeErrorText $_
+        }
+        if ($null -ne $w32Unread) {
+            $said = "Could not read the Windows Time service, so it was not started and the clock was not checked: $w32Unread"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+        } elseif (-not $w32) {
             Log "[!] The Windows Time service is not installed" -Colour Yellow -Indent
             Add-StepResult -Status Warning -Detail "The Windows Time service is not installed"
         } else {
@@ -4620,7 +5507,12 @@ if ($Undo) {
                 try {
                     $lookup = [System.Net.Dns]::GetHostAddressesAsync('time.windows.com')
                     if ($lookup.Wait($leftMs) -and @($lookup.Result).Count -gt 0) { $resolved = $true }
-                } catch { $null = $_ }
+                } catch {
+                    # A lookup that fails is tried again until the 30 seconds
+                    # are up, and then the step says the server could not be
+                    # reached, which is what was seen.
+                    $null = $_
+                }
                 if ($resolved) { break }
                 $leftMs = $deadlineMs - [int]$netWait.ElapsedMilliseconds
                 if ($leftMs -le 0) { break }
@@ -4700,10 +5592,21 @@ if ($Undo) {
         "TmCCSF"       = "Trend Micro"
         "SophosSafestore" = "Sophos"
     }
+    # Until 6.3.1 a process list that could not be read read as no
+    # antivirus running.
     $runningAv = @()
+    $avProcUnread = $false
     foreach ($proc in $knownAvProcesses.Keys) {
-        if (Get-Process -Name $proc -ErrorAction SilentlyContinue) {
-            $runningAv += $knownAvProcesses[$proc]
+        try {
+            if (@(Get-ClaudeProcessByName -Name $proc).Count -gt 0) {
+                $runningAv += $knownAvProcesses[$proc]
+            }
+        } catch {
+            $avProcUnread = $true
+            $said = "Could not list the running processes, so an antivirus that is not Defender may go unreported: $(Get-ClaudeErrorText $_)"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+            break
         }
     }
     # Deduplicate
@@ -4815,8 +5718,13 @@ if ($Undo) {
             Log "interfering with VirtioFS disk operations" -Colour DarkGray -Indent
             Add-StepResult -Status Warning -Detail "Add the exclusions listed above to $($allAv -join ', '): this script cannot"
         }
-    } elseif ($avUnread) {
-        Log "No antivirus product found among the running processes" -Colour DarkGray -Indent
+    } elseif ($avUnread -or $avProcUnread) {
+        # Only what was read is said.
+        if (-not $avProcUnread) {
+            Log "No antivirus product found among the running processes" -Colour DarkGray -Indent
+        } elseif (-not $avUnread) {
+            Log "No antivirus product is registered with Windows" -Colour DarkGray -Indent
+        }
     } else {
         Log "No antivirus product detected" -Colour DarkGray -Indent
         Add-StepResult -Status Skipped
@@ -4831,11 +5739,17 @@ if ($Undo) {
     # distro read wsl.exe's UTF-16 output as text, so it never matched.
     Step 14 $steps "Checking for WSL2 / Hyper-V conflicts..." -Name "WSL2 conflicts"
     try {
+        # A feature that is not there comes back as nothing, with no error
+        # (measured 2026-11-22: Get-WindowsOptionalFeature -Online
+        # -FeatureName NoSuchFeature_cf). Any error means it could not be
+        # read: until 6.3.1 that was said only as a grey line.
         $wslFeature = $null
         try {
-            $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction SilentlyContinue
+            $wslFeature = Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux -ErrorAction Stop
         } catch {
-            Log "Could not query Windows optional features" -Colour DarkGray -Indent
+            $said = "Could not read whether the WSL feature is installed: $(Get-ClaudeErrorText $_)"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
         }
         if ($wslFeature -and $wslFeature.State -eq 'Enabled') {
             Log "WSL is installed" -Colour DarkGray -Indent
@@ -4843,25 +5757,66 @@ if ($Undo) {
         if (Test-Path -LiteralPath (Join-Path $env:ProgramFiles "Docker\Docker\Docker.exe")) {
             Log "Docker Desktop is installed (it may use WSL2)" -Colour DarkGray -Indent
         }
+        # wsl.exe -l -v lists the distros. It ends with exit code 0 when it
+        # did; otherwise its output is a message, not a list. Until 6.3.1 the
+        # exit code and the errors were not looked at, and any failure read
+        # as "No WSL2 distro running".
         $runningWsl = @()
+        $wslUnread = $null
         $wslExe = Join-Path $env:SystemRoot "System32\wsl.exe"
-        if (Test-Path -LiteralPath $wslExe) {
+        # A wsl.exe that could not be read is a list that could not be read.
+        # Until 6.3.1 Test-Path was asked, which answers $false for a file
+        # that cannot be read as for one that is not there (measured
+        # 2026-11-23), and "No WSL2 distro running" was said.
+        $wslExeThere = $false
+        try {
+            $wslExeThere = ($null -ne (Get-ClaudeItemOrNull -LiteralPath $wslExe))
+        } catch {
+            $wslUnread = "$wslExe could not be read ($(Get-ClaudeErrorText $_))"
+        }
+        if ($wslExeThere) {
             $oldWslUtf8 = $env:WSL_UTF8
             try {
                 $env:WSL_UTF8 = '1'
-                foreach ($l in @(& $wslExe -l -v 2>$null)) {
-                    $t = ([string]$l) -replace "`0", ''
-                    if ($t -match 'Running' -and $t -match '\s2\s*$') {
-                        $runningWsl += (($t.Trim().TrimStart('*').Trim()) -split '\s+')[0]
+                $wslOut = @(& $wslExe -l -v 2>&1)
+                $wslCode = $LASTEXITCODE
+                if ($wslCode -eq 0) {
+                    foreach ($l in $wslOut) {
+                        if ($l -is [System.Management.Automation.ErrorRecord]) { continue }
+                        $t = ([string]$l) -replace "`0", ''
+                        if ($t -match 'Running' -and $t -match '\s2\s*$') {
+                            $runningWsl += (($t.Trim().TrimStart('*').Trim()) -split '\s+')[0]
+                        }
+                    }
+                } else {
+                    # The list fails where WSL is not installed (measured
+                    # 2026-11-22: exit code 1). No distro runs while neither
+                    # WSL service runs, WSLService (WSL from the Store) or
+                    # LxssManager (the WSL in Windows): that is told by the
+                    # services, never by wsl.exe's message, which is in the
+                    # display language. Anything else is a list that could
+                    # not be read.
+                    $wslSvcUp = @()
+                    foreach ($svcName in @('WSLService', 'LxssManager')) {
+                        $svc = Get-ClaudeServiceOrNull -Name $svcName
+                        if ($null -ne $svc -and [string]$svc.Status -ne 'Stopped') { $wslSvcUp += $svcName }
+                    }
+                    if ($wslSvcUp.Count -gt 0) {
+                        $first = @($wslOut | ForEach-Object { ([string]$_) -replace "`0", '' } | Where-Object { $_.Trim() }) | Select-Object -First 1
+                        $wslUnread = "wsl.exe -l -v ended with exit code $wslCode while $($wslSvcUp -join ' and ') runs: $first"
                     }
                 }
             } catch {
-                $null = $_
+                $wslUnread = Get-ClaudeErrorText $_
             } finally {
                 $env:WSL_UTF8 = $oldWslUtf8
             }
         }
-        if ($runningWsl.Count -gt 0) {
+        if ($null -ne $wslUnread) {
+            $said = "Could not read which WSL distros are running: $wslUnread"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+        } elseif ($runningWsl.Count -gt 0) {
             Log "[!] WSL2 distros running: $($runningWsl -join ', ')" -Colour Yellow -Indent
             Log "If Cowork has issues, try: wsl --shutdown" -Colour DarkGray -Indent
             Add-StepResult -Status Warning -Detail "WSL2 running ($($runningWsl -join ', ')): if Cowork has issues, run wsl --shutdown"
@@ -4879,34 +5834,36 @@ if ($Undo) {
     # ----------------------------------------------------------------
     Step 15 $steps "Installing health monitor..." -Name "Health monitor"
 
-    # Find Watch-ClaudeHealth.ps1 in the same folder as this script
+    # Find Watch-ClaudeHealth.ps1 beside this script, else in C:\ClaudeFix or
+    # in the Desktop or Documents folder. A place that could not be read
+    # stops the search: the monitor is not installed from a later place in
+    # its stead, and the step says why. Until 6.3.1 Test-Path was asked,
+    # which answers $false for a file that cannot be read as for one that is
+    # not there (measured 2026-11-23): such a script was passed over for a
+    # copy found later, and with none the step said it was not beside this
+    # script.
     $myDir = $null
     $watchScript = $null
+    $watchUnread = $null
     try {
         if ($PSCommandPath) { $myDir = Split-Path $PSCommandPath -Parent }
-        if ($myDir) {
-            $candidate = Join-Path $myDir "Watch-ClaudeHealth.ps1"
-            if (Test-Path $candidate) { $watchScript = $candidate }
-        }
-        if (-not $watchScript) {
-            $fallbackPaths = @(
-                "C:\ClaudeFix\Watch-ClaudeHealth.ps1",
-                (Join-Path $env:USERPROFILE "Desktop\Watch-ClaudeHealth.ps1"),
-                (Join-Path $env:USERPROFILE "Documents\Watch-ClaudeHealth.ps1")
-            )
-            foreach ($fb in $fallbackPaths) {
-                if (Test-Path $fb) { $watchScript = $fb; break }
-            }
-        }
+        $watchCandidates = @()
+        if ($myDir) { $watchCandidates += (Join-Path $myDir "Watch-ClaudeHealth.ps1") }
+        $watchCandidates += @(
+            "C:\ClaudeFix\Watch-ClaudeHealth.ps1",
+            (Join-Path $env:USERPROFILE "Desktop\Watch-ClaudeHealth.ps1"),
+            (Join-Path $env:USERPROFILE "Documents\Watch-ClaudeHealth.ps1")
+        )
+        $watchScript = Find-PreventKitFile -Candidates $watchCandidates
     } catch {
-        Log "Could not locate health monitor script, skipping" -Colour DarkGray -Indent
+        $watchUnread = Get-ClaudeErrorText $_
     }
 
     # The basic watchdog script older versions installed, replaced by the
     # health monitor. It shows an older version ran here, so that is recorded
     # before it is deleted.
     $oldWatchdog = Join-Path $ClaudeAppData "cowork-watchdog.ps1"
-    if (Test-Path -LiteralPath $oldWatchdog) {
+    if (Test-PreventPathThere -Path $oldWatchdog -NotDone 'it was not recorded or removed') {
         try {
             Add-LegacyInstallRecord -What 'watchdog script' -Where $oldWatchdog
             Remove-Item -LiteralPath $oldWatchdog -Force -ErrorAction Stop
@@ -4919,6 +5876,9 @@ if ($Undo) {
 
     if ($watchScript) {
         Install-HealthMonitorTask -WatchScript $watchScript
+    } elseif ($watchUnread) {
+        Log "[!] Could not look for Watch-ClaudeHealth.ps1: $watchUnread" -Colour Red -Indent
+        Add-StepResult -Status Failed -Detail "Could not look for Watch-ClaudeHealth.ps1, because $watchUnread, so the health monitor was not installed"
     } else {
         Log "[!] Watch-ClaudeHealth.ps1 not found in same folder" -Colour Yellow -Indent
         Log "Put all scripts in the same folder and rerun to enable health monitor" -Colour DarkGray -Indent
@@ -4931,38 +5891,33 @@ if ($Undo) {
     # ----------------------------------------------------------------
     Step 16 $steps "Creating Fix Claude Desktop shortcuts..." -Name "Fix Claude Desktop shortcuts"
 
-    $fixScript = $null
+    # Fix-ClaudeDesktop.bat beside this script, else beside the first
+    # Fix-ClaudeDesktop.ps1 found beside this script, in C:\ClaudeFix, or in
+    # the Desktop or Documents folder. A place that could not be read stops
+    # the search: no shortcut is made to a later place in its stead, and the
+    # step says why. Until 6.3.1 Test-Path was asked, which answers $false
+    # for a file that cannot be read as for one that is not there (measured
+    # 2026-11-23): such a file was passed over, and with none found the step
+    # said the launcher was not beside this script.
+    $fixBat = $null
+    $fixUnread = $null
     try {
-        if ($myDir) {
-            $candidate = Join-Path $myDir "Fix-ClaudeDesktop.ps1"
-            if (Test-Path $candidate) { $fixScript = $candidate }
-        }
-        if (-not $fixScript) {
-            $fallbackPaths = @(
+        if ($myDir) { $fixBat = Find-PreventKitFile -Candidates @(Join-Path $myDir "Fix-ClaudeDesktop.bat") }
+        if (-not $fixBat) {
+            $fixCandidates = @()
+            if ($myDir) { $fixCandidates += (Join-Path $myDir "Fix-ClaudeDesktop.ps1") }
+            $fixCandidates += @(
                 "C:\ClaudeFix\Fix-ClaudeDesktop.ps1",
                 (Join-Path $env:USERPROFILE "Desktop\Fix-ClaudeDesktop.ps1"),
                 (Join-Path $env:USERPROFILE "Documents\Fix-ClaudeDesktop.ps1")
             )
-            foreach ($fb in $fallbackPaths) {
-                if (Test-Path $fb) { $fixScript = $fb; break }
+            $fixScript = Find-PreventKitFile -Candidates $fixCandidates
+            if ($fixScript) {
+                $fixBat = Find-PreventKitFile -Candidates @(Join-Path (Split-Path $fixScript -Parent) "Fix-ClaudeDesktop.bat")
             }
         }
     } catch {
-        Log "Could not locate fix script, skipping shortcuts" -Colour DarkGray -Indent
-    }
-
-    $fixBat = $null
-    try {
-        if ($myDir) {
-            $candidate = Join-Path $myDir "Fix-ClaudeDesktop.bat"
-            if (Test-Path $candidate) { $fixBat = $candidate }
-        }
-        if (-not $fixBat -and $fixScript) {
-            $fixBatCandidate = Join-Path (Split-Path $fixScript -Parent) "Fix-ClaudeDesktop.bat"
-            if (Test-Path $fixBatCandidate) { $fixBat = $fixBatCandidate }
-        }
-    } catch {
-        Log "Could not locate fix launcher, skipping shortcuts" -Colour DarkGray -Indent
+        $fixUnread = Get-ClaudeErrorText $_
     }
 
     $shell = $null
@@ -5011,6 +5966,9 @@ if ($Undo) {
             Log "[!] Could not create Start Menu shortcut: $($_.Exception.Message)" -Colour Red -Indent
             Add-StepResult -Status Failed -Detail "Could not create the Start Menu shortcut: $($_.Exception.Message)"
         }
+    } elseif ($fixUnread) {
+        Log "[!] Could not look for Fix-ClaudeDesktop.bat: $fixUnread" -Colour Red -Indent
+        Add-StepResult -Status Failed -Detail "Could not look for Fix-ClaudeDesktop.bat, because $fixUnread, so the shortcuts were not made"
     } elseif (-not $fixBat) {
         Log "[!] Fix-ClaudeDesktop.bat not found in same folder" -Colour Red -Indent
         Log "Put all scripts in the same folder and rerun to create shortcuts" -Colour DarkGray -Indent
@@ -5044,8 +6002,26 @@ if ($Undo) {
 
         $elevTaskName = "LaunchClaudeAdmin"
 
-        # Remove old task if present
-        try { Unregister-ScheduledTask -TaskName $elevTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } catch { $null = $_ }
+        # An old task is removed first. One that could not be read, or could
+        # not be removed, is said: registering with -Force below replaces it
+        # all the same. Until 6.3.1 both were passed over without a word.
+        $oldTask = $null
+        try {
+            $oldTask = Get-ClaudeScheduledTaskOrNull -TaskName $elevTaskName -TaskPath $TaskPath
+        } catch {
+            $said = "Could not read whether the scheduled task $TaskPath$elevTaskName is there, so it was not removed first; registering it replaces it: $(Get-ClaudeErrorText $_)"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+        }
+        if ($null -ne $oldTask) {
+            try {
+                Unregister-ScheduledTask -TaskName $elevTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction Stop
+            } catch {
+                $said = "Could not remove the old scheduled task $TaskPath$elevTaskName; registering it again replaces it: $(Get-ClaudeErrorText $_)"
+                Log "[!] $said" -Colour Yellow -Indent
+                Add-StepResult -Status Warning -Detail $said
+            }
+        }
 
         # PowerShell command that finds and launches Claude
         # Priority: 1) MSIX via Get-AppxPackage  2) Traditional .exe install paths
@@ -5058,31 +6034,70 @@ if ($Undo) {
 # If Claude Desktop is already running, don't launch again. The Claude Code CLI
 # runs as "claude" too and does not count: with a project thread or a terminal
 # session alive, this used to exit without launching anything. A process whose
-# path cannot be read does count, so a doubt ends in no second launch.
-$existing = @(Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object {
-    $pexe = $null
-    try { $pexe = $_.MainModule.FileName } catch { $null = $_ }
-    if (-not $pexe) { return $true }
-    if ($pexe -match '[\\/]claude-code[\\/]') { return $false }
-    $product = ''
-    try { $product = [string](Get-Item -LiteralPath $pexe).VersionInfo.ProductName } catch { $null = $_ }
-    $product -ne 'Claude Code'
-})
+# path or product name cannot be read does count, so a doubt ends in no
+# second launch.
+#
+# A process list that cannot be read is a doubt as well: Claude is not
+# started, and why is shown, since this runs with no window. Get-Process says
+# that none runs with an error of its own: id NoProcessFoundForGivenName,
+# category ObjectNotFound, exception ProcessCommandException (measured
+# 2026-11-22). Until 6.3.1 every error read as none running.
+$existing = @()
+try {
+    $existing = @(Get-Process -Name claude -ErrorAction Stop | Where-Object {
+        $pexe = $null
+        try { $pexe = $_.MainModule.FileName } catch { $null = $_ }
+        if (-not $pexe) { return $true }
+        if ($pexe -match '[\\/]claude-code[\\/]') { return $false }
+        $product = ''
+        try { $product = [string](Get-Item -LiteralPath $pexe).VersionInfo.ProductName } catch { $null = $_ }
+        $product -ne 'Claude Code'
+    })
+} catch {
+    if (-not ("$($_.FullyQualifiedErrorId)" -like 'NoProcessFoundForGivenName,*' -and
+              [string]$_.CategoryInfo.Category -eq 'ObjectNotFound' -and
+              $_.Exception.GetType().FullName -eq 'Microsoft.PowerShell.Commands.ProcessCommandException')) {
+        $null = (New-Object -ComObject WScript.Shell).Popup("Claude was not started: the running processes could not be read, so it is not known whether Claude is already running.`n`n$($_.Exception.Message)", 0, 'Claude (Admin)', 48)
+        exit 1
+    }
+}
 if ($existing.Count -gt 0) { exit 0 }
 $exe = $null
-# 1. MSIX install (Windows Store / winget MSIX)
-$p = Get-AppxPackage | Where-Object { $_.Name -eq 'Claude' -or $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
-if ($p) { $e = Join-Path $p.InstallLocation 'app\Claude.exe'; if (Test-Path $e) { $exe = $e } }
-# 2. Traditional installer paths
-if (-not $exe) {
-    $candidates = @(
-        (Join-Path $env:LOCALAPPDATA 'Programs\claude-desktop\Claude.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Claude Desktop\Claude.exe'),
-        (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'),
-        (Join-Path ${env:ProgramFiles} 'Claude Desktop\Claude.exe'),
-        (Join-Path ${env:ProgramFiles(x86)} 'Claude Desktop\Claude.exe')
-    )
-    foreach ($c in $candidates) { if (Test-Path $c) { $exe = $c; break } }
+# A place that could not be read is a doubt too: Claude is not started from
+# a later place in its stead, and why is shown. Get-Item says a file is not
+# there with id PathNotFound, category ObjectNotFound, exception
+# ItemNotFoundException (measured 2026-11-23). Until 6.3.1 Test-Path was
+# asked, which answers $false for a file that cannot be read, and the next
+# place was tried. Get-AppxPackage lists nothing, with no error, when no
+# package matches (measured 2026-11-23), so any error is a list not read.
+function Test-ClaudeExe {
+    param([string]$Path)
+    try {
+        return (-not (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).PSIsContainer)
+    } catch {
+        if ("$($_.FullyQualifiedErrorId)" -like 'PathNotFound,*' -and [string]$_.CategoryInfo.Category -eq 'ObjectNotFound' -and
+            $_.Exception.GetType().FullName -eq 'System.Management.Automation.ItemNotFoundException') { return $false }
+        throw "$Path could not be read: $($_.Exception.Message)"
+    }
+}
+try {
+    # 1. MSIX install (Windows Store / winget MSIX)
+    $p = Get-AppxPackage -ErrorAction Stop | Where-Object { $_.Name -eq 'Claude' -or $_.PackageFamilyName -like 'Claude_*' } | Select-Object -First 1
+    if ($p) { $e = Join-Path $p.InstallLocation 'app\Claude.exe'; if (Test-ClaudeExe $e) { $exe = $e } }
+    # 2. Traditional installer paths
+    if (-not $exe) {
+        $candidates = @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\claude-desktop\Claude.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Claude Desktop\Claude.exe'),
+            (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'),
+            (Join-Path ${env:ProgramFiles} 'Claude Desktop\Claude.exe'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Claude Desktop\Claude.exe')
+        )
+        foreach ($c in $candidates) { if (Test-ClaudeExe $c) { $exe = $c; break } }
+    }
+} catch {
+    $null = (New-Object -ComObject WScript.Shell).Popup("Claude was not started: $($_.Exception.Message)", 0, 'Claude (Admin)', 48)
+    exit 1
 }
 # There was a third method, reading the path off a running "claude" process.
 # By this line no app process is running, so it could only ever find the Claude
@@ -5108,8 +6123,10 @@ if ($exe) { Start-Process $exe } else { throw 'Claude Desktop not found. Is it i
         # Hidden cannot do. Same elevated token (wscript runs at the task's
         # RunLevel and PowerShell inherits it), same EncodedCommand payload, and
         # zero windows. Verified clean with tools/probes/probe_console_flash.ps1.
-        if (-not (Initialize-ClaudeAppData)) {
-            throw "Claude AppData folder is unavailable; cannot place the launcher."
+        try {
+            $null = Initialize-ClaudeAppData
+        } catch {
+            throw "the launcher could not be placed: $($_.Exception.Message)"
         }
         $wscriptExe = Join-Path $env:SystemRoot "System32\wscript.exe"
         $elevVbs = Join-Path $ClaudeAppData "Launch-Claude-Admin.vbs"
@@ -5121,7 +6138,7 @@ if ($exe) { Start-Process $exe } else { throw 'Claude Desktop not found. Is it i
 ' deliberately not relied on here.
 CreateObject("WScript.Shell").Run "PowerShell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $encodedCmd", 0, False
 "@
-        Set-Content -Path $elevVbs -Value $elevVbsBody -Encoding ASCII -Force
+        Set-Content -Path $elevVbs -Value $elevVbsBody -Encoding ASCII -Force -ErrorAction Stop
 
         $elevAction = New-ScheduledTaskAction -Execute $wscriptExe `
             -Argument "`"$elevVbs`""
@@ -5137,14 +6154,45 @@ CreateObject("WScript.Shell").Run "PowerShell.exe -NoProfile -ExecutionPolicy By
             -RunLevel Highest `
             -LogonType Interactive
 
-        Register-ScheduledTask `
-            -TaskName $elevTaskName `
-            -TaskPath $TaskPath `
-            -Action $elevAction `
-            -Settings $elevSettings `
-            -Principal $elevPrincipal `
-            -Description "Launches Claude Desktop with full admin privileges. Triggered by the 'Claude (Admin)' shortcut." `
-            -Force | Out-Null
+        # A registration the scheduler refuses is a failed step, and no
+        # shortcut is made. One an earlier run made is removed when its task
+        # is not there now: it would start nothing. Until 6.3.1 a refused
+        # registration went on to say "Scheduled task created" and to make
+        # the shortcut.
+        $regWhy = $null
+        try {
+            $null = Register-ScheduledTask `
+                -TaskName $elevTaskName `
+                -TaskPath $TaskPath `
+                -Action $elevAction `
+                -Settings $elevSettings `
+                -Principal $elevPrincipal `
+                -Description "Launches Claude Desktop with full admin privileges. Triggered by the 'Claude (Admin)' shortcut." `
+                -Force -ErrorAction Stop
+        } catch {
+            $regWhy = Get-ClaudeErrorText $_
+        }
+        if ($null -ne $regWhy) {
+            $said = "the scheduler refused the task $TaskPath$elevTaskName, so no Claude (Admin) shortcut was made ($regWhy)"
+            $staleLnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "Claude (Admin).lnk"
+            $staleTold = $true
+            try {
+                $taskLeft = $null -ne (Get-ClaudeScheduledTaskOrNull -TaskName $elevTaskName -TaskPath $TaskPath)
+                $lnkLeft = $null -ne (Get-ClaudeItemOrNull -LiteralPath $staleLnk)
+            } catch {
+                $staleTold = $false
+                $said += ". Whether the shortcut $staleLnk an earlier run made still has its task could not be read: $(Get-ClaudeErrorText $_)"
+            }
+            if ($staleTold -and $lnkLeft -and -not $taskLeft) {
+                try {
+                    Remove-Item -LiteralPath $staleLnk -Force -ErrorAction Stop
+                    $said += ". The shortcut $staleLnk an earlier run made was removed: the task it starts is not there"
+                } catch {
+                    $said += ". The shortcut $staleLnk an earlier run made starts a task that is not there, and could not be removed: $(Get-ClaudeErrorText $_)"
+                }
+            }
+            throw $said
+        }
 
         Log "Scheduled task created: $TaskPath$elevTaskName (Highest + Interactive, no console)" -Colour Green -Indent
 
@@ -5165,13 +6213,13 @@ If rc <> 0 Then
     MsgBox "The LaunchClaudeAdmin scheduled task was not found." & vbCrLf & "Run Prevent-ClaudeIssues.bat to set it up.", vbExclamation, "Claude (Admin)"
 End If
 "@
-        Set-Content -Path $triggerVbs -Value $triggerVbsBody -Encoding ASCII -Force
+        Set-Content -Path $triggerVbs -Value $triggerVbsBody -Encoding ASCII -Force -ErrorAction Stop
         Log "Launcher created: $triggerVbs" -Colour Green -Indent
 
         # Remove the old .cmd launcher left by versions <= 6.1.0, if present.
         # It shows an older version ran here, so that is recorded first.
         $oldLauncherCmd = Join-Path $ClaudeAppData "Launch-Claude-Admin.cmd"
-        if (Test-Path -LiteralPath $oldLauncherCmd) {
+        if (Test-PreventPathThere -Path $oldLauncherCmd -NotDone 'it was not recorded or removed') {
             try {
                 Add-LegacyInstallRecord -What 'admin launcher' -Where $oldLauncherCmd
                 Remove-Item -LiteralPath $oldLauncherCmd -Force -ErrorAction Stop
@@ -5188,6 +6236,9 @@ End If
         # Remove any old broken shortcuts
         $oldLnk = Join-Path $desktopPath "Claude (Admin).lnk"
         if (Test-Path $oldLnk) {
+            # Best effort: the shortcut is saved over it below, and a save
+            # that fails fails the step. A shortcut Test-Path could not read
+            # answers $false here, and is the same case: the save says.
             Remove-Item $oldLnk -Force -ErrorAction SilentlyContinue
         }
 
@@ -5294,11 +6345,28 @@ Invoke-CommandInDesktopPackage ``
 # starts for Code sessions and project threads, out of a claude-code folder,
 # and any terminal session. Closing those would end that work. A process whose
 # path cannot be read is left alone as well: it could be either, and an app
-# that was started elevated cannot be closed from here anyway.
+# that was started elevated cannot be closed from here anyway. One whose path
+# is read and is not the CLI's, but whose product name is not, is the app.
+# -Unread lists instead the ones whose path could not be read.
+#
+# Get-Process says that none runs with an error of its own: id
+# NoProcessFoundForGivenName, category ObjectNotFound, exception
+# ProcessCommandException (measured 2026-11-22). Any other error means the
+# list could not be read, and is thrown. Until 6.3.1 it read as none running.
 function Get-ClaudeAppProcess {
-    @(Get-Process claude -ErrorAction SilentlyContinue | Where-Object {
+    param([switch]`$Unread)
+    `$all = @()
+    try {
+        `$all = @(Get-Process claude -ErrorAction Stop)
+    } catch {
+        if (-not ("`$(`$_.FullyQualifiedErrorId)" -like 'NoProcessFoundForGivenName,*' -and
+                  [string]`$_.CategoryInfo.Category -eq 'ObjectNotFound' -and
+                  `$_.Exception.GetType().FullName -eq 'Microsoft.PowerShell.Commands.ProcessCommandException')) { throw }
+    }
+    @(`$all | Where-Object {
         `$exe = `$null
         try { `$exe = `$_.MainModule.FileName } catch { `$null = `$_ }
+        if (`$Unread) { return (-not `$exe) }
         if (-not `$exe -or `$exe -match '[\\/]claude-code[\\/]') { return `$false }
         `$product = ''
         try { `$product = [string](Get-Item -LiteralPath `$exe).VersionInfo.ProductName } catch { `$null = `$_ }
@@ -5306,22 +6374,56 @@ function Get-ClaudeAppProcess {
     })
 }
 
-`$running = @(Get-ClaudeAppProcess)
+# A list that cannot be read stops here: Claude is neither closed nor started.
+try {
+    `$running = @(Get-ClaudeAppProcess)
+    `$unread = @(Get-ClaudeAppProcess -Unread)
+} catch {
+    Write-Host "  [!] The running processes could not be read, so Claude was not closed or started: `$(`$_.Exception.Message)" -ForegroundColor Red
+    Read-Host "  Press Enter to close"
+    exit 1
+}
+# So does a Claude process whose path cannot be read. It is not closed, as it
+# could be the CLI, and it could as well be Claude started as administrator,
+# which would take the launch below and ignore the flag. Until 6.3.1 the
+# launch went ahead all the same, and was then said to run without the GPU,
+# or not to have started.
+if (`$unread.Count -gt 0) {
+    Write-Host "  [!] `$(`$unread.Count) running Claude process(es) could not be read (one started as administrator, or a Claude Code session), so Claude was not closed or started without the GPU: a copy already running takes the launch and ignores the flag. Close Claude and run this again." -ForegroundColor Red
+    Read-Host "  Press Enter to close"
+    exit 1
+}
 if (`$running.Count -gt 0) {
     Write-Host "  Closing `$(`$running.Count) running Claude process(es)..." -ForegroundColor DarkGray
+    # A stop that fails shows below, where what still runs is read again.
     `$running | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 3
+    # A copy still running would take the launch below and ignore the flag.
+    # Until 6.3.1 this was not checked, and a Claude that could not be closed
+    # was then reported as running without GPU acceleration.
+    `$left = -1
+    try { `$left = @(Get-ClaudeAppProcess).Count } catch { `$left = -1 }
+    if (`$left -ne 0) {
+        Write-Host "  [!] Claude could not be closed, or whether it closed could not be read, so it was not started again without the GPU. Close Claude and run this again." -ForegroundColor Red
+        Read-Host "  Press Enter to close"
+        exit 1
+    }
 }
 
 Write-Host "  Starting Claude with --disable-gpu..." -ForegroundColor Cyan
 $launchBody
 
 Start-Sleep -Seconds 3
-if (@(Get-ClaudeAppProcess).Count -gt 0) {
+`$after = -1
+try { `$after = @(Get-ClaudeAppProcess).Count } catch { `$after = -1 }
+if (`$after -gt 0) {
     Write-Host "  Claude is running without hardware GPU acceleration." -ForegroundColor Green
     Write-Host "  The UI may feel slightly slower. That is the trade." -ForegroundColor DarkGray
-} else {
+} elseif (`$after -eq 0) {
     Write-Host "  [!] Claude did not start. Launch it normally and report this." -ForegroundColor Red
+    Read-Host "  Press Enter to close"
+} else {
+    Write-Host "  [!] Claude was started, but the running processes could not be read to check that it runs." -ForegroundColor Red
     Read-Host "  Press Enter to close"
 }
 "@
@@ -5382,17 +6484,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launch-Claude-NoGPU.ps
     # which it is. What shows that is recorded before it is deleted here.
     Step 19 $steps "Removing what older versions set up..." -Name "Older versions' leftovers"
     try {
-        $legacyTrace = Get-LegacyInstallTrace
-        if (Get-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -ErrorAction SilentlyContinue) {
+        # Until 6.3.1 a file or a task that could not be read counted as not
+        # there: no older version, and no logon task to remove.
+        $legacyTrace = $null
+        $legacyUnread = $false
+        try {
+            $legacyTrace = Get-LegacyInstallTrace
+        } catch {
+            $legacyUnread = $true
+            $said = "Whether a version before 6.3.0 ran here could not be told, because $(Get-ClaudeErrorText $_)"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+        }
+        $bootTask = $null
+        try {
+            $bootTask = Get-ClaudeScheduledTaskOrNull -TaskName $BootTaskName -TaskPath $TaskPath
+        } catch {
+            $said = "Could not read the scheduled task $TaskPath$BootTaskName, so the logon task older versions created was not checked or removed: $(Get-ClaudeErrorText $_)"
+            Log "[!] $said" -Colour Yellow -Indent
+            Add-StepResult -Status Warning -Detail $said
+        }
+        if ($null -ne $bootTask) {
             Add-LegacyInstallRecord -What 'boot-fix task' -Where "$TaskPath$BootTaskName"
             Unregister-ScheduledTask -TaskName $BootTaskName -TaskPath $TaskPath -Confirm:$false -ErrorAction Stop
             Log "Removed the logon task $BootTaskName" -Colour Green -Indent
             Add-StepResult -Status Done
         }
+        # Until 6.3.1 the flag and the Connected Standby record below were
+        # looked for with Test-Path, which answers $false for a file that
+        # cannot be read as for one that is not there (measured 2026-11-23),
+        # and "Nothing left from older versions" was said.
         $flagFile = Join-Path $ClaudeAppData "disable-dynamic-memory.flag"
-        if (Test-Path -LiteralPath $flagFile) {
+        if (Test-PreventPathThere -Path $flagFile -NotDone 'it was not recorded or removed') {
             Add-LegacyInstallRecord -What 'Dynamic Memory flag' -Where $flagFile
-            Remove-Item -LiteralPath $flagFile -Force -ErrorAction Stop
+            Remove-PreventItem -Path $flagFile
             Log "Removed $flagFile" -Colour Green -Indent
             Add-StepResult -Status Done
         }
@@ -5408,6 +6533,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launch-Claude-NoGPU.ps
         if ($v -is [int] -and $v -eq 120000) { $gated += "ServicesPipeTimeout = 120000" }
         if ($null -ne $legacyTrace) {
             $leftovers += $gated
+        } elseif ($legacyUnread) {
+            foreach ($g in $gated) {
+                $said = "$g matches what older versions set, but whether one ran here could not be told, so it is not known whether -Undo removes it"
+                Log "Left in place: $said" -Colour DarkGray -Indent
+                Add-StepResult -Status Unchanged -Detail $said
+            }
         } else {
             foreach ($g in $gated) {
                 $said = "$g matches what older versions set, but no older install was found here, so -Undo leaves it"
@@ -5415,10 +6546,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launch-Claude-NoGPU.ps
                 Add-StepResult -Status Unchanged -Detail $said
             }
         }
-        if (Test-Path -LiteralPath $CsBackupFile) { $leftovers += "CsEnabled (Connected Standby)" }
+        if (Test-PreventPathThere -Path $CsBackupFile -NotDone 'whether Connected Standby is left as an older version set it is not known') {
+            $leftovers += "CsEnabled (Connected Standby)"
+        }
         # Restart recovery older versions set on the Cowork VM service. Setup
         # sets recovery on vmcompute only, with a record, so this is theirs.
-        if ($ServiceName -and (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) -and
+        # Until 6.3.1 a service that could not be read counted as not there.
+        $cvSvc = $null
+        if ($ServiceName) {
+            try {
+                $cvSvc = Get-ClaudeServiceOrNull -Name $ServiceName
+            } catch {
+                $said = "Could not read the service $ServiceName, so the restart recovery older versions set on it was not checked: $(Get-ClaudeErrorText $_)"
+                Log "[!] $said" -Colour Yellow -Indent
+                Add-StepResult -Status Warning -Detail $said
+            }
+        }
+        if ($null -ne $cvSvc -and
             $null -eq (Get-PreventUndoItem -Kind ServiceFailureActions -Key $ServiceName) -and
             (Test-RestartRecovery (ConvertFrom-FailureActionsBlob -Bytes (Get-ServiceFailureBytes -Service $ServiceName)))) {
             $leftovers += "the restart recovery on $ServiceName"
@@ -5453,6 +6597,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launch-Claude-NoGPU.ps
         # Dynamic Memory older versions turned off, where one is known to have
         # run. -Undo turns it back on, and Hyper-V lets it only while the VM
         # is off.
+        # Get-Command answers nothing for a command that is not installed:
+        # without Hyper-V's cmdlets there is no Dynamic Memory to read.
         if ($null -ne $legacyTrace -and (Get-Command -Name Set-VMMemory -ErrorAction SilentlyContinue)) {
             $dmVms = @()
             try {
@@ -5541,5 +6687,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Launch-Claude-NoGPU.ps
 $exitCode = Get-PreventExitCode
 Write-Host ""
 Write-Host "  Press any key to close..." -ForegroundColor DarkGray
+# Best effort: without a console to read a key from, the window simply closes.
 try { [void][System.Console]::ReadKey($true) } catch { $null = $_ }
 exit $exitCode

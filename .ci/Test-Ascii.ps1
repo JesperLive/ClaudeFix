@@ -46,12 +46,22 @@ $required = @(
 # The named four first, in that order, then every other script found, by name.
 $targets = [System.Collections.Generic.List[string]]::new()
 foreach ($name in $required) { $targets.Add($name) }
+# A folder that could not be listed fails the gate, naming it and the error.
+# Until 6.3.1 the listing's error was written, nothing was found in it, and
+# the gate passed without reading that folder's scripts.
+$unreadDirs = 0
 foreach ($dir in @('', '.ci')) {
     $full = if ($dir) { Join-Path $Root $dir } else { $Root }
     if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
-    $files = @(Get-ChildItem -LiteralPath $full -File |
-        Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.bat' } |
-        Sort-Object Name)
+    try {
+        $files = @(Get-ChildItem -LiteralPath $full -File -ErrorAction Stop |
+            Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.bat' } |
+            Sort-Object Name)
+    } catch {
+        Write-Host ("UNREAD  : {0} could not be listed ({1})" -f $full, $_.Exception.Message)
+        $unreadDirs++
+        continue
+    }
     foreach ($file in $files) {
         $name = if ($dir) { Join-Path $dir $file.Name } else { $file.Name }
         if (-not ($targets -contains $name)) { $targets.Add($name) }
@@ -97,6 +107,6 @@ foreach ($name in $targets) {
 }
 
 Write-Host ""
-if ($failed -eq 0) { Write-Host "ASCII gate PASSED"; exit 0 }
-Write-Host ("ASCII gate FAILED ({0} file(s))" -f $failed)
+if ($failed -eq 0 -and $unreadDirs -eq 0) { Write-Host "ASCII gate PASSED"; exit 0 }
+Write-Host ("ASCII gate FAILED ({0} file(s), {1} folder(s) that could not be listed)" -f $failed, $unreadDirs)
 exit 1

@@ -49,10 +49,34 @@ function Assert-Case {
 # Win32_Process.ExecutablePath returns for it) and Parent (its
 # Win32_Process.ParentProcessId). $script:CimThrows makes the process query
 # fail, as it does when WMI is broken or the caller lacks the right.
+#
+# Each fake writes the error its cmdlet writes, with the identity measured
+# 2026-11-22 on Windows 11, Windows PowerShell 5.1 (the region's helpers
+# carry the measurements): Get-Process for a name nothing runs under writes
+# NoProcessFoundForGivenName, ObjectNotFound, ProcessCommandException;
+# Get-Item for a path with nothing there writes PathNotFound, ObjectNotFound,
+# ItemNotFoundException. A read that fails for another reason (access denied
+# could not be produced read-only on this PC) gets another identity here,
+# which is what the helpers must not take for "not there". The error is
+# written, not thrown, as the cmdlets do; -ErrorAction Stop makes it
+# terminating in the caller.
 # ---------------------------------------------------------------------
-$script:FakeProcs    = @()
-$script:FakeProducts = @{}
-$script:CimThrows    = $false
+Add-Type -AssemblyName 'Microsoft.PowerShell.Commands.Management'
+$script:FakeProcs     = @()
+$script:FakeProducts  = @{}
+$script:FakeMissing   = @{}
+$script:FakeDenied    = @{}
+$script:FakeNoVersion = @{}
+$script:FakeReal      = @{}
+$script:CimThrows     = $false
+$script:ProcListFails = $false
+
+function New-FakeErrorRecord {
+    param([string]$TypeName, [string]$Message, [string]$Id, [string]$Category, $Target)
+    $ex = New-Object $TypeName $Message
+    return (New-Object System.Management.Automation.ErrorRecord($ex, $Id,
+        [System.Management.Automation.ErrorCategory]$Category, $Target))
+}
 
 function New-FakeProc {
     param([int]$Id, [string]$Path, [string]$CimPath, [int]$Parent = 0)
@@ -66,23 +90,61 @@ function New-FakeProc {
 }
 
 function Get-Process {
-    param([string]$Name, [string]$ErrorAction)
-    $null = $ErrorAction
-    if ($Name -eq 'claude') { return $script:FakeProcs }
-    return @()
+    [CmdletBinding()]
+    param([string]$Name)
+    if ($script:ProcListFails) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ComponentModel.Win32Exception' 'Access is denied' `
+            'CouldNotEnumerateProcesses' 'NotSpecified' $Name))
+        return
+    }
+    $hits = @($script:FakeProcs | Where-Object { $_.Name -eq $Name })
+    if ($hits.Count -eq 0) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ProcessCommandException' `
+            "Cannot find a process with the name `"$Name`". Verify the process name and call the cmdlet again." `
+            'NoProcessFoundForGivenName' 'ObjectNotFound' $Name))
+        return
+    }
+    return $hits
 }
 
+# A path not listed in FakeMissing or FakeDenied is a file that is there,
+# with the product name FakeProducts gives it, or none. FakeNoVersion makes
+# its VersionInfo read as $null, as a getter that throws does. A path in
+# FakeReal is read by the real Get-Item, for a real folder this script makes.
 function Get-Item {
-    param([string]$LiteralPath, [string]$ErrorAction)
-    $null = $ErrorAction
-    if (-not $script:FakeProducts.ContainsKey($LiteralPath)) { throw "Cannot find path '$LiteralPath'" }
-    return [pscustomobject]@{ VersionInfo = [pscustomobject]@{ ProductName = $script:FakeProducts[$LiteralPath] } }
+    [CmdletBinding()]
+    param([string]$LiteralPath, [switch]$Force)
+    if ($script:FakeReal.ContainsKey($LiteralPath)) {
+        return (Microsoft.PowerShell.Management\Get-Item -LiteralPath $LiteralPath -Force:$Force)
+    }
+    if ($script:FakeDenied.ContainsKey($LiteralPath)) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.UnauthorizedAccessException' `
+            'Access is denied' 'ItemExistsUnauthorizedAccessError' 'PermissionDenied' $LiteralPath))
+        return
+    }
+    if ($script:FakeMissing.ContainsKey($LiteralPath)) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Management.Automation.ItemNotFoundException' `
+            "Cannot find path '$LiteralPath' because it does not exist." 'PathNotFound' 'ObjectNotFound' $LiteralPath))
+        return
+    }
+    $product = ''
+    if ($script:FakeProducts.ContainsKey($LiteralPath)) { $product = $script:FakeProducts[$LiteralPath] }
+    $vi = [pscustomobject]@{ ProductName = $product }
+    if ($script:FakeNoVersion.ContainsKey($LiteralPath)) { $vi = $null }
+    return [pscustomobject]@{ FullName = $LiteralPath; PSIsContainer = $false; VersionInfo = $vi }
 }
 
+# The real cmdlet writes a CimException (measured 2026-11-22 for an invalid
+# class: HRESULT 0x80041010, MetadataError) and does not throw.
 function Get-CimInstance {
-    param([string]$ClassName, [string]$Filter, [string]$ErrorAction)
-    $null = $ClassName, $Filter, $ErrorAction
-    if ($script:CimThrows) { throw 'Invalid class' }
+    [CmdletBinding()]
+    param([string]$ClassName, [string]$Filter)
+    $null = $ClassName, $Filter
+    if ($script:CimThrows) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.Management.Infrastructure.CimException' 'Invalid class' `
+            'HRESULT 0x80041010' 'MetadataError' $ClassName))
+        return
+    }
     return @($script:FakeProcs | ForEach-Object {
         [pscustomobject]@{ ProcessId = $_.Id; ExecutablePath = $_.CimPath; ParentProcessId = $_.Parent }
     })
@@ -195,6 +257,228 @@ Assert-Case "claude-code folder is the CLI"    (Test-ClaudeCodeCliPath $appCli)
 Assert-Case "product name Claude Code is the CLI" (Test-ClaudeCodeCliPath $termCli)
 Assert-Case "the app is not the CLI"           (-not (Test-ClaudeCodeCliPath "$install\app\Claude.exe"))
 Assert-Case "an empty path is not the CLI"     (-not (Test-ClaudeCodeCliPath ''))
+
+# Until 6.3.1 a file whose product name could not be read answered "not the
+# CLI", so the callers that pick the app's exe could take it.
+$deniedExe  = 'D:\Locked\claude.exe'
+$noVerExe   = 'D:\NoVersion\claude.exe'
+$missingExe = 'D:\Gone\claude.exe'
+$script:FakeDenied[$deniedExe]     = $true
+$script:FakeNoVersion[$noVerExe]   = $true
+$script:FakeMissing[$missingExe]   = $true
+Assert-Case "a file that cannot be read is not taken for the app" (Test-ClaudeCodeCliPath $deniedExe)
+Assert-Case "a file whose version info reads as null is not taken for the app" (Test-ClaudeCodeCliPath $noVerExe)
+Assert-Case "a path with nothing there is not the CLI" (-not (Test-ClaudeCodeCliPath $missingExe))
+
+# A folder is not the CLI. A Claude*.lnk or an App Paths value can name one,
+# and a folder has no VersionInfo, so reading it threw under StrictMode
+# Latest, as the scripts run, and Fix's search for Claude.exe then said the
+# Start Menu or the App Paths key could not be read. A real folder, read by
+# the real Get-Item, made here and removed after.
+$realDir = Join-Path ([System.IO.Path]::GetTempPath()) ('claudefix-ci-tpi-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$dirAnswer = $null
+$dirError  = ''
+try {
+    $null = New-Item -ItemType Directory -Path $realDir
+    $script:FakeReal[$realDir] = $true
+    $dirAnswer = & { Set-StrictMode -Version Latest; Test-ClaudeCodeCliPath $realDir }
+} catch {
+    $dirError = $_.Exception.Message
+} finally {
+    $script:FakeReal.Remove($realDir)
+    # Only the folder made above, which is empty.
+    Remove-Item -LiteralPath $realDir -Force -ErrorAction SilentlyContinue
+}
+Assert-Case "a folder is not the CLI, and asking does not throw" (
+    $dirAnswer -is [bool] -and -not $dirAnswer -and -not $dirError) "got '$dirAnswer', error '$dirError'"
+
+# ---------------------------------------------------------------------
+Write-Host ""
+Write-Host "--- Get-ClaudeProcessInventory: a list that could not be read"
+
+# Until 6.3.1 Get-Process ran with SilentlyContinue, so a list that could
+# not be read came back empty and every caller read "Claude is not running".
+$script:FakeProcs = @()
+$got = '<threw>'
+try { $got = "$(@(Get-ClaudeProcessInventory -Environment $msixEnv).Count)" } catch { $got = "<threw: $($_.FullyQualifiedErrorId)>" }
+Assert-Case "none running: an empty inventory, no error" ($got -eq '0') "got $got"
+$got = '<threw>'
+try { $got = "$(@(Get-ClaudeDesktopProcess -Environment $msixEnv).Count)" } catch { $got = "<threw: $($_.FullyQualifiedErrorId)>" }
+Assert-Case "none running: no desktop process, no error" ($got -eq '0') "got $got"
+
+$script:FakeProcs = @((New-FakeProc 101 "$install\app\Claude.exe"))
+$script:ProcListFails = $true
+$threwWith = ''
+try { $null = Get-ClaudeProcessInventory -Environment $msixEnv } catch { $threwWith = "$($_.FullyQualifiedErrorId)" }
+Assert-Case "a list that could not be read throws, with the error it came with" ($threwWith -match '^CouldNotEnumerateProcesses') "threw: $threwWith"
+$threwWith = ''
+try { $null = Get-ClaudeDesktopProcess -Environment $msixEnv } catch { $threwWith = "$($_.FullyQualifiedErrorId)" }
+Assert-Case "and Get-ClaudeDesktopProcess passes it on" ($threwWith -match '^CouldNotEnumerateProcesses') "threw: $threwWith"
+$threwWith = ''
+try { $null = Get-ClaudeAppCliProcess -Environment $msixEnv } catch { $threwWith = "$($_.FullyQualifiedErrorId)" }
+Assert-Case "and Get-ClaudeAppCliProcess passes it on" ($threwWith -match '^CouldNotEnumerateProcesses') "threw: $threwWith"
+$script:ProcListFails = $false
+
+# A process whose module cannot be read is placed by one CIM query. When
+# that fails too, the process cannot be placed, and until 6.3.1 the failure
+# was passed over: an app process read as unknown and was not counted.
+$script:FakeProcs = @(
+    (New-FakeProc 101 "$install\app\Claude.exe"),
+    (New-FakeProc 401 $null "$install\app\Claude.exe")
+)
+$script:CimThrows = $true
+$threwWith = ''
+try { $null = Get-ClaudeProcessInventory -Environment $msixEnv } catch { $threwWith = "$($_.FullyQualifiedErrorId)|$($_.Exception.GetType().Name)" }
+Assert-Case "an unreadable module and a failed CIM query throw the CIM error" ($threwWith -match '^HRESULT 0x80041010.*\|CimException$') "threw: $threwWith"
+$script:CimThrows = $false
+
+# A product name that could not be read leaves the process unknown, not
+# other: it may be the CLI. Until 6.3.1 it was other.
+$script:FakeProcs = @(
+    (New-FakeProc 101 "$install\app\Claude.exe" '' 4000),
+    (New-FakeProc 701 $deniedExe '' 101),
+    (New-FakeProc 702 $noVerExe '' 101),
+    (New-FakeProc 703 $deniedExe '' 900)
+)
+$k = Get-KindById $msixEnv
+Assert-Case "a product name that cannot be read is unknown"           ($k[701] -eq 'unknown') "got $($k[701])"
+Assert-Case "a version info that reads as null is unknown"            ($k[702] -eq 'unknown') "got $($k[702])"
+$got = '<threw>'
+try { $got = (@(Get-ClaudeAppCliProcess -Environment $msixEnv | ForEach-Object { [int]$_.Id } | Sort-Object) -join ',') } catch { $got = "<threw: $($_.Exception.Message)>" }
+Assert-Case "an unknown child of the app counts as one of its sessions" ($got -eq '701,702') "got $got"
+
+# ---------------------------------------------------------------------
+Write-Host ""
+Write-Host "--- the helpers that tell not there from could not read"
+
+# Each helper is driven with a fake of its cmdlet in a scope of its own: the
+# error that says "not there", the same id from a script function (whose
+# id PowerShell suffixes with its own name), a failure of another kind, an
+# error that has the not-there id but another category or type, and a read
+# that answers.
+$helperCase = & {
+    Set-StrictMode -Version Latest
+    $mode = 'ok'
+    function Get-Service {
+        [CmdletBinding()] param([string]$Name)
+        switch ($mode) {
+            'missing' { $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ServiceCommandException' `
+                            "Cannot find any service with service name '$Name'." 'NoServiceFoundForGivenName' 'ObjectNotFound' $Name)); return }
+            'denied'  { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.InvalidOperationException' `
+                            'Cannot open Service Control Manager on computer. This operation might require other privileges.' 'CouldNotGetServiceInfo' 'PermissionDenied' $Name)); return }
+            'wrongcat' { $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ServiceCommandException' `
+                            'x' 'NoServiceFoundForGivenName' 'NotSpecified' $Name)); return }
+            'wrongtype' { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.InvalidOperationException' `
+                            "Cannot find any service with service name '$Name'." 'NoServiceFoundForGivenName' 'ObjectNotFound' $Name)); return }
+        }
+        return [pscustomobject]@{ Name = $Name; Status = 'Running' }
+    }
+    function Get-ScheduledTask {
+        [CmdletBinding()] param([string]$TaskName, [string]$TaskPath)
+        switch ($mode) {
+            'missing' { $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Cmdletization.Cim.CimJobException' `
+                            "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$TaskName'." 'CmdletizationQuery_NotFound' 'ObjectNotFound' $TaskName)); return }
+            'denied'  { $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.Management.Infrastructure.CimException' `
+                            'Access denied' 'HRESULT 0x80070005' 'PermissionDenied' $TaskName)); return }
+            'wrongcat' { $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Cmdletization.Cim.CimJobException' `
+                            'x' 'CmdletizationQuery_NotFound' 'InvalidOperation' $TaskName)); return }
+            'wrongtype' { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.InvalidOperationException' `
+                            'x' 'CmdletizationQuery_NotFound' 'ObjectNotFound' $TaskName)); return }
+        }
+        return [pscustomobject]@{ TaskName = $TaskName; TaskPath = $TaskPath; State = 'Ready' }
+    }
+    function Get-Process {
+        [CmdletBinding()] param([string]$Name)
+        switch ($mode) {
+            'missing' { $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ProcessCommandException' `
+                            "Cannot find a process with the name `"$Name`"." 'NoProcessFoundForGivenName' 'ObjectNotFound' $Name)); return }
+            'denied'  { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ComponentModel.Win32Exception' `
+                            "Cannot find a process with the name `"$Name`"." 'CouldNotEnumerateProcesses' 'NotSpecified' $Name)); return }
+            'wrongcat' { $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ProcessCommandException' `
+                            'x' 'NoProcessFoundForGivenName' 'NotSpecified' $Name)); return }
+            'wrongtype' { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.InvalidOperationException' `
+                            'x' 'NoProcessFoundForGivenName' 'ObjectNotFound' $Name)); return }
+        }
+        return @([pscustomobject]@{ Id = 11; Name = $Name }, [pscustomobject]@{ Id = 12; Name = $Name })
+    }
+    function Get-Item {
+        [CmdletBinding()] param([string]$LiteralPath, [switch]$Force)
+        $null = $Force
+        switch ($mode) {
+            'missing' { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Management.Automation.ItemNotFoundException' `
+                            "Cannot find path '$LiteralPath' because it does not exist." 'PathNotFound' 'ObjectNotFound' $LiteralPath)); return }
+            'denied'  { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.UnauthorizedAccessException' `
+                            'Access is denied' 'ItemExistsUnauthorizedAccessError' 'PermissionDenied' $LiteralPath)); return }
+            'wrongcat' { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Management.Automation.ItemNotFoundException' `
+                            'x' 'PathNotFound' 'ReadError' $LiteralPath)); return }
+            'wrongtype' { $PSCmdlet.WriteError((New-FakeErrorRecord 'System.IO.IOException' `
+                            "Cannot find path '$LiteralPath' because it does not exist." 'PathNotFound' 'ObjectNotFound' $LiteralPath)); return }
+        }
+        return [pscustomobject]@{ FullName = $LiteralPath; PSIsContainer = $false }
+    }
+    $calls = [ordered]@{
+        service = { Get-ClaudeServiceOrNull -Name 'CoworkVMService' }
+        task    = { Get-ClaudeScheduledTaskOrNull -TaskName 'ClaudeWatch' -TaskPath '\Claude\' }
+        # The leading comma keeps an empty list from unrolling to nothing.
+        process = { ,@(Get-ClaudeProcessByName -Name 'claude') }
+        item    = { Get-ClaudeItemOrNull -LiteralPath 'C:\x\y.log' }
+    }
+    $r = [ordered]@{}
+    foreach ($h in $calls.Keys) {
+        foreach ($m in @('ok', 'missing', 'denied', 'wrongcat', 'wrongtype')) {
+            $mode = $m
+            try {
+                $v = & $calls[$h]
+                if ($null -eq $v) { $r["$h.$m"] = 'null' }
+                elseif ($v -is [array]) { $r["$h.$m"] = "array:$($v.Count)" }
+                else { $r["$h.$m"] = 'object' }
+            } catch {
+                $r["$h.$m"] = "threw:$($_.FullyQualifiedErrorId)|$($_.Exception.GetType().Name)"
+            }
+        }
+    }
+    $r
+}
+foreach ($h in @('service', 'task', 'item')) {
+    Assert-Case "$h helper: a read that answers returns it"   ($helperCase["$h.ok"] -eq 'object') "got $($helperCase["$h.ok"])"
+    Assert-Case "$h helper: not there is `$null"              ($helperCase["$h.missing"] -eq 'null') "got $($helperCase["$h.missing"])"
+}
+Assert-Case "process helper: every process it lists comes back" ($helperCase['process.ok'] -eq 'array:2') "got $($helperCase['process.ok'])"
+Assert-Case "process helper: none running is empty"             ($helperCase['process.missing'] -eq 'array:0') "got $($helperCase['process.missing'])"
+# The error thrown is the one the cmdlet wrote, told by its id. A bare "it
+# threw" also passes where the helper does not exist and the call itself
+# throws CommandNotFoundException.
+$deniedId   = @{ service = 'CouldNotGetServiceInfo'; task = 'HRESULT 0x80070005'; process = 'CouldNotEnumerateProcesses'
+                 item = 'ItemExistsUnauthorizedAccessError' }
+$notThereId = @{ service = 'NoServiceFoundForGivenName'; task = 'CmdletizationQuery_NotFound'; process = 'NoProcessFoundForGivenName'
+                 item = 'PathNotFound' }
+foreach ($h in @('service', 'task', 'process', 'item')) {
+    Assert-Case "$h helper: a failed read throws the original error" ($helperCase["$h.denied"] -like "threw:$($deniedId[$h]),*") `
+        "got $($helperCase["$h.denied"])"
+    Assert-Case "$h helper: the not-there id with another category throws" ($helperCase["$h.wrongcat"] -like "threw:$($notThereId[$h]),*") `
+        "got $($helperCase["$h.wrongcat"])"
+    Assert-Case "$h helper: the not-there id with another exception type throws" ($helperCase["$h.wrongtype"] -like "threw:$($notThereId[$h]),*") `
+        "got $($helperCase["$h.wrongtype"])"
+}
+Assert-Case "service helper: the error thrown is the one Get-Service wrote" `
+    ($helperCase['service.denied'] -match '^threw:CouldNotGetServiceInfo,Get-Service\|InvalidOperationException$') "got $($helperCase['service.denied'])"
+Assert-Case "process helper: a message that reads like not there does not decide" `
+    ($helperCase['process.denied'] -match '^threw:CouldNotEnumerateProcesses,Get-Process\|Win32Exception$') "got $($helperCase['process.denied'])"
+Assert-Case "task helper: the error thrown is the one Get-ScheduledTask wrote" `
+    ($helperCase['task.denied'] -match '^threw:HRESULT 0x80070005,Get-ScheduledTask\|CimException$') "got $($helperCase['task.denied'])"
+Assert-Case "item helper: the error thrown is the one Get-Item wrote" `
+    ($helperCase['item.denied'] -match '^threw:ItemExistsUnauthorizedAccessError,Get-Item\|UnauthorizedAccessException$') "got $($helperCase['item.denied'])"
+
+# Test-ClaudeNotFoundError directly: the real cmdlet's id carries the
+# cmdlet's class after the comma, a fake's its own name.
+$realRec = New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ServiceCommandException' 'x' `
+    'NoServiceFoundForGivenName,Microsoft.PowerShell.Commands.GetServiceCommand' 'ObjectNotFound' 'n'
+Assert-Case "Test-ClaudeNotFoundError reads the real cmdlet's id" `
+    (Test-ClaudeNotFoundError -ErrorRecord $realRec -ErrorId 'NoServiceFoundForGivenName' -ExceptionType 'Microsoft.PowerShell.Commands.ServiceCommandException')
+Assert-Case "Test-ClaudeNotFoundError: no record is not not-there" `
+    (-not (Test-ClaudeNotFoundError -ErrorRecord $null -ErrorId 'NoServiceFoundForGivenName' -ExceptionType 'Microsoft.PowerShell.Commands.ServiceCommandException'))
+Assert-Case "Test-ClaudeNotFoundError: another id is not not-there" `
+    (-not (Test-ClaudeNotFoundError -ErrorRecord $realRec -ErrorId 'PathNotFound' -ExceptionType 'Microsoft.PowerShell.Commands.ServiceCommandException'))
 
 # ---------------------------------------------------------------------
 Write-Host ""
@@ -312,6 +596,72 @@ if ($stopDef) {
     Assert-Case "it returns how many it stopped"                ($outcome.Returned -eq 3) "returned $($outcome.Returned)"
     Assert-Case "it says how many it left alone" `
         ($outcome.Logged -match 'Left 4 other process\(es\) named claude alone') "logged: $($outcome.Logged)"
+
+    # A process list that could not be read stops nothing, says so and
+    # returns $null. Until 6.3.1 it read as empty: nothing stopped, nothing
+    # said, and 0 returned, as for an app that was not running.
+    $script:ProcListFails = $true
+    try {
+        $unreadStop = & {
+            $stoppedIds = New-Object System.Collections.ArrayList
+            $logged     = New-Object System.Collections.ArrayList
+            function Stop-Process {
+                param([Parameter(ValueFromPipeline = $true)]$InputObject, [switch]$Force)
+                process { $null = $Force; [void]$stoppedIds.Add([int]$InputObject.Id) }
+            }
+            function Log {
+                param([string]$Message, [string]$Colour, [switch]$Indent)
+                $null = $Colour, $Indent
+                [void]$logged.Add($Message)
+            }
+            . ([scriptblock]::Create($stopDef.Extent.Text))
+            $returned = Stop-ClaudeDesktopApp
+            [pscustomobject]@{ IsNull = ($null -eq $returned); Returned = "$returned"; Stopped = $stoppedIds.Count; Logged = ($logged -join ' | ') }
+        }
+    } catch {
+        # Escaped: a failed case, not the end of the gate.
+        $unreadStop = [pscustomobject]@{ IsNull = $false; Returned = "escaped: $($_.Exception.Message)"; Stopped = -1; Logged = '' }
+    } finally {
+        $script:ProcListFails = $false
+    }
+    Assert-Case "a process list that could not be read: nothing stopped, `$null returned" `
+        ($unreadStop.IsNull -and $unreadStop.Stopped -eq 0) "returned '$($unreadStop.Returned)', stopped $($unreadStop.Stopped)"
+    Assert-Case "and it says so" `
+        ($unreadStop.Logged -match "^\[!\] Claude's processes could not be listed \(Access is denied\), so none were stopped$") "logged: $($unreadStop.Logged)"
+
+    # A kill that Stop-Process refuses is not counted, and is said. Until
+    # 6.3.1 every process listed was counted as stopped. The refusal is the
+    # error the real one writes for a process it may not stop.
+    $firstErrDef = Get-FixFunction 'Get-FixFirstError'
+    $refusedStop = & {
+        $stoppedIds = New-Object System.Collections.ArrayList
+        $logged     = New-Object System.Collections.ArrayList
+        function Stop-Process {
+            param([Parameter(ValueFromPipeline = $true)]$InputObject, [switch]$Force)
+            process {
+                $null = $Force
+                if ([int]$InputObject.Id -eq 102) {
+                    $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord(
+                        (New-Object System.ComponentModel.Win32Exception 5), 'CouldNotStopProcess', 'CloseError', $InputObject)))
+                    return
+                }
+                [void]$stoppedIds.Add([int]$InputObject.Id)
+            }
+        }
+        function Log {
+            param([string]$Message, [string]$Colour, [switch]$Indent)
+            $null = $Colour, $Indent
+            [void]$logged.Add($Message)
+        }
+        . ([scriptblock]::Create($firstErrDef.Extent.Text))
+        . ([scriptblock]::Create($stopDef.Extent.Text))
+        $returned = Stop-ClaudeDesktopApp
+        [pscustomobject]@{ Returned = $returned; Stopped = (@($stoppedIds | Sort-Object) -join ','); Logged = ($logged -join ' | ') }
+    }
+    Assert-Case "a kill that is refused is not counted" `
+        ($refusedStop.Returned -eq 2 -and $refusedStop.Stopped -eq '101,401') "returned $($refusedStop.Returned), stopped $($refusedStop.Stopped)"
+    Assert-Case "and it says so" `
+        ($refusedStop.Logged -match '\[!\] 1 Claude process\(es\) could not be stopped \(Access is denied\)') "logged: $($refusedStop.Logged)"
 }
 
 # Every kill site in Fix says how many processes named claude it spared, so a
@@ -359,6 +709,12 @@ if ($blockDef) {
         $transcriptRecent = $false
         $busyProc         = $null
         $vmLogAge         = $null
+        $transcriptThrows = $false
+        $vmLogThrows      = $false
+        $procListFails    = $false
+        $idFails          = $false
+        $sessionOne       = $false
+        $addTypeFails     = ''
         $transcriptAsked  = New-Object System.Collections.ArrayList
         function Get-ClaudeAppCliProcess {
             param($Environment)
@@ -366,19 +722,68 @@ if ($blockDef) {
             if ($appCliThrows) { throw 'Access denied' }
             return @($appCliNow)
         }
+        # Both throw when they cannot tell, since 6.3.1, as the region's do.
         function Test-ClaudeCodeTranscriptRecent {
             param([int]$Minutes)
             [void]$transcriptAsked.Add($Minutes)
+            if ($transcriptThrows) { throw 'Access to the path is denied' }
             return $transcriptRecent
         }
-        function Get-ClaudeVmLogAge { param($LogDir) $null = $LogDir; return $vmLogAge }
+        function Get-ClaudeVmLogAge {
+            param($LogDir)
+            $null = $LogDir
+            if ($vmLogThrows) { throw 'Access to the path is denied' }
+            return $vmLogAge
+        }
         function Start-Sleep { param([int]$Milliseconds, [int]$Seconds) $null = $Milliseconds, $Seconds }
+        # As the cmdlet: no match writes NoProcessFoundForGivenName,
+        # ProcessCommandException, ObjectNotFound (measured 2026-11-22), and a
+        # list that cannot be read another error; neither throws, and
+        # -ErrorAction Stop makes it terminating in the caller.
         function Get-Process {
-            param([string]$Name, [int]$Id, [string]$ErrorAction)
-            $null = $ErrorAction
-            if ($Id) { return [pscustomobject]@{ Id = $Id; SessionId = 0 } }
+            [CmdletBinding()]
+            param([string]$Name, [int]$Id)
+            if ($Id) {
+                if ($idFails) {
+                    $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ComponentModel.Win32Exception' 'Access is denied' `
+                        'CouldNotEnumerateProcesses' 'NotSpecified' $Id))
+                    return
+                }
+                return [pscustomobject]@{ Id = $Id; SessionId = $(if ($sessionOne) { 1 } else { 0 }) }
+            }
+            if ($procListFails) {
+                $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ComponentModel.Win32Exception' 'Access is denied' `
+                    'CouldNotEnumerateProcesses' 'NotSpecified' $Name))
+                return
+            }
             if ($Name -eq 'claude' -and $busyProc) { return @($busyProc) }
-            return @()
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ProcessCommandException' `
+                "Cannot find a process with the name `"$Name`". Verify the process name and call the cmdlet again." `
+                'NoProcessFoundForGivenName' 'ObjectNotFound' $Name))
+        }
+        # As the cmdlet (measured 2026-11-23 on Windows PowerShell 5.1): a
+        # definition that does not compile writes one SOURCE_CODE_ERROR per
+        # compiler error, which -ErrorAction Stop makes terminating, and then
+        # throws COMPILER_ERRORS whatever the ErrorAction; a name another
+        # definition holds throws TYPE_ALREADY_EXISTS whatever the
+        # ErrorAction. Otherwise it adds nothing: the type the input check
+        # calls is a stand-in, loaded below.
+        function Add-Type {
+            [CmdletBinding()]
+            param([string]$TypeDefinition)
+            $null = $TypeDefinition
+            if ($addTypeFails -eq 'compile') {
+                $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Exception' `
+                    ("c:\Temp\cfx1\cfx1.0.cs(6) : Invalid expression term '}'`r`n`r`nc:\Temp\cfx1\cfx1.0.cs(6) : >>> " +
+                        '[DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);') `
+                    'SOURCE_CODE_ERROR' 'InvalidData' $null))
+                $PSCmdlet.ThrowTerminatingError((New-FakeErrorRecord 'System.InvalidOperationException' `
+                    'Cannot add type. Compilation errors occurred.' 'COMPILER_ERRORS' 'InvalidData' $null))
+            }
+            if ($addTypeFails -eq 'exists') {
+                $PSCmdlet.ThrowTerminatingError((New-FakeErrorRecord 'System.Exception' `
+                    "Cannot add type. The type name 'FixActivityCheck' already exists." 'TYPE_ALREADY_EXISTS' 'InvalidOperation' $null))
+            }
         }
         if ($sessionDef) { . ([scriptblock]::Create($sessionDef.Extent.Text)) }
         . ([scriptblock]::Create($blockDef.Extent.Text))
@@ -403,6 +808,78 @@ if ($blockDef) {
         $r['vmlog'] = Get-AutomatedFixBlocker
         $vmLogAge = 600
         $r['clear'] = Get-AutomatedFixBlocker
+        # Each read that could not be made, since 6.3.1. A throw out of the
+        # function is a case result too, so an old copy fails here and not
+        # the whole run.
+        $ask = { try { Get-AutomatedFixBlocker } catch { "THREW: $($_.Exception.Message)" } }
+        $transcriptThrows = $true
+        $r['transcriptUnread'] = & $ask
+        $transcriptThrows = $false
+        $procListFails = $true
+        $r['procsUnread'] = & $ask
+        $procListFails = $false
+        $vmLogThrows = $true
+        $r['vmlogUnread'] = & $ask
+        $vmLogThrows = $false
+        $idFails = $true
+        $r['inputUnread'] = & $ask
+        $idFails = $false
+        # A process whose second sample fails: running, then whose end
+        # cannot be read either, then ended. As a Process: a getter that
+        # throws reads as nothing, and its get_ method throws (measured
+        # 2026-11-23).
+        $busyProc = [pscustomobject]@{ Id = 78; Gone = $false; EndUnread = $false }
+        $busyProc | Add-Member -MemberType ScriptProperty -Name TotalProcessorTime -Value { [timespan]::FromMilliseconds(0) }
+        $busyProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { throw 'Access is denied' }
+        $busyProc | Add-Member -MemberType ScriptProperty -Name HasExited -Value {
+            if ($this.EndUnread) { throw 'Access is denied' }
+            return $this.Gone
+        }
+        $busyProc | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value {
+            if ($this.EndUnread) { throw 'Access is denied' }
+            return $this.Gone
+        }
+        $r['sampleUnread'] = & $ask
+        $busyProc.EndUnread = $true
+        $r['sampleEndUnread'] = & $ask
+        $busyProc.EndUnread = $false
+        $busyProc.Gone = $true
+        $r['sampleEnded'] = & $ask
+        $busyProc = $null
+        # Check 5, in a session with a desktop. Its type comes from the
+        # compiler, so the case where it is not there runs first, and a
+        # stand-in of that name is loaded after it: GetLastInputInfo answers
+        # an input IdleMs ago, or fails.
+        $r['typeBefore'] = [bool]('FixActivityCheck' -as [type])
+        $sessionOne = $true
+        $addTypeFails = 'compile'
+        $r['inputTypeUnloaded'] = & $ask
+        $addTypeFails = ''
+        Microsoft.PowerShell.Utility\Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+public static class FixActivityCheck {
+    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    public static uint IdleMs = 600000;
+    public static bool Fails = false;
+    public static bool GetLastInputInfo(ref LASTINPUTINFO plii) {
+        if (Fails) { return false; }
+        plii.dwTime = unchecked((uint)Environment.TickCount - IdleMs);
+        return true;
+    }
+}
+'@
+        $standIn = 'FixActivityCheck' -as [type]
+        $standIn::IdleMs = 10000
+        $r['inputRecent'] = & $ask
+        $standIn::IdleMs = 600000
+        $r['inputIdle'] = & $ask
+        $addTypeFails = 'exists'
+        $r['inputTypeThere'] = & $ask
+        $addTypeFails = ''
+        $standIn::Fails = $true
+        $r['inputApiFails'] = & $ask
+        $standIn::Fails = $false
+        $sessionOne = $false
         $r
     }
     Assert-Case "a running app session blocks, naming its PIDs" `
@@ -418,6 +895,70 @@ if ($blockDef) {
     Assert-Case "a fresh VM log still blocks" `
         ("$($blocked['vmlog'])" -eq 'a VM log was written 30s ago') "got: $($blocked['vmlog'])"
     Assert-Case "nothing going on: no blocker" ($null -eq $blocked['clear']) "got: $($blocked['clear'])"
+    Assert-Case "a transcript folder that could not be read blocks (fail closed)" `
+        ("$($blocked['transcriptUnread'])" -eq 'whether a Claude Code transcript was written in the last 35 minutes could not be read (Access to the path is denied)') `
+        "got: $($blocked['transcriptUnread'])"
+    Assert-Case "a process list that could not be read blocks (fail closed)" `
+        ("$($blocked['procsUnread'])" -eq 'the processes named claude could not be listed (Access is denied)') "got: $($blocked['procsUnread'])"
+    Assert-Case "VM logs that could not be read block (fail closed)" `
+        ("$($blocked['vmlogUnread'])" -eq 'the VM logs could not be read (Access to the path is denied)') "got: $($blocked['vmlogUnread'])"
+    Assert-Case "an input check that failed blocks (fail closed)" `
+        ("$($blocked['inputUnread'])" -eq 'the time of the last keyboard or mouse input could not be read (Access is denied)') "got: $($blocked['inputUnread'])"
+    Assert-Case "a running process that could not be sampled blocks" `
+        ("$($blocked['sampleUnread'])" -match '^whether claude process 78 is using CPU could not be read \(.*Access is denied.*\)$') "got: $($blocked['sampleUnread'])"
+    Assert-Case "one that ended before its second sample does not" ($null -eq $blocked['sampleEnded']) "got: $($blocked['sampleEnded'])"
+    # Until 6.3.1 the end was read through the getter, which reads as
+    # nothing when it throws, so an end that could not be read was not said.
+    Assert-Case "one whose end could not be read either blocks, saying both" `
+        ("$($blocked['sampleEndUnread'])" -match '^whether claude process 78 is using CPU could not be read \(.*Access is denied.*\), nor whether it has ended \(.*Access is denied.*\)$') `
+        "got: $($blocked['sampleEndUnread'])"
+    Assert-Case "no stand-in input type was loaded before the input cases" ($blocked['typeBefore'] -eq $false) "got: $($blocked['typeBefore'])"
+    # Until 6.3.1 the Add-Type ran with SilentlyContinue, which hid the
+    # compiler's error, and only "Cannot add type. Compilation errors
+    # occurred." was said.
+    Assert-Case "an input check whose type did not compile blocks, naming the compiler's error" `
+        ("$($blocked['inputTypeUnloaded'])" -match "^the time of the last keyboard or mouse input could not be read \(the check for it could not be loaded: .*Invalid expression term '\}'.*\)$") `
+        "got: $($blocked['inputTypeUnloaded'])"
+    Assert-Case "input 10 seconds ago blocks" ("$($blocked['inputRecent'])" -match '^keyboard or mouse input 1[01]s ago$') "got: $($blocked['inputRecent'])"
+    Assert-Case "no input for 10 minutes: no blocker" ($null -eq $blocked['inputIdle']) "got: $($blocked['inputIdle'])"
+    Assert-Case "an Add-Type that fails with the type already there: the type answers, no blocker" `
+        ($null -eq $blocked['inputTypeThere']) "got: $($blocked['inputTypeThere'])"
+    Assert-Case "a GetLastInputInfo that fails blocks" `
+        ("$($blocked['inputApiFails'])" -eq 'the time of the last keyboard or mouse input could not be read (GetLastInputInfo failed)') `
+        "got: $($blocked['inputApiFails'])"
+}
+
+# Fix's window type, loaded at the top of the script, is best effort: with
+# it the window is brought forward and flashed, and nothing else. Add-Type
+# throws COMPILER_ERRORS for a type that does not compile whatever its
+# ErrorAction (measured 2026-11-23), so until 6.3.1 SilentlyContinue alone
+# left that error in red on the screen of a run it does not touch. The
+# statement that loads it runs here against a fake Add-Type that fails as
+# the cmdlet does.
+$winAdd = $fixAst.Find({ param($n)
+    $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Type' -and
+    $n.Extent.Text -match 'public static class Win32Window' }, $true)
+Assert-Case "Fix's window type is loaded by an Add-Type" ($null -ne $winAdd)
+if ($winAdd) {
+    $winStmt = $winAdd
+    while ($winStmt.Parent -and $winStmt.Parent -isnot [System.Management.Automation.Language.NamedBlockAst]) { $winStmt = $winStmt.Parent }
+    $winOut = try {
+        & {
+            Set-StrictMode -Version Latest
+            function Add-Type {
+                [CmdletBinding()]
+                param([string]$TypeDefinition)
+                $null = $TypeDefinition
+                $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Exception' 'c:\Temp\cfx2\cfx2.0.cs(12) : ; expected' 'SOURCE_CODE_ERROR' 'InvalidData' $null))
+                $PSCmdlet.ThrowTerminatingError((New-FakeErrorRecord 'System.InvalidOperationException' `
+                    'Cannot add type. Compilation errors occurred.' 'COMPILER_ERRORS' 'InvalidData' $null))
+            }
+            . ([scriptblock]::Create($winStmt.Extent.Text))
+            'ran on'
+        } 2>&1
+    } catch { "THREW: $($_.Exception.Message)" }
+    $winText = @($winOut | ForEach-Object { "$_" }) -join ' / '
+    Assert-Case "a window type that does not compile is passed over in silence, and the run goes on" ($winText -eq 'ran on') "got: $winText"
 }
 # Held back, not done: exit $script:BlockedExitCode. Until 6.3.0 it was exit 0,
 # the same as a finished repair. Test-RunOutcomes runs the gate.
@@ -476,7 +1017,12 @@ $guardedSeen = (@($guardedBy | Sort-Object) -join ' | ')
 $guardedWant = (@('Step 1', 'Step 4', 'the escalation to Deep', 'the no-progress escalation') | Sort-Object) -join ' | '
 Assert-Case "the guards stand before Step 1, Step 4 and both escalations" ($guardedSeen -eq $guardedWant) "before: $guardedSeen"
 $guardCalls = [regex]::Matches($fixSrc, '(?m)^\s*(if \(\$orphanAppCount -gt 0\) \{ )?Assert-NoNewAppSession -Before "').Count
-Assert-Case "and nowhere else" ($guardCalls -eq 4) "found $guardCalls call(s)"
+# Once more before Step 1, in its branch for a list of processes that could
+# not be read: whether the app runs a session is not known then either, and
+# nothing has been stopped yet (6.3.1).
+Assert-Case "and nowhere else, but once more in Step 1 for a list that could not be read" ($guardCalls -eq 5) "found $guardCalls call(s)"
+Assert-Case "that one is Step 1's branch for a list that could not be read" `
+    ($fixSrc -match '(?m)^\} elseif \(\$claudeUnread\) \{\s*\r?\n(\s*#[^\r\n]*\r?\n)*\s*Assert-NoNewAppSession -Before "Step 1" -ExitCode \$script:BlockedExitCode\s*\r?\n\} else \{')
 # Step 4 asks only when a process of the app is left over, not for the
 # service alone, which no Claude Code session runs in.
 Assert-Case "Step 4 counts the app's own processes it is about to stop" `
@@ -496,15 +1042,28 @@ Assert-Case "Assert-NoNewAppSession and Get-AppSessionBlocker were found in Fix"
 $restartDef = Get-FixFunction 'Start-ServiceStoppedByRun'
 Assert-Case "Start-ServiceStoppedByRun was found in Fix" ($null -ne $restartDef)
 $restartText = if ($restartDef) { $restartDef.Extent.Text } else { '' }
+# The service is read through Fix's Get-FixServiceState and the region's
+# Get-ClaudeServiceOrNull, lifted as they are; only Get-Service is faked.
+# 'svcdenied' makes it fail with an identity that is not "no such service"
+# (access denied), as a read that could not be made.
+$svcReadText = @('Get-FixServiceState', 'Get-ClaudeServiceOrNull', 'Test-ClaudeNotFoundError' | ForEach-Object {
+    $d = Get-FixFunction $_
+    if ($d) { $d.Extent.Text } }) -join "`r`n"
 $svcFakes = @(
     '$ServiceName = "CoworkVMService"',
     '$script:ServiceStoppedByRun = ($Case -notmatch ''notstopped'')',
+    'function Get-ClaudeErrorText { param($ErrorRecord) return [string]$ErrorRecord.Exception.Message }',
     'function Get-Service {',
-    '    param([string]$Name, [string]$ErrorAction)',
-    '    $null = $ErrorAction',
+    '    [CmdletBinding()]',
+    '    param([string]$Name)',
+    '    if ($Case -match ''svcdenied'') {',
+    '        $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord((New-Object System.ComponentModel.Win32Exception 5), ''CouldNotGetServiceInfo'', ''PermissionDenied'', $Name)))',
+    '        return',
+    '    }',
     '    $st = if ($Case -match ''svcup'') { ''Running'' } else { ''Stopped'' }',
     '    return [pscustomobject]@{ Name = $Name; Status = $st }',
     '}',
+    $svcReadText,
     'function Start-Service {',
     '    param([string]$Name, [string]$ErrorAction)',
     '    $null = $ErrorAction',
@@ -578,6 +1137,8 @@ if ($guardDef -and $sessionDef) {
             Assert-Case "$label exits $($gc.Exit)" ($gExit -eq $gc.Exit -and $gOut -match $gc.Rx -and $gOut -notmatch $gc.Not) "exit $gExit; output: $($gOut.Trim())"
         }
     } finally {
+        # Clean-up of this section's own temp script: its cases are counted,
+        # and a file left in %TEMP% changes nothing.
         Remove-Item -LiteralPath $guardScript -Force -ErrorAction SilentlyContinue
     }
 }
@@ -590,7 +1151,8 @@ if ($guardDef -and $sessionDef) {
 # case says otherwise. Until 6.3.0 an exit 4 here left it stopped, and
 # Windows does not start a manually stopped service through its trigger.
 $s4First = @($fixAst.FindAll({ param($n)
-    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$orphanInventory' }, $true))
+    $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$orphanUnread' -and
+    $n.Right.Extent.Text -eq '$null' }, $true))
 $s4Last  = @($fixAst.FindAll({ param($n)
     $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$remaining.Count -gt 0' }, $true))
 Assert-Case "Step 4's inventory and its kill were found" ($s4First.Count -eq 1 -and $s4Last.Count -eq 1) "found $($s4First.Count), $($s4Last.Count)"
@@ -600,7 +1162,8 @@ if ($s4First.Count -eq 1 -and $s4Last.Count -eq 1 -and $guardDef -and $sessionDe
     $s4Text = $s4Text.Replace('$PSCmdlet.ShouldProcess(', '$fakeCmdlet.ShouldProcess(')
     $s4Faked = @('Get-ClaudeProcessInventory', 'Get-Process', 'Log', 'Save-Log', 'Stop-Process', 'Start-Sleep',
         'Get-ClaudeDesktopProcess', 'Get-ClaudeAppCliProcess', 'Assert-NoNewAppSession', 'Get-AppSessionBlocker',
-        'Where-Object', 'ForEach-Object', 'Start-ServiceStoppedByRun', 'Get-Service', 'Start-Service')
+        'Where-Object', 'ForEach-Object', 'Start-ServiceStoppedByRun', 'Get-Service', 'Start-Service', 'Get-ClaudeErrorText',
+        'Get-ClaudeProcessByName', 'Get-FixServiceState')
     $s4Parsed = [System.Management.Automation.Language.Parser]::ParseInput($s4Text, [ref]$null, [ref]$null)
     $s4Unfaked = @(@($s4Parsed, $guardDef, $sessionDef, $restartDef) | Where-Object { $_ } | ForEach-Object {
         $_.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) } | ForEach-Object {
@@ -619,20 +1182,37 @@ if ($s4First.Count -eq 1 -and $s4Last.Count -eq 1 -and $guardDef -and $sessionDe
             $guardFakes,
             '$ServiceExe = "cowork-svc"',
             'function Start-Sleep { param([int]$Seconds, [int]$Milliseconds) $null = $Seconds, $Milliseconds }',
+            'function Get-ClaudeErrorText { param($ErrorRecord) return [string]$ErrorRecord.Exception.Message }',
             'function Get-ClaudeProcessInventory {',
             '    param($Environment)',
             '    $null = $Environment',
+            '    if ($Case -match ''unread'') { throw ''Access is denied'' }',
             '    if ($Case -match ''desktop'') { return @([pscustomobject]@{ IsDesktop = $true; Process = [pscustomobject]@{ Id = 101 } }) }',
             '    return @()',
             '}',
             'function Get-Process {',
-            '    param([string]$Name, [string]$ErrorAction)',
-            '    $null = $ErrorAction',
+            '    [CmdletBinding()]',
+            '    param([string]$Name)',
+            '    if ($Case -match ''svcexefails'') {',
+            '        $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord((New-Object System.ComponentModel.Win32Exception 5), ''CouldNotEnumerateProcesses'', ''PermissionDenied'', $Name)))',
+            '        return',
+            '    }',
+            '    if ($Case -match ''service'' -and $Name -eq $ServiceExe) { return @([pscustomobject]@{ Id = 900 }) }',
+            '    return @()',
+            '}',
+            'function Get-ClaudeProcessByName {',
+            '    param([string]$Name)',
+            '    if ($Case -match ''svcexefails'') { throw (New-Object System.ComponentModel.Win32Exception 5) }',
             '    if ($Case -match ''service'' -and $Name -eq $ServiceExe) { return @([pscustomobject]@{ Id = 900 }) }',
             '    return @()',
             '}',
             'function Stop-Process { param([switch]$Force, [string]$ErrorAction) $null = $Force, $ErrorAction; foreach ($p in $input) { [Console]::Out.WriteLine("KILLED $($p.Id)") } }',
-            'function Get-ClaudeDesktopProcess { param($Environment) $null = $Environment; return @() }',
+            'function Get-ClaudeDesktopProcess {',
+            '    param($Environment)',
+            '    $null = $Environment',
+            '    if ($Case -match ''recheck'') { throw ''Access is denied'' }',
+            '    return @()',
+            '}',
             '$fakeCmdlet = New-Object psobject',
             '$fakeCmdlet | Add-Member -MemberType ScriptMethod -Name ShouldProcess -Value { param($Target, $Action) [Console]::Out.WriteLine("ASKED $Action"); return $true }',
             $sessionDef.Extent.Text,
@@ -662,7 +1242,38 @@ if ($s4First.Count -eq 1 -and $s4Last.Count -eq 1 -and $guardDef -and $sessionDe
                 # A start that fails is logged, and the run still ends with 4.
                 @{ Case = 'desktop-session-startfails'; Quiet = $true; Exit = 4
                    Has = @('STOPPED PART-WAY: 1 Claude Code session', 'LOG: \[!\] Could not start CoworkVMService again \(Cannot start service CoworkVMService\); run Fix when Cowork is needed')
-                   Not = 'ASKED|KILLED|STEP 4 DONE|STARTED CoworkVMService' }
+                   Not = 'ASKED|KILLED|STEP 4 DONE|STARTED CoworkVMService' },
+                # A list that could not be read: none of the app's processes
+                # is stopped, that is said, and "All clear" is not. The
+                # service's are read apart and still stopped. Until 6.3.1 the
+                # list read as empty.
+                @{ Case = 'unread'; Quiet = $false; Exit = 0
+                   Has = @('LOG: \[!\] Claude''s processes could not be listed \(Access is denied\), so none of the app''s were stopped', 'STEP 4 DONE')
+                   Not = 'ASKED|KILLED|All clear' },
+                @{ Case = 'unread-service'; Quiet = $true; Exit = 0
+                   Has = @('could not be listed \(Access is denied\)', 'ASKED Force-kill', 'KILLED 900', 'STEP 4 DONE')
+                   Not = 'KILLED 101|All clear|STOPPED PART-WAY|BLOCKED' },
+                # A re-check that could not be read is not "Cleaned up".
+                @{ Case = 'desktop-recheck'; Quiet = $false; Exit = 0
+                   Has = @('KILLED 101', 'LOG: \[!\] Whether the orphans stopped is not known: Claude''s processes could not be listed \(Access is denied\)', 'STEP 4 DONE')
+                   Not = 'Cleaned up|refuse to die' },
+                # The service's processes could not be listed: none of them
+                # is stopped, that is said, and neither "All clear" nor
+                # "Cleaned up" is. Until 6.3.1 that list read as empty.
+                @{ Case = 'svcexefails'; Quiet = $false; Exit = 0
+                   Has = @('LOG: \[!\] cowork-svc''s processes could not be listed \(Access is denied\), so none were stopped', 'STEP 4 DONE')
+                   Not = 'ASKED|KILLED|All clear' },
+                @{ Case = 'desktop-svcexefails'; Quiet = $false; Exit = 0
+                   Has = @('LOG: \[!\] cowork-svc''s processes could not be listed \(Access is denied\), so none were stopped', 'KILLED 101',
+                           'LOG: \[!\] Whether the orphans stopped is not known: cowork-svc''s processes could not be listed \(Access is denied\)', 'STEP 4 DONE')
+                   Not = 'KILLED 900|All clear|Cleaned up' },
+                # Whether the service runs could not be read: it is not
+                # started again, and that is said. Until 6.3.1 the run ended
+                # here without a word.
+                @{ Case = 'desktop-session-svcdenied'; Quiet = $true; Exit = 4
+                   Has = @('STOPPED PART-WAY: 1 Claude Code session',
+                           'LOG: \[!\] Whether CoworkVMService is running could not be read \(Access is denied\), so it was not started again; run Fix when Cowork is needed')
+                   Not = 'ASKED|KILLED|STEP 4 DONE|STARTED CoworkVMService|Could not start' }
             )) {
                 $sArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $s4Script, '-Case', $sc.Case)
                 if ($sc.Quiet) { $sArgs += '-Quiet' }
@@ -674,6 +1285,8 @@ if ($s4First.Count -eq 1 -and $s4Last.Count -eq 1 -and $guardDef -and $sessionDe
                     "exit $sExit; missing [$($missing -join '; ')]; output: $($sOut.Trim())"
             }
         } finally {
+            # Clean-up of this section's own temp script: its cases are
+            # counted, and a file left in %TEMP% changes nothing.
             Remove-Item -LiteralPath $s4Script -Force -ErrorAction SilentlyContinue
         }
     }
@@ -706,26 +1319,84 @@ if ($findDef) {
     $script:FakeProducts[$realApp]     = 'Claude'
     $script:ClaudeEnv         = [pscustomobject]@{ ClaudeExe = $null; ClaudeExeSource = $null }
     $script:CapturedClaudeExe = $null
+    $presentDef  = Get-FixFunction 'Test-FixPathPresent'
+    $firstErrDef = Get-FixFunction 'Get-FixFirstError'
     try {
         $found = & {
             $ExePathCache   = Join-Path $sandbox '.claude-exe-path'
             $appPathsTarget = $null
             $lnkTarget      = $null
-            function Log { param([string]$Message, [string]$Colour, [switch]$Indent) $null = $Message, $Colour, $Indent }
+            # What could not be read: 'cached' (the path the cache names),
+            # 'reg' (the App Paths key), 'menu' (the Start Menu folders), or
+            # 'partial' (a folder under the Start Menu, so the search writes
+            # an error and finds nothing). Test-Path answers $false for each,
+            # as the real one does for a path it cannot read; the reads
+            # since 6.3.1 get the error. Access denied is the identity used.
+            $readFails      = ''
+            $findLog        = New-Object System.Collections.ArrayList
+            function Log { param([string]$Message, [string]$Colour, [switch]$Indent) $null = $Colour, $Indent; [void]$findLog.Add($Message) }
+            # The errors Get-Item really gives (measured 2026-11-23): for a
+            # registry key it may not open, SecurityException, "Requested
+            # registry access is not allowed."; for a file or folder,
+            # ItemExistsUnauthorizedAccessError, "Access is denied", which
+            # does not name the path. Get-ChildItem's error for a folder in
+            # its walk, DirUnauthorizedAccessError, does name it.
+            function New-DeniedRecord {
+                param($Target)
+                # Module-qualified: New-Object is faked in this scope.
+                if ("$Target" -like 'HK*:*') {
+                    return (Microsoft.PowerShell.Utility\New-Object System.Management.Automation.ErrorRecord(
+                        (Microsoft.PowerShell.Utility\New-Object System.Security.SecurityException 'Requested registry access is not allowed.'),
+                        'System.Security.SecurityException', 'PermissionDenied', $Target))
+                }
+                return (Microsoft.PowerShell.Utility\New-Object System.Management.Automation.ErrorRecord(
+                    (Microsoft.PowerShell.Utility\New-Object System.UnauthorizedAccessException 'Access is denied'),
+                    'ItemExistsUnauthorizedAccessError', 'PermissionDenied', $Target))
+            }
+            function New-WalkDeniedRecord {
+                param($Target)
+                return (Microsoft.PowerShell.Utility\New-Object System.Management.Automation.ErrorRecord(
+                    (Microsoft.PowerShell.Utility\New-Object System.UnauthorizedAccessException "Access to the path '$Target' is denied."),
+                    'DirUnauthorizedAccessError', 'PermissionDenied', $Target))
+            }
             function Test-Path {
                 param($Path)
-                if ("$Path" -like 'HKLM:*')      { return [bool]$appPathsTarget }
-                if ("$Path" -like '*Start Menu') { return [bool]$lnkTarget }
+                if ("$Path" -like 'HKLM:*')      { return ($readFails -ne 'reg' -and [bool]$appPathsTarget) }
+                if ("$Path" -like '*Start Menu') { return ($readFails -ne 'menu' -and ([bool]$lnkTarget -or $readFails -eq 'partial')) }
+                if ($readFails -eq 'cached' -and "$Path" -eq $realApp) { return $false }
                 return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $Path)
             }
+            function Get-ClaudeItemOrNull {
+                param([string]$LiteralPath)
+                if ($LiteralPath -like 'HKLM:*') {
+                    if ($readFails -eq 'reg') { throw (New-DeniedRecord $LiteralPath) }
+                    if ($appPathsTarget) { return [pscustomobject]@{ PSPath = $LiteralPath } }
+                    return $null
+                }
+                if ($LiteralPath -like '*Start Menu') {
+                    if ($readFails -eq 'menu') { throw (New-DeniedRecord $LiteralPath) }
+                    if ($lnkTarget -or $readFails -eq 'partial') { return [pscustomobject]@{ PSPath = $LiteralPath } }
+                    return $null
+                }
+                if ($readFails -eq 'cached' -and $LiteralPath -eq $realApp) { throw (New-DeniedRecord $LiteralPath) }
+                # A sandbox file: the script's Get-Item fake gives its product
+                # name, which Test-ClaudeCodeCliPath reads.
+                if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath) { return (Get-Item -LiteralPath $LiteralPath -ErrorAction Stop) }
+                return $null
+            }
             function Get-ItemProperty {
-                param($Path, $ErrorAction)
-                $null = $Path, $ErrorAction
+                param($Path, $LiteralPath, $ErrorAction)
+                $null = $Path, $LiteralPath, $ErrorAction
                 return [pscustomobject]@{ '(default)' = $appPathsTarget }
             }
             function Get-ChildItem {
-                param($Path, [switch]$Recurse, $Filter, $ErrorAction)
-                $null = $Path, $Recurse, $Filter, $ErrorAction
+                [CmdletBinding()]
+                param([Parameter(Position = 0)]$Path, $LiteralPath, [switch]$Recurse, $Filter)
+                $null = $Path, $LiteralPath, $Recurse, $Filter
+                if ($readFails -eq 'partial') {
+                    $PSCmdlet.WriteError((New-WalkDeniedRecord 'Start Menu\Programs\Locked'))
+                    return
+                }
                 if ($lnkTarget) { return [pscustomobject]@{ FullName = 'Claude.lnk' } }
             }
             function New-Object {
@@ -739,6 +1410,8 @@ if ($findDef) {
                 }
                 return $shell
             }
+            if ($presentDef)  { . ([scriptblock]::Create($presentDef.Extent.Text)) }
+            if ($firstErrDef) { . ([scriptblock]::Create($firstErrDef.Extent.Text)) }
             . ([scriptblock]::Create($findDef.Extent.Text))
 
             $r = [ordered]@{}
@@ -750,20 +1423,41 @@ if ($findDef) {
                 @{ Key = 'regApp';    Reg = $realApp }
                 @{ Key = 'lnkTerm';   Lnk = $realTermCli }
                 @{ Key = 'lnkApp';    Lnk = $realApp }
+                @{ Key = 'cacheUnread'; Cache = $realApp; Fails = 'cached' }
+                @{ Key = 'regUnread';   Reg = $realApp; Fails = 'reg' }
+                @{ Key = 'regTargetUnread'; Reg = $realApp; Fails = 'cached' }
+                @{ Key = 'menuUnread';  Lnk = $realApp; Fails = 'menu' }
+                @{ Key = 'menuPartial'; Fails = 'partial' }
             )) {
-                Microsoft.PowerShell.Management\Remove-Item -LiteralPath $ExePathCache -Force -ErrorAction SilentlyContinue
+                # The cache the case before wrote. Until 6.3.1 one that could
+                # not be deleted was passed over, and this case then read the
+                # last one's. File.Delete is no error for a file that is not
+                # there, and throws for one it cannot delete, which stops the
+                # gate.
+                [System.IO.File]::Delete($ExePathCache)
                 if ($c['Cache']) { [System.IO.File]::WriteAllText($ExePathCache, $c['Cache']) }
                 $appPathsTarget = $c['Reg']
                 $lnkTarget      = $c['Lnk']
+                $readFails      = "$($c['Fails'])"
+                $findLog.Clear()
                 $got = Find-ClaudeExe
+                # GetAttributes tells a cache that is not there
+                # (FileNotFoundException) from one that could not be read,
+                # which throws and fails the case. File.Exists answered $false
+                # for both, which would pass "the cache holding it is removed".
+                $kept = $(try { $null = [System.IO.File]::GetAttributes($ExePathCache); $true }
+                          catch [System.IO.FileNotFoundException] { $false })
                 $r[$c.Key] = [pscustomobject]@{
                     Got       = "$got"
-                    CacheKept = [System.IO.File]::Exists($ExePathCache)
+                    CacheKept = $kept
+                    Logged    = ($findLog -join ' | ')
                 }
             }
             $r
         }
     } finally {
+        # Clean-up of this section's own sandbox: its results are in hand,
+        # and a folder left in %TEMP% changes nothing.
         Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
         $script:ClaudeEnv = $null
     }
@@ -771,12 +1465,32 @@ if ($findDef) {
     Assert-Case "and the cache holding it is removed"        (-not $found['cacheTerm'].CacheKept)
     Assert-Case "a cached app-started CLI path is refused"   ($found['cacheCli'].Got -eq '')  "got $($found['cacheCli'].Got)"
     Assert-Case "and the cache holding it is removed"        (-not $found['cacheCli'].CacheKept)
-    Assert-Case "a cached app path is used"                  ($found['cacheApp'].Got -eq $realApp) "got $($found['cacheApp'].Got)"
+    Assert-Case "a cached app path is used"                  ($found['cacheApp'].Got -eq $realApp) "got $($found['cacheApp'].Got); logged: $($found['cacheApp'].Logged)"
     Assert-Case "and its cache is kept"                      ($found['cacheApp'].CacheKept)
     Assert-Case "App Paths naming the terminal CLI is refused" ($found['regTerm'].Got -eq '') "got $($found['regTerm'].Got)"
-    Assert-Case "App Paths naming the app is used"           ($found['regApp'].Got -eq $realApp) "got $($found['regApp'].Got)"
+    Assert-Case "App Paths naming the app is used"           ($found['regApp'].Got -eq $realApp) "got $($found['regApp'].Got); logged: $($found['regApp'].Logged)"
     Assert-Case "a Start Menu shortcut to the terminal CLI is refused" ($found['lnkTerm'].Got -eq '') "got $($found['lnkTerm'].Got)"
-    Assert-Case "a Start Menu shortcut to the app is used"   ($found['lnkApp'].Got -eq $realApp) "got $($found['lnkApp'].Got)"
+    Assert-Case "a Start Menu shortcut to the app is used"   ($found['lnkApp'].Got -eq $realApp) "got $($found['lnkApp'].Got); logged: $($found['lnkApp'].Logged)"
+    # What could not be read is said, and a cache whose path could not be
+    # read is kept. Until 6.3.1 each read as nothing there, without a word,
+    # and the cache was deleted on it.
+    Assert-Case "a cached path that could not be read: the cache is kept" `
+        ($found['cacheUnread'].Got -eq '' -and $found['cacheUnread'].CacheKept) "got '$($found['cacheUnread'].Got)', kept $($found['cacheUnread'].CacheKept)"
+    Assert-Case "and it says so" `
+        ($found['cacheUnread'].Logged -match '\[!\] The cached Claude\.exe could not be read \(Access is denied\), so it was passed over' -and
+         $found['cacheUnread'].Logged -notmatch 'Cached path invalid') "logged: $($found['cacheUnread'].Logged)"
+    Assert-Case "an App Paths key that could not be read is said" `
+        ($found['regUnread'].Got -eq '' -and $found['regUnread'].Logged -match '\[!\] The App Paths key for claude\.exe could not be read \(Requested registry access is not allowed\.\)') `
+        "got '$($found['regUnread'].Got)'; logged: $($found['regUnread'].Logged)"
+    Assert-Case "an App Paths target that could not be read is said" `
+        ($found['regTargetUnread'].Got -eq '' -and $found['regTargetUnread'].Logged -match '\[!\] The Claude\.exe App Paths names could not be read \(Access is denied\)') `
+        "got '$($found['regTargetUnread'].Got)'; logged: $($found['regTargetUnread'].Logged)"
+    Assert-Case "a Start Menu that could not be searched is said" `
+        ($found['menuUnread'].Got -eq '' -and $found['menuUnread'].Logged -match '\[!\] The Start Menu at .*Start Menu could not be searched for a Claude shortcut \(Access is denied\)') `
+        "got '$($found['menuUnread'].Got)'; logged: $($found['menuUnread'].Logged)"
+    Assert-Case "part of the Start Menu that could not be searched is said" `
+        ($found['menuPartial'].Got -eq '' -and $found['menuPartial'].Logged -match '\[!\] Part of .*Start Menu could not be searched for a Claude shortcut \(Access to the path ''Start Menu\\Programs\\Locked'' is denied\.\)') `
+        "got '$($found['menuPartial'].Got)'; logged: $($found['menuPartial'].Logged)"
 }
 
 # ---------------------------------------------------------------------
@@ -851,9 +1565,10 @@ function Test-ScanNamesClaude {
 }
 
 function Test-ScanNameLookup {
-    # Get-Process given the name claude, by -Name or by position.
+    # Get-Process given the name claude, by -Name or by position, or the
+    # region's Get-ClaudeProcessByName (6.3.1), which is Get-Process -Name.
     param($Cmd)
-    if ((Get-ScanCmdName $Cmd) -notmatch '(?i)^(Get-Process|gps|ps)$') { return $false }
+    if ((Get-ScanCmdName $Cmd) -notmatch '(?i)^(Get-Process|gps|ps|Get-ClaudeProcessByName)$') { return $false }
     $els = $Cmd.CommandElements
     for ($i = 1; $i -lt $els.Count; $i++) {
         $e = $els[$i]
@@ -1035,6 +1750,11 @@ function Find-BroadKill {
 # the last commit before the fix, with only enough around them to parse; the
 # rest are shapes a regression could take.
 $mustFlag = [ordered]@{
+    'the region helper that lists by name, into a kill' = 'Get-ClaudeProcessByName -Name $ProcessName | Stop-Process -Force'
+    'the region helper that lists by name, held and killed' = @'
+$all = @(Get-ClaudeProcessByName -Name $ProcessName)
+$all | Stop-Process -Force
+'@
     'Fix -Close (0aa8d07)' = @'
 $procs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
 if ($procs.Count -gt 0) {
@@ -1101,14 +1821,24 @@ foreach ($k in $mustFlag.Keys) {
 # And it has to pass the kills that replaced them, and the lookups that never
 # kill, or it would be red for good and get switched off.
 $mustPass = [ordered]@{
-    'CPU sampling across every claude (Fix today)' = @'
+    'CPU sampling across every claude (Fix until 6.3.1)' = @'
 $claudeCheck = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
 foreach ($cp in $claudeCheck) { $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds }
+'@
+    'CPU sampling across every claude (Fix today)' = @'
+$cpuProcs = @(Get-ClaudeProcessByName -Name $ProcessName)
+foreach ($cp in $cpuProcs) { $cpu1 = $cp.TotalProcessorTime.TotalMilliseconds }
 '@
     'the service, by name' = 'Get-Process -Name $ServiceExe -ErrorAction SilentlyContinue | Stop-Process -Force'
     'taskkill on the service' = 'Start-Process "taskkill" -ArgumentList "/F /IM $ServiceExe.exe" -NoNewWindow -Wait'
     'Step 4 orphans (Fix today)' = @'
-$orphanInventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+$orphanUnread    = $null
+$orphanInventory = @()
+try {
+    $orphanInventory = @(Get-ClaudeProcessInventory -Environment $script:ClaudeEnv)
+} catch {
+    $orphanUnread = Get-ClaudeErrorText $_
+}
 $remaining = @(@($orphanInventory | Where-Object { $_.IsDesktop } | ForEach-Object { $_.Process }) +
                @(Get-Process -Name $ServiceExe -ErrorAction SilentlyContinue))
 foreach ($proc in $remaining) {

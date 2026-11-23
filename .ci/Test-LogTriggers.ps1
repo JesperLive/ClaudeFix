@@ -194,7 +194,8 @@ try {
 }
 finally {
     # Remove only the folder this script made: under the temp root, named by
-    # this script, created above.
+    # this script, created above. Best effort: every case is counted by
+    # now, and a folder left in %TEMP% changes nothing.
     $leaf = Split-Path $ClaudeLogDir -Leaf
     if ($leaf -like 'cf-logtrig-*' -and $ClaudeLogDir.StartsWith($tempBase, [System.StringComparison]::OrdinalIgnoreCase)) {
         Remove-Item -LiteralPath $ClaudeLogDir -Recurse -Force -ErrorAction SilentlyContinue

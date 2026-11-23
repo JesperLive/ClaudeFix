@@ -3,17 +3,28 @@
     Drives Prevent-ClaudeIssues.ps1's own functions and steps against fakes.
 .DESCRIPTION
     The functions are lifted out of Prevent with the language parser, and
-    the steps that are not functions (1, 8 to 13, 15 and 19 of setup, the
+    the steps that are not functions (1, 8 to 15, 17 and 19 of setup, the
     parts of 15 and 17 that remove an older version's files, and 1 to 5 of
     -Undo) are cut out of the source between their Step calls and
-    wrapped in a function, so what runs here is the shipped text. The
+    wrapped in a function, so what runs here is the shipped text. So are
+    the two scripts setup writes for later, the Claude (Admin) task's
+    payload and the GPU-free launcher, which run here in this process. The
     monitor's clock functions are lifted from Watch-ClaudeHealth.ps1 too.
 
-    Nothing on this machine is changed, and little is read: Test-Path on a
-    path that is not a registry path goes to the real cmdlet, and step 15
-    reads the name of the account it runs as
-    ([Security.Principal.WindowsIdentity]::GetCurrent().Name). Every other
-    command those steps reach is a fake defined below: powercfg, sc.exe,
+    Nothing on this machine is changed. Files are read only in the folder
+    this run makes under %TEMP%: Test-Path, Get-Item and Get-ChildItem
+    pass a path that is not a registry path to the real cmdlet, and
+    Get-Content has no fake, but none is given a path outside that folder
+    (measured 2026-11-22 with a copy of this file that logged each one:
+    1833 calls, none outside it). Beyond that folder, what is read for real
+    is the name of this computer ([Environment]::MachineName), which the
+    undo record carries; the name of the account the run is under
+    ([Security.Principal.WindowsIdentity]::GetCurrent().Name), which step
+    15 gives the monitor's task; this process's environment variables,
+    some of which cases set, for this process only; the clock; and the
+    list of commands, to check that each name below is its fake. Every other
+    command those steps reach that reads or changes the machine is a fake
+    defined below: powercfg, sc.exe,
     w32tm and hcsdiag, the
     registry (an in-memory copy), the network adapter, storage and CIM
     cmdlets, the service, process, Defender, scheduled task and Hyper-V
@@ -143,6 +154,17 @@ function Get-FakeFolder {
 }
 function Get-FakeCommandPath { return $script:FakeCommandPath }
 
+# A fake reports what a cmdlet reports: the same error id, category and
+# exception type, which is what Prevent tells "not there" from "could not
+# be read" by. The exception types of the service and process cmdlets live
+# in this assembly.
+Add-Type -AssemblyName 'Microsoft.PowerShell.Commands.Management'
+function New-FakeErrorRecord {
+    param([string]$TypeName, [string]$Message, [string]$Id, [string]$Category, $Target)
+    $ex = New-Object $TypeName $Message
+    return (New-Object System.Management.Automation.ErrorRecord($ex, $Id,
+        [System.Management.Automation.ErrorCategory]$Category, $Target))
+}
 function Test-InSandbox {
     param([string]$Path)
     return ([string]$Path).StartsWith($sandbox, [StringComparison]::OrdinalIgnoreCase)
@@ -163,7 +185,7 @@ $tripwires = @(
     'Set-MpPreference', 'Stop-Service', 'Restart-Service', 'Set-Service', 'New-Service',
     'Set-ScheduledTask', 'Disable-ScheduledTask', 'Enable-ScheduledTask', 'Stop-ScheduledTask', 'New-ScheduledTask',
     'New-ItemProperty', 'Clear-ItemProperty', 'Rename-ItemProperty', 'Copy-Item', 'Move-Item',
-    'Rename-Item', 'Set-Content', 'Add-Content', 'Restart-Computer', 'Stop-Computer',
+    'Rename-Item', 'Add-Content', 'Restart-Computer', 'Stop-Computer',
     'New-NetNat', 'New-NetFirewallRule', 'Remove-NetFirewallRule',
     'Set-VM', 'Start-VM', 'Stop-VM', 'Start-Process', 'bcdedit.exe', 'reg.exe', 'netsh.exe'
 )
@@ -231,6 +253,16 @@ function Test-Path {
     [CmdletBinding()]
     param([Parameter(Position = 0)][string[]]$Path, [string[]]$LiteralPath, [string]$PathType, [switch]$IsValid)
     $p = Select-FakePath $Path $LiteralPath
+    # A file or folder $script:ItemReadFault matches cannot be read: Test-Path
+    # answers $false for it, as for one that is not there, and writes this
+    # error (measured 2026-11-23, an explicit Deny on the folder that holds
+    # it). A registry key is not faulted here: Test-Path answers $true for a
+    # key that cannot be read (measured the same day).
+    if ($script:ItemReadFault -and -not (Test-RegPath $p) -and $p -like $script:ItemReadFault) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.UnauthorizedAccessException' 'Access is denied' `
+            'ItemExistsUnauthorizedAccessError' 'PermissionDenied' $p))
+        return $false
+    }
     if (Test-RegPath $p) { return $script:Reg.ContainsKey((Get-RegNorm $p)) }
     return Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
 }
@@ -238,9 +270,34 @@ function Get-Item {
     [CmdletBinding()]
     param([Parameter(Position = 0)][string[]]$Path, [string[]]$LiteralPath, [switch]$Force)
     $p = Select-FakePath $Path $LiteralPath
+    # $script:ItemReadFault is a -like pattern: a path it matches cannot be
+    # read. The error is the one Get-Item -Force gives for a file under an
+    # explicit Deny (measured 2026-11-23): its message does not name the
+    # path. Until 6.3.1 this fake's message did, as no real one measured
+    # does, so a test could not see a line that failed to name it.
+    if ($script:ItemReadFault -and $p -like $script:ItemReadFault) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.UnauthorizedAccessException' 'Access is denied' `
+            'ItemExistsUnauthorizedAccessError' 'PermissionDenied' $p))
+        return
+    }
     if (Test-RegPath $p) {
         $n = Get-RegNorm $p
-        if (-not $script:Reg.ContainsKey($n)) { throw "Cannot find path '$p' because it does not exist." }
+        # $script:RegItemReadFault is a -like pattern: a key it matches cannot
+        # be opened, with the error Get-Item gives for a key Windows will not
+        # open (measured 2026-11-23, HKLM:\SAM\SAM). The fake Test-Path still
+        # answers whether the key is there; the real one answers $true.
+        if ($script:RegItemReadFault -and $p -like $script:RegItemReadFault) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Security.SecurityException' 'Requested registry access is not allowed.' `
+                'System.Security.SecurityException' 'PermissionDenied' $p))
+            return
+        }
+        # A key that is not there gives the error Get-Item gives (measured
+        # 2026-11-23); until 6.3.1 this fake threw a bare message instead.
+        if (-not $script:Reg.ContainsKey($n)) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Management.Automation.ItemNotFoundException' `
+                "Cannot find path '$p' because it does not exist." 'PathNotFound' 'ObjectNotFound' $p))
+            return
+        }
         return (New-FakeRegKeyObject $script:Reg[$n])
     }
     return Microsoft.PowerShell.Management\Get-Item @PSBoundParameters
@@ -251,6 +308,18 @@ function Get-ChildItem {
     $p = Select-FakePath $Path $LiteralPath
     if (Test-RegPath $p) {
         $pre = (Get-RegNorm $p) + '\'
+        # $script:RegReadFault is a -like pattern: a key it matches cannot be
+        # read. A key that is not there gives the error Get-ChildItem gives.
+        if ($script:RegReadFault -and $p -like $script:RegReadFault) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Security.SecurityException' 'Requested registry access is not allowed.' `
+                'System.Security.SecurityException' 'PermissionDenied' $p))
+            return
+        }
+        if (-not $script:Reg.ContainsKey((Get-RegNorm $p)) -and @($script:Reg.Keys | Where-Object { $_.StartsWith($pre) }).Count -eq 0) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Management.Automation.ItemNotFoundException' `
+                "Cannot find path '$p' because it does not exist." 'PathNotFound' 'ObjectNotFound' $p))
+            return
+        }
         $out = @()
         foreach ($k in @($script:Reg.Keys | Sort-Object)) {
             if ($k.StartsWith($pre) -and $k.Substring($pre.Length) -notmatch '\\') { $out += (New-FakeRegKeyObject $script:Reg[$k]) }
@@ -272,6 +341,24 @@ function New-Item {
     if (Test-InSandbox $p) { return Microsoft.PowerShell.Management\New-Item @PSBoundParameters }
     [void]$script:Tripped.Add("New-Item $p")
     throw "TRIPWIRE: New-Item $p"
+}
+# Set-Content writes only in the sandbox, where step 17 writes its
+# launchers; anywhere else it is a tripwire. $script:SetContentFault is a
+# -like pattern: a file it matches is refused, as a denied one is.
+function Set-Content {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string[]]$Path, [string[]]$LiteralPath, [Parameter(Position = 1)]$Value,
+          [string]$Encoding, [switch]$Force, [switch]$NoNewline)
+    $p = Select-FakePath $Path $LiteralPath
+    if (-not (Test-InSandbox $p)) { [void]$script:Tripped.Add("Set-Content $p"); throw "TRIPWIRE: Set-Content $p"; return }
+    # The error is the one Set-Content gives for a file the user may not
+    # write (measured 2026-11-23); until 6.3.1 its id and category were not.
+    if ($script:SetContentFault -and $p -like $script:SetContentFault) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.UnauthorizedAccessException' "Access to the path '$p' is denied." `
+            'System.UnauthorizedAccessException' 'NotSpecified' $p))
+        return
+    }
+    Microsoft.PowerShell.Management\Set-Content @PSBoundParameters
 }
 function Set-ItemProperty {
     [CmdletBinding()]
@@ -329,13 +416,23 @@ function Remove-Item {
     }
     # $script:FileRemoveFault and $script:FileRemoveNoop are -like patterns:
     # a file the first matches is refused, as a locked or denied one is, and
-    # one the second matches stays without an error.
+    # one the second matches stays without an error. The error is the one
+    # Remove-Item gives for a file the user may not delete (measured
+    # 2026-11-23): its message does not name the file. Until 6.3.1 this
+    # fake's message did, so a test could not see a line that failed to.
     if ($script:FileRemoveFault -and $p -like $script:FileRemoveFault) {
-        Write-Error -Message "Access to the path '$p' is denied." -Category PermissionDenied
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ArgumentException' 'Access to the path is denied.' `
+            'RemoveFileSystemItemArgumentError' 'InvalidArgument' $p))
         return
     }
     if ($script:FileRemoveNoop -and $p -like $script:FileRemoveNoop) { return }
-    if (Test-InSandbox $p) { return Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters }
+    if (Test-InSandbox $p) {
+        Microsoft.PowerShell.Management\Remove-Item @PSBoundParameters
+        # $script:ItemReadFaultAfterRemove becomes $script:ItemReadFault once
+        # a file is removed: whether it is gone then cannot be read.
+        if ($script:ItemReadFaultAfterRemove) { $script:ItemReadFault = $script:ItemReadFaultAfterRemove }
+        return
+    }
     [void]$script:Tripped.Add("Remove-Item $p")
     throw "TRIPWIRE: Remove-Item $p"
 }
@@ -590,6 +687,11 @@ function w32tm {
         return @($script:ChartLines)
     }
     if ($a.Count -gt 0 -and $a[0] -eq '/resync') {
+        # $script:ResyncTakesMs: how long the resync takes, for real, as a
+        # resync that sets the clock forward moves the time read after it.
+        # Start-Sleep is faked here, so the thread sleeps.
+        if ($script:ResyncTakesMs -gt 0) { [System.Threading.Thread]::Sleep($script:ResyncTakesMs) }
+        $script:ResyncDoneAt = [datetime]::UtcNow
         $global:LASTEXITCODE = $script:ResyncCode
         if ($script:ResyncCode -ne 0) { return 'The computer did not resync because no time data was available.' }
         return 'The command completed successfully.'
@@ -739,12 +841,24 @@ function Start-Sleep {
     $script:Slept += $Seconds + ($Milliseconds / 1000.0)
     $script:FakeClockMs += 1000 * [long]$Seconds + $Milliseconds
 }
+# A service that is not there gives the error Get-Service gives for one; a
+# name in $script:ServiceReadFault cannot be read.
 function Get-Service {
     [CmdletBinding()]
     param([Parameter(Position = 0)][string[]]$Name)
     $out = @()
     foreach ($n in $Name) {
-        if ($script:Services.ContainsKey($n)) { $out += [pscustomobject]@{ Name = $n; Status = $script:Services[$n] } }
+        if (@($script:ServiceReadFault) -contains $n) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ComponentModel.Win32Exception' 'Access is denied' `
+                'CouldNotGetServiceInfo' 'PermissionDenied' $n))
+            continue
+        }
+        if ($script:Services.ContainsKey($n)) {
+            $out += [pscustomobject]@{ Name = $n; Status = $script:Services[$n] }
+        } else {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ServiceCommandException' `
+                "Cannot find any service with service name '$n'." 'NoServiceFoundForGivenName' 'ObjectNotFound' $n))
+        }
     }
     return $out
 }
@@ -892,19 +1006,45 @@ function Remove-NetNat {
 function Get-Process {
     [CmdletBinding()]
     param([Parameter(Position = 0)][string[]]$Name, [int[]]$Id)
+    # $script:ProcReadFault holds names and ids that cannot be read, or '*'
+    # for every one: an error that is not the one for "not there".
+    $fault = @($script:ProcReadFault)
     if ($PSBoundParameters.ContainsKey('Id')) {
+        if ($fault -contains '*' -or $fault -contains [string]$Id[0]) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ComponentModel.Win32Exception' 'Access is denied' `
+                'CouldNotEnumerateProcesses' 'NotSpecified' $Id))
+            return
+        }
         $found = @($script:Procs | Where-Object { $Id -contains $_.Id })
         if ($found.Count -eq 0) {
-            # The error Get-Process writes, with its id, which tells a
-            # process that exited from a read that failed.
-            $PSCmdlet.WriteError([System.Management.Automation.ErrorRecord]::new(
-                [System.InvalidOperationException]::new("Cannot find a process with the process identifier $($Id -join ',')."),
-                'NoProcessFoundForGivenId,Microsoft.PowerShell.Commands.GetProcessCommand', 'ObjectNotFound', $Id))
+            # The error Get-Process writes, with its id, category and
+            # exception type, which tell a process that exited from a read
+            # that failed.
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ProcessCommandException' `
+                "Cannot find a process with the process identifier $($Id -join ',')." 'NoProcessFoundForGivenId' 'ObjectNotFound' $Id))
             return
         }
         return $found
     }
-    if ($Name) { return @($script:Procs | Where-Object { $Name -contains $_.ProcessName }) }
+    if ($Name) {
+        $out = @()
+        foreach ($n in $Name) {
+            if ($fault -contains '*' -or $fault -contains $n) {
+                $PSCmdlet.WriteError((New-FakeErrorRecord 'System.ComponentModel.Win32Exception' 'Access is denied' `
+                    'CouldNotEnumerateProcesses' 'NotSpecified' $n))
+                continue
+            }
+            $m = @($script:Procs | Where-Object { $_.ProcessName -eq $n })
+            if ($m.Count -eq 0) {
+                $PSCmdlet.WriteError((New-FakeErrorRecord 'Microsoft.PowerShell.Commands.ProcessCommandException' `
+                    "Cannot find a process with the name `"$n`". Verify the process name and call the cmdlet again." `
+                    'NoProcessFoundForGivenName' 'ObjectNotFound' $n))
+            } else {
+                $out += $m
+            }
+        }
+        return $out
+    }
     return @($script:Procs)
 }
 function Get-CimInstance {
@@ -1105,11 +1245,31 @@ function Get-ScheduledTask {
         Write-Error -Message 'The RPC server is unavailable. (Exception from HRESULT: 0x800706BA)' -Category ConnectionError
         return
     }
-    if (-not $script:Tasks.ContainsKey("$TaskPath|$TaskName")) {
-        Write-Error -Message "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$TaskName'." -Category ObjectNotFound
+    $key = "$TaskPath|$TaskName"
+    if (-not $script:Tasks.ContainsKey($key)) {
+        $PSCmdlet.WriteError((New-FakeTaskNotFound $TaskName))
         return
     }
-    return [pscustomobject]@{ TaskName = $TaskName; TaskPath = $TaskPath; State = $script:Tasks["$TaskPath|$TaskName"] }
+    # $script:TaskStopReads: how many more reads a task that reads Running
+    # goes on reading so, as an instance the scheduler is still winding
+    # down does. 0 ends it at the next read, -1 never.
+    if ($script:Tasks[$key] -eq 'Running' -and $script:TaskStopReads.ContainsKey($key)) {
+        $left = [int]$script:TaskStopReads[$key]
+        if ($left -eq 0) {
+            $script:Tasks[$key] = 'Ready'
+            $script:TaskStopReads.Remove($key)
+        } elseif ($left -gt 0) {
+            $script:TaskStopReads[$key] = $left - 1
+        }
+    }
+    return [pscustomobject]@{ TaskName = $TaskName; TaskPath = $TaskPath; State = $script:Tasks[$key] }
+}
+# The error Get-ScheduledTask gives for a task that is not there.
+function New-FakeTaskNotFound {
+    param([string]$TaskName)
+    return (New-FakeErrorRecord 'Microsoft.PowerShell.Cmdletization.Cim.CimJobException' `
+        "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$TaskName'.  Verify the value of the property and retry." `
+        'CmdletizationQuery_NotFound' 'ObjectNotFound' $TaskName)
 }
 function Unregister-ScheduledTask {
     [CmdletBinding(SupportsShouldProcess)]
@@ -1117,17 +1277,18 @@ function Unregister-ScheduledTask {
     [void]$script:TaskCalls.Add("Unregister $TaskPath$TaskName")
     if ($script:UnregisterFault) { throw 'Access is denied.'; return }
     if (-not $script:Tasks.ContainsKey("$TaskPath|$TaskName")) {
-        Write-Error -Message "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$TaskName'." -Category ObjectNotFound
+        $PSCmdlet.WriteError((New-FakeTaskNotFound $TaskName))
         return
     }
     if ($script:UnregisterNoop) { return }
     $script:Tasks.Remove("$TaskPath|$TaskName")
 }
-# Step 15 makes the monitor's task. Register-ScheduledTask,
+# Steps 15 and 17 make a task: the monitor's, and Claude (Admin)'s.
+# Register-ScheduledTask,
 # Start-ScheduledTask and the New-ScheduledTask* cmdlets that build the
 # task answer only when the case set $script:TaskInstallExpected, which
 # Reset-State clears; anywhere else each is a tripwire, recorded in
-# $script:Tripped, that throws, since only step 15 makes a task. A
+# $script:Tripped, that throws, since only steps 15 and 17 make one. A
 # registration is in $script:TaskCalls and $script:Tasks, and what it was
 # given in $script:RegisteredTask. $script:RegisterFault and
 # $script:StartTaskFault are a scheduler that refuses: an error that is
@@ -1144,7 +1305,8 @@ function Register-ScheduledTask {
     if (-not (Test-TaskInstallExpected 'Register-ScheduledTask' "$TaskPath$TaskName")) { throw 'TRIPWIRE: Register-ScheduledTask'; return }
     [void]$script:TaskCalls.Add("Register $TaskPath$TaskName")
     if ($script:RegisterFault) { Write-Error -Message 'Access is denied.' -Category PermissionDenied; return }
-    $script:Tasks["$TaskPath|$TaskName"] = 'Ready'
+    # Registering does not end an instance that runs.
+    if ($script:Tasks["$TaskPath|$TaskName"] -ne 'Running') { $script:Tasks["$TaskPath|$TaskName"] = 'Ready' }
     $script:RegisteredTask = [pscustomobject]@{
         Action = $Action; Trigger = $Trigger; Settings = $Settings; Principal = $Principal; Description = $Description; Force = [bool]$Force
     }
@@ -1160,11 +1322,59 @@ function Start-ScheduledTask {
         return
     }
     if (-not $script:Tasks.ContainsKey("$TaskPath|$TaskName")) {
-        Write-Error -Message "No MSFT_ScheduledTask objects found with property 'TaskName' equal to '$TaskName'." -Category ObjectNotFound
+        $PSCmdlet.WriteError((New-FakeTaskNotFound $TaskName))
         return
     }
+    # A start the scheduler takes without an error and then does nothing
+    # with ($script:StartTaskNoop), and the task's MultipleInstances
+    # IgnoreNew: a start while an instance runs is ignored, with no error.
+    if ($script:StartTaskNoop -or $script:Tasks["$TaskPath|$TaskName"] -eq 'Running') { return }
     $script:Tasks["$TaskPath|$TaskName"] = 'Running'
+    # From here on the task cannot be read: a scheduler that stopped answering.
+    if ($script:TaskQueryFaultAfterStart) { $script:TaskQueryFault = $true }
+    # The task is deleted right after the start, by another program or a policy.
+    if ($script:TaskGoneAfterStart) { $script:Tasks.Remove("$TaskPath|$TaskName") }
 }
+# Setup step 14 reads the WSL feature and runs wsl.exe -l -v; the step
+# runs Invoke-FakeWsl in its place, from the path Get-FakeWslPath gives.
+function Get-WindowsOptionalFeature {
+    [CmdletBinding()]
+    param([switch]$Online, [string]$FeatureName)
+    if ($script:WslFeatureFault) {
+        $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Runtime.InteropServices.COMException' 'Class not registered' `
+            'Microsoft.Dism.Commands.GetWindowsOptionalFeatureCommand' 'NotSpecified' $FeatureName))
+        return
+    }
+    if ($script:WslFeatureState) { return [pscustomobject]@{ FeatureName = $FeatureName; State = $script:WslFeatureState } }
+}
+function Invoke-FakeWsl {
+    [void]$script:WslCalls.Add(@($args) -join ' ')
+    if ($script:WslThrows) { throw 'The system cannot execute the specified program.' }
+    foreach ($l in @($script:WslLines)) { $l }
+    $global:LASTEXITCODE = $script:WslExit
+}
+function Get-FakeWslPath { return $script:FakeWslPath }
+# Setup steps 8 and 10 look for hcsdiag.exe when the discovery found none, to
+# tell one that is not there from one that could not be read; they look at
+# the path Get-FakeHcsDiagPath gives, in the sandbox.
+function Get-FakeHcsDiagPath { return $script:FakeHcsDiagPath }
+function Get-FakeDockerPath { return (Join-Path $sandbox 'no-docker\Docker.exe') }
+# Setup step 17 asks whether it runs as an administrator and as whom, and
+# makes its shortcut through WScript.Shell. Each is swapped for these in the
+# cut-out step; a shortcut that is saved is in $script:SavedShortcuts.
+function Test-FakeAdmin { return [bool]$script:FakeIsAdmin }
+function Get-FakeUserName { return 'TESTPC\tester' }
+function New-FakeShell {
+    $sh = [pscustomobject]@{ Kind = 'FakeShell' }
+    $sh | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
+        param($LnkPath)
+        $lnk = [pscustomobject]@{ Path = $LnkPath; TargetPath = ''; Arguments = ''; WorkingDirectory = ''; Description = ''; IconLocation = ''; WindowStyle = 1 }
+        $lnk | Add-Member -MemberType ScriptMethod -Name Save -Value { [void]$script:SavedShortcuts.Add($this) }
+        return $lnk
+    }
+    return $sh
+}
+function Initialize-ClaudeIcon { return 'fake-claude.ico,0' }
 function New-ScheduledTaskAction {
     [CmdletBinding()]
     param([string]$Execute, [string]$Argument)
@@ -1619,6 +1829,8 @@ function Reset-State {
     $script:Killed         = New-Object System.Collections.ArrayList
     $script:ChartLines     = @()
     $script:ResyncCode     = 0
+    $script:ResyncTakesMs  = 0
+    $script:ResyncDoneAt   = [datetime]::MinValue
     $script:JobHangs       = $false
     $script:DnsOkAfter     = 1
     $script:DnsTries       = 0
@@ -1699,6 +1911,30 @@ function Reset-State {
     $script:RegisteredTask = $null
     $script:FakeCommandPath = $null
     $script:ClaudeEnv.VmCachePath = $null
+    $script:ServiceReadFault = @()
+    $script:ProcReadFault = @()
+    $script:ItemReadFault = $null
+    $script:ItemReadFaultAfterRemove = $null
+    $script:RegReadFault = $null
+    $script:RegItemReadFault = $null
+    $script:SetContentFault = $null
+    $script:TaskStopReads = @{}
+    $script:StartTaskNoop = $false
+    $script:TaskQueryFaultAfterStart = $false
+    $script:TaskGoneAfterStart = $false
+    $script:WslFeatureFault = $false
+    $script:WslFeatureState = $null
+    $script:WslLines = @()
+    $script:WslExit = 0
+    $script:WslThrows = $false
+    $script:WslCalls = New-Object System.Collections.ArrayList
+    $script:FakeWslPath = Join-Path $sandbox 'no-wsl\wsl.exe'
+    $script:FakeHcsDiagPath = Join-Path $sandbox 'no-hcs\hcsdiag.exe'
+    # -Undo step 2 reads $planRestored, which step 1 sets once it has put
+    # your plan back.
+    $script:FakePlanRestored = $false
+    $script:FakeIsAdmin = $true
+    $script:SavedShortcuts = New-Object System.Collections.ArrayList
     foreach ($f in @($UndoDir, $BackupFile, $CsBackupFile, $ClaudeAppData, $fakeDesktop, $fakeAppData)) {
         if (Microsoft.PowerShell.Management\Test-Path -LiteralPath $f) {
             Microsoft.PowerShell.Management\Remove-Item -LiteralPath $f -Recurse -Force
@@ -1724,7 +1960,8 @@ $mustBeFakes = @(
     'Get-NetAdapterPowerManagement', 'Set-NetAdapterPowerManagement', 'Get-NetNat', 'Remove-NetNat', 'Get-ScheduledTask',
     'Unregister-ScheduledTask', 'Get-PreventTaskService', 'Get-VM', 'Set-VMMemory', 'Get-Volume', 'Get-Partition', 'Get-Disk',
     'Register-ScheduledTask', 'Start-ScheduledTask', 'New-ScheduledTaskAction', 'New-ScheduledTaskTrigger', 'New-ScheduledTaskSettingsSet',
-    'New-ScheduledTaskPrincipal', 'Invoke-HcsDiag', 'Get-HcsListCached'
+    'New-ScheduledTaskPrincipal', 'Invoke-HcsDiag', 'Get-HcsListCached', 'Set-Content', 'Get-WindowsOptionalFeature',
+    'Initialize-ClaudeIcon'
 ) + $tripwires
 $notFaked = @()
 foreach ($c in $mustBeFakes) {
@@ -1743,7 +1980,7 @@ if ($notFaked.Count -gt 0) {
 Write-Host ""
 Write-Host "--- Lifting the code under test"
 $preventFns = @(
-    'Initialize-ClaudeAppData', 'ConvertTo-StringArray', 'Step', 'Add-StepResult', 'Write-StepSummary',
+    'Initialize-ClaudeAppData', 'ConvertTo-StringArray', 'Step', 'Add-StepResult', 'Add-DiscoveryReadError', 'Write-StepSummary',
     'Get-PreventExitCode', 'Read-PreventUndo', 'Save-PreventUndo', 'Get-PreventUndoItem', 'Add-PreventUndoItem',
     'Clear-PreventUndoItem', 'Invoke-PowerCfg', 'Get-ActivePlanGuid', 'Test-PowerPlanExists',
     'Get-UltimatePlanGuids', 'Get-AcPowerIndex', 'Write-AcPowerValue', 'Get-ModernStandbyState',
@@ -1755,7 +1992,10 @@ $preventFns = @(
     'Get-PreventMachineGuid', 'Test-DefenderListHidden', 'Test-DefenderExclusionCovers', 'Get-PreventNicAdvanced',
     'Get-PreventNicPower', 'Test-PowerSettingGone', 'Add-LegacyInstallRecord', 'Get-LegacyInstallTrace',
     'Get-ClaudeVmWithoutDynamicMemory', 'Remove-PreventTask', 'Remove-PreventTaskFolder', 'Remove-PreventFile',
-    'Test-CoworkNat', 'Test-WinNatMissingError', 'Install-HealthMonitorTask', 'Test-CimClassMissingError'
+    'Test-CoworkNat', 'Test-WinNatMissingError', 'Install-HealthMonitorTask', 'Test-CimClassMissingError',
+    'Test-ClaudeNotFoundError', 'Get-ClaudeErrorText', 'Get-ClaudeServiceOrNull', 'Get-ClaudeProcessByName',
+    'Get-ClaudeScheduledTaskOrNull', 'Get-ClaudeItemOrNull', 'Get-PreventProcessByIdOrNull', 'Wait-PreventProcessExit',
+    'Get-PreventTaskState', 'Test-PreventPathThere', 'Find-PreventKitFile', 'Remove-PreventItem'
 )
 # Get-PreventTaskService is never lifted: it connects to the real Task
 # Scheduler, and the fake of that name above stands in for it.
@@ -1824,6 +2064,8 @@ if ($null -eq $iwCmd) {
 }
 if ($escapes.Count -gt 0) {
     Write-Host "Refusing to run: $($escapes -join '; ')" -ForegroundColor Red
+    # Best effort: the run exits 1 below either way, and a folder left in
+    # %TEMP% changes nothing.
     Microsoft.PowerShell.Management\Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
     exit 1
 }
@@ -1867,20 +2109,47 @@ $stepWrappers = @(
     @{ Fn = 'Invoke-SetupStep1'; Total = 19; From = 'Step 1 $steps "Configuring power plan...'; To = 'Step 2 $steps "Setting the active plan' }
     @{ Fn = 'Invoke-UndoStep1';  Total = 5;  From = 'Step 1 $steps "Putting back the recorded settings...'; To = 'Step 2 $steps "Removing what older' }
     @{ Fn = 'Invoke-UndoStep2';  Total = 5;  From = 'Step 2 $steps "Removing what older'; To = 'Step 3 $steps "Removing scheduled'
-       Pre = '$planRestored = $false' }
+       Pre = '$planRestored = [bool]$script:FakePlanRestored' }
     @{ Fn = 'Invoke-UndoStep3';  Total = 5;  From = 'Step 3 $steps "Removing scheduled'; To = 'Step 4 $steps "Removing shortcuts' }
     @{ Fn = 'Invoke-UndoStep4';  Total = 5;  From = 'Step 4 $steps "Removing shortcuts'; To = 'Step 5 $steps "Removing Claude launchers' }
     @{ Fn = 'Invoke-UndoStep5';  Total = 5;  From = 'Step 5 $steps "Removing Claude launchers'; To = '    Write-UndoOutcome' }
-    @{ Fn = 'Invoke-Step8';      Total = 19; From = 'Step 8 $steps "Raising the Cowork VM'; To = 'Step 9 $steps' }
+    @{ Fn = 'Invoke-Step8';      Total = 19; From = 'Step 8 $steps "Raising the Cowork VM'; To = 'Step 9 $steps'
+       Swaps = @( @{ Old = '"$env:SystemRoot\System32\hcsdiag.exe"'; New = '(Get-FakeHcsDiagPath)' } ) }
     @{ Fn = 'Invoke-Step9';      Total = 19; From = 'Step 9 $steps "Configuring Hyper-V compute service recovery'; To = 'Step 10 $steps' }
-    @{ Fn = 'Invoke-Step10';     Total = 19; From = 'Step 10 $steps "Removing stale Cowork VMs'; To = 'Step 11 $steps' }
+    @{ Fn = 'Invoke-Step10';     Total = 19; From = 'Step 10 $steps "Removing stale Cowork VMs'; To = 'Step 11 $steps'
+       Swaps = @( @{ Old = '"$env:SystemRoot\System32\hcsdiag.exe"'; New = '(Get-FakeHcsDiagPath)' } ) }
     @{ Fn = 'Invoke-Step11';     Total = 19; From = 'Step 11 $steps "Checking workspace storage'; To = 'Step 12 $steps' }
     @{ Fn = 'Invoke-Step12';     Total = 19; From = 'Step 12 $steps "Checking the clock'; To = 'Step 13 $steps'; DnsOnce = $true }
     @{ Fn = 'Invoke-Step13';     Total = 19; From = 'Step 13 $steps "Checking antivirus'; To = 'Step 14 $steps' }
+    @{ Fn = 'Invoke-Step14';     Total = 19; From = 'Step 14 $steps "Checking for WSL2'; To = 'Step 15 $steps'
+       Swaps = @(
+           @{ Old = '(Join-Path $env:ProgramFiles "Docker\Docker\Docker.exe")'; New = '(Get-FakeDockerPath)' }
+           @{ Old = 'Join-Path $env:SystemRoot "System32\wsl.exe"'; New = 'Get-FakeWslPath' }
+           @{ Old = '& $wslExe -l -v 2>&1'; New = 'Invoke-FakeWsl -l -v 2>&1' }
+       ) }
     @{ Fn = 'Invoke-Step15Legacy'; Total = 19; From = '    # The basic watchdog script older versions installed'; To = '    if ($watchScript) {' }
     @{ Fn = 'Invoke-Step15';     Total = 19; From = 'Step 15 $steps "Installing health monitor'; To = 'Step 16 $steps' }
+    # Step 16 reads $myDir, which step 15 sets from Prevent's own path.
+    @{ Fn = 'Invoke-Step16';     Total = 19; From = 'Step 16 $steps "Creating Fix Claude Desktop shortcuts'; To = 'Step 17 $steps'
+       Pre = '$myDir = $null; if ($script:FakeCommandPath) { $myDir = Split-Path $script:FakeCommandPath -Parent }'
+       Swaps = @(
+           @{ Old = '"C:\ClaudeFix\Fix-ClaudeDesktop.ps1"'; New = '(Join-Path (Get-FakeFolder ClaudeFix) "Fix-ClaudeDesktop.ps1")' }
+           @{ Old = 'New-Object -ComObject WScript.Shell'; New = 'New-FakeShell' }
+       ) }
     @{ Fn = 'Invoke-Step17Legacy'; Total = 19; From = '# Remove the old .cmd launcher left by versions <= 6.1.0, if present.'
        To = '        # Create desktop shortcut pointing to the launcher' }
+    # The launcher payload is a single-quoted here-string that step 17 only
+    # encodes, so the %LOCALAPPDATA% and WScript.Shell in it are inert text;
+    # they are swapped all the same, so that the check below stays simple.
+    @{ Fn = 'Invoke-Step17';     Total = 19; From = 'Step 17 $steps "Configuring Claude Desktop to launch elevated'; To = 'Step 18 $steps'
+       Pre = "`$ToolkitVersion = '0.0.0-test'"
+       Swaps = @(
+           @{ Old = '([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)'
+              New = '(Test-FakeAdmin)' }
+           @{ Old = '[System.Security.Principal.WindowsIdentity]::GetCurrent().Name'; New = '(Get-FakeUserName)' }
+           @{ Old = 'New-Object -ComObject WScript.Shell'; New = 'New-FakeShell' }
+           @{ Old = '$env:LOCALAPPDATA'; New = '$env:FAKE_LOCALAPPDATA' }
+       ) }
     @{ Fn = 'Invoke-Step19';     Total = 19; From = 'Step 19 $steps "Removing what older'; To = '# Summary' }
 )
 foreach ($w in $stepWrappers) {
@@ -1890,12 +2159,19 @@ foreach ($w in $stepWrappers) {
         $why = "not found between '$($w.From)' and '$($w.To)'"
     } else {
         $hits = 0
+        $ownSwaps = @()
+        if ($w.ContainsKey('Swaps')) { $ownSwaps = @($w.Swaps) }
+        foreach ($sw in $ownSwaps) {
+            if ($slice.IndexOf($sw.Old, [StringComparison]::Ordinal) -lt 0) { $why = "it no longer holds $($sw.Old)"; break }
+            $slice = $slice.Replace($sw.Old, $sw.New)
+        }
         foreach ($sw in $stepSwaps) {
             $n = ([regex]::Matches($slice, [regex]::Escape($sw.Old))).Count
             if ($sw.Dns) { $hits += $n }
             $slice = $slice.Replace($sw.Old, $sw.New)
         }
-        if ($w.ContainsKey('DnsOnce') -and $hits -ne 1) { $why = "the DNS call appears $hits time(s), not once" }
+        if ($why) { }
+        elseif ($w.ContainsKey('DnsOnce') -and $hits -ne 1) { $why = "the DNS call appears $hits time(s), not once" }
         elseif ($slice -match $unswapped) { $why = "it still holds $($Matches[0]), which reaches the machine" }
     }
     if ($why) {
@@ -2011,6 +2287,30 @@ Invoke-Section 'Step results, the summary and the exit code' {
     Step 1 19 'x' -Name 'X'
     try { Add-StepResult -Status Bogus } catch { $threw = $true }
     Assert-Case "an outcome that is not one of the five is refused" $threw
+
+    # The reads the discovery could not make: said at once, and in the
+    # summary as a step of their own with a warning. Until 6.3.1 they were
+    # not said at all.
+    Reset-State
+    Add-DiscoveryReadError -ReadErrors @()
+    Assert-Case "every read made: nothing said, and no step recorded" ($script:LogLines.Count -eq 0 -and $script:StepResults.Count -eq 0) `
+        "said $($script:LogLines.Count), steps $($script:StepResults.Count)"
+    Add-DiscoveryReadError -ReadErrors @('Service CoworkVMService could not be read: Access is denied',
+        'Data folder candidate C:\x could not be read: Access to the path is denied.')
+    Assert-Case "each read that failed is said at once, as a warning" ((@($script:LogLines) -join '|') -eq
+        ('[!] Service CoworkVMService could not be read: Access is denied|' +
+            '[!] Data folder candidate C:\x could not be read: Access to the path is denied.')) "got $(@($script:LogLines) -join '|')"
+    $d = $script:StepResults | Select-Object -First 1
+    Assert-Case "and recorded as step 0, a warning, with each read under it" ($script:StepResults.Count -eq 1 -and $d.Num -eq 0 -and
+        $d.Status -eq 'Warning' -and @($d.Notes).Count -eq 2) "steps $($script:StepResults.Count)"
+    Step 1 19 'one' -Name 'First'
+    Add-StepResult -Status Done
+    $text = @(Write-StepSummary 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    Assert-Case "the summary shows it first, with the reads" ($text -match ' 0\. Looking at this PC \.+ check the note' -and
+        $text -match '(?m)^\s+Service CoworkVMService could not be read: Access is denied$' -and
+        $text.IndexOf('Looking at this PC') -lt $text.IndexOf('First')) $text
+    Assert-Case "a warning is not a failure: exit code 0" ((Get-PreventExitCode) -eq 0)
+    Reset-State
 }
 
 # =====================================================================
@@ -3744,6 +4044,19 @@ Invoke-Section 'Setup step 8: only the Cowork VM is raised' {
     $script:ClaudeEnv.HcsDiagPath = $null
     try { Invoke-Step8 } finally { $script:ClaudeEnv.HcsDiagPath = 'Invoke-FakeHcs' }
     Assert-Case "no hcsdiag: Skipped" ((Get-StepStatus) -eq 'Skipped' -and (Get-StepNotes) -match 'hcsdiag.exe is not available')
+
+    # 6.3.1: the discovery leaves HcsDiagPath unset for an hcsdiag.exe that
+    # could not be read too. Until 6.3.1 that was Skipped, "not available",
+    # as for one that is not there.
+    Reset-State
+    Set-VmFixture
+    $script:ClaudeEnv.HcsDiagPath = $null
+    $script:FakeHcsDiagPath = Join-Path $sandbox 'hcs\hcsdiag.exe'
+    $script:ItemReadFault = $script:FakeHcsDiagPath
+    try { Invoke-Step8 } finally { $script:ClaudeEnv.HcsDiagPath = 'Invoke-FakeHcs' }
+    Assert-Case "an hcsdiag.exe that cannot be read: a Warning that names it and why, not 'not available', and nothing raised" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "$($script:FakeHcsDiagPath) could not be read (Access is denied), so the Cowork VM's worker cannot be told from other VMs' and was not raised" -and
+        (Get-Priority 10) -eq 'Normal' -and -not (Test-LogHas 'not available')) "$(Get-StepStatus): $(Get-StepNotes)"
 }
 
 # =====================================================================
@@ -3833,6 +4146,18 @@ Invoke-Section 'Setup step 10: stale Cowork VMs' {
     $script:ClaudeEnv.HcsDiagPath = $null
     try { Invoke-Step10 } finally { $script:ClaudeEnv.HcsDiagPath = 'Invoke-FakeHcs' }
     Assert-Case "no hcsdiag: Skipped" ((Get-StepStatus) -eq 'Skipped')
+
+    # 6.3.1: as in step 8, an hcsdiag.exe that could not be read is not one
+    # that is not there.
+    Reset-State
+    [void]$script:HcsLive.Add($guidA)
+    $script:ClaudeEnv.HcsDiagPath = $null
+    $script:FakeHcsDiagPath = Join-Path $sandbox 'hcs\hcsdiag.exe'
+    $script:ItemReadFault = $script:FakeHcsDiagPath
+    try { Invoke-Step10 } finally { $script:ClaudeEnv.HcsDiagPath = 'Invoke-FakeHcs' }
+    Assert-Case "an hcsdiag.exe that cannot be read: a Warning that names it and why, not 'not available', and nothing killed" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "$($script:FakeHcsDiagPath) could not be read (Access is denied), so stale Cowork VMs were not looked for" -and
+        $script:Killed.Count -eq 0 -and -not (Test-LogHas 'not available')) "$(Get-StepStatus): $(Get-StepNotes)"
 }
 
 # =====================================================================
@@ -3982,6 +4307,42 @@ Invoke-Section 'The monitor: worker priority and the clock' {
         @($script:W32Calls | Where-Object { $_ -like '/stripchart*' }).Count -eq 1) "got $r; $($script:WatchLog -join ' | ')"
     Assert-Case "and no resync is forced for an hour" ($script:ResyncBackoffUntil -gt [datetime]::UtcNow.AddMinutes(59) -and
         $script:ResyncBackoffUntil -lt [datetime]::UtcNow.AddMinutes(61)) "until $($script:ResyncBackoffUntil.ToString('o'))"
+
+    # The hour runs from the time after the resync. Until 6.3.1 it ran from
+    # the time read before it, so a resync that set the clock forward left
+    # a hold that had already ended, or nearly. Here the resync takes 400 ms
+    # of real time, which the hold must not lose.
+    Reset-State
+    $script:Services['W32Time'] = 'Running'
+    $script:ChartLines = $chart + @('20:22:22, -12,5000000s')
+    $script:ResyncCode = 1
+    $script:ResyncTakesMs = 400
+    $null = Test-TimeSyncHealth
+    Assert-Case "the hour of no forced resync runs from the time after the resync, not before it" ($script:ResyncDoneAt -ne [datetime]::MinValue -and
+        $script:ResyncBackoffUntil -ge $script:ResyncDoneAt.AddMinutes(60) -and $script:ResyncBackoffUntil -lt [datetime]::UtcNow.AddMinutes(61)) `
+        "until $($script:ResyncBackoffUntil.ToString('o')), resync done $($script:ResyncDoneAt.ToString('o'))"
+
+    # The Windows Time service that cannot be read: said once an hour,
+    # not started, and the clock still measured. Until 6.3.1 it was read
+    # with SilentlyContinue, as a service that is not installed, unsaid.
+    $w32Line = 'TIME WARNING: The Windows Time service could not be read (Access is denied), so it is not started if it is stopped; ' +
+        'the clock is still measured every 5 min; the same error is logged at most once an hour'
+    Reset-State
+    $script:Services['W32Time'] = 'Stopped'
+    $script:ServiceReadFault = @('W32Time')
+    $script:ChartLines = $chart + @('20:22:22, +00.0684055s')
+    $r = Test-TimeSyncHealth
+    $script:LastTimeSyncCheck = [datetime]::UtcNow.AddMinutes(-6)
+    $null = Test-TimeSyncHealth
+    Assert-Case "the Windows Time service cannot be read: said once, not started, and the clock still measured" ($null -eq $r -and
+        ($script:WatchLog -join ' | ') -eq $w32Line -and $script:SvcCalls.Count -eq 0 -and
+        @($script:W32Calls | Where-Object { $_ -like '/stripchart*' }).Count -eq 2) "got $r; $($script:WatchLog -join ' | '); $($script:SvcCalls -join ',')"
+    Reset-State
+    $script:ServiceReadFault = @()
+    $script:ChartLines = $chart + @('20:22:22, +00.0684055s')
+    $r = Test-TimeSyncHealth
+    Assert-Case "a Windows Time service that is not installed: not started, and nothing said" ($null -eq $r -and $script:WatchLog.Count -eq 0 -and
+        $script:SvcCalls.Count -eq 0 -and @($script:W32Calls | Where-Object { $_ -like '/stripchart*' }).Count -eq 1) "got $r; $($script:WatchLog -join ' | ')"
 
     Reset-State
     $script:Services['W32Time'] = 'Running'
@@ -4335,6 +4696,35 @@ Invoke-Section 'The monitor: Cowork compute systems left behind' {
     Stop-StaleCoworkVm
     Assert-Case "a worker list read with no Cowork worker in it: nothing killed, and said so" ($script:Killed.Count -eq 0 -and
         ($script:WatchLog -join ' | ') -eq 'HCS: 2 cowork-vm compute systems and none has a worker process to tell the live one by; none killed') ($script:WatchLog -join ' | ')
+
+    # A worker that cannot be read is not one that is not there. Until
+    # 6.3.1 a worker whose command line or start time could not be read was
+    # passed over: when it was the live VM's, the live VM was killed.
+    $unreadLine = 'HCS: 2 cowork-vm compute systems, and the command line or start time of 1 VM worker process(es) (vmwp.exe) ' +
+        'could not be read to tell the live one by; none killed; the same error is logged at most once an hour'
+    Reset-State
+    Set-TwoCoworkVms
+    $script:VmWorkers = @((New-FakeWorker 10 $guidA $older), [pscustomobject]@{ ProcessId = 14; CommandLine = $null; CreationDate = $newer },
+        (New-FakeWorker 11 $guidWsl $older))
+    Stop-StaleCoworkVm
+    Stop-StaleCoworkVm
+    Assert-Case "the live VM's worker whose command line cannot be read: nothing killed, said once" ($script:Killed.Count -eq 0 -and
+        ($script:WatchLog -join ' | ') -eq $unreadLine) "killed $($script:Killed -join ','); $($script:WatchLog -join ' | ')"
+
+    Reset-State
+    Set-TwoCoworkVms
+    $script:VmWorkers = @((New-FakeWorker 10 $guidA $older), (New-FakeWorker 14 $guidB $null), (New-FakeWorker 11 $guidWsl $older))
+    Stop-StaleCoworkVm
+    Assert-Case "the live VM's worker whose start time cannot be read: nothing killed, and said" ($script:Killed.Count -eq 0 -and
+        ($script:WatchLog -join ' | ') -eq $unreadLine) "killed $($script:Killed -join ','); $($script:WatchLog -join ' | ')"
+
+    # A worker of another VM with no start time does not hold the kill back.
+    Reset-State
+    Set-TwoCoworkVms
+    $script:VmWorkers = @((New-FakeWorker 10 $guidA $older), (New-FakeWorker 14 $guidB $newer), (New-FakeWorker 11 $guidWsl $null))
+    Stop-StaleCoworkVm
+    Assert-Case "another VM's worker with no start time: the stale Cowork VM is still killed" (($script:Killed -join ',') -eq $guidA -and
+        ($script:WatchLog -join ' | ') -eq "HCS: killed stale cowork-vm ($guidA)") "killed $($script:Killed -join ','); $($script:WatchLog -join ' | ')"
 
     Reset-State
     Set-TwoCoworkVms
@@ -5439,6 +5829,18 @@ Invoke-Section 'Setup step 11: where the Claude data folder is, and the checks t
     Invoke-Step11
     Assert-Case "the VM cache's drive cannot be read: a Warning that names it and why" (
         Test-Unread "Could not check whether the VM cache $vmCache is on a network drive: The RPC server is unavailable.") "$(Get-StepStatus): $(Get-StepNotes)"
+
+    # 6.3.1: until then the cache folder was looked for with Test-Path, which
+    # answers $false for a folder that cannot be read as for one that is not
+    # there: its drive was not checked, and "Storage location OK" was said.
+    Reset-Storage
+    $script:ClaudeEnv.VmCachePath = $vmCache
+    $script:LogicalDisks[$sbDrive] = 3
+    $script:ItemReadFault = $vmCache
+    Invoke-Step11
+    Assert-Case "the VM cache folder cannot be read: a Warning that names it and why, and its drive checked all the same" (
+        (Test-Unread "Could not read the VM cache folder ${vmCache}: Access is denied") -and (Get-Reads).EndsWith("Win32_LogicalDisk $sbDrive")) (
+        "$(Get-StepStatus): $(Get-StepNotes); $(Get-Reads)")
     Reset-State
 }
 
@@ -5646,7 +6048,7 @@ Invoke-Section '-Undo step 3: the health monitor, its tasks and the old watchdog
     $script:FileRemoveFault = '*cowork-watchdog.ps1'
     Invoke-UndoStep3
     Assert-Case "a script that cannot be deleted: Failed, with the reason, and it is kept" ((Microsoft.PowerShell.Management\Test-Path -LiteralPath $wd) -and
-        (Get-StepStatus) -eq 'Failed' -and (Get-StepNotes) -eq "Could not remove ${wd}: Access to the path '$wd' is denied." -and
+        (Get-StepStatus) -eq 'Failed' -and (Get-StepNotes) -eq "Could not remove ${wd}: Access to the path is denied." -and
         -not (Test-LogHas '^Removed old watchdog script')) "$(Get-StepStatus): $(Get-StepNotes)"
 
     Reset-State
@@ -5688,7 +6090,7 @@ Invoke-Section '-Undo step 4: the Fix Claude Desktop shortcuts' {
     Invoke-UndoStep4
     Assert-Case "one that cannot be deleted: Failed, it is kept, and the other is still removed" ((Microsoft.PowerShell.Management\Test-Path -LiteralPath $menu) -and
         -not (Microsoft.PowerShell.Management\Test-Path -LiteralPath $desk) -and (Get-StepStatus) -eq 'Failed' -and
-        (Get-StepNotes) -eq "Could not remove ${menu}: Access to the path '$menu' is denied." -and
+        (Get-StepNotes) -eq "Could not remove ${menu}: Access to the path is denied." -and
         -not (Test-LogHas ('^Removed: ' + [regex]::Escape($menu) + '$'))) "$(Get-StepStatus): $(Get-StepNotes)"
 
     Reset-State
@@ -5824,7 +6226,7 @@ Invoke-Section '-Undo step 5: the launchers and the task folder' {
     Invoke-UndoStep5
     $vbs = $files[3]
     Assert-Case "a launcher that cannot be deleted: Failed, it is kept, and the others are removed" ((Get-StepStatus) -eq 'Failed' -and
-        (Get-StepNotes) -eq "Could not remove ${vbs}: Access to the path '$vbs' is denied." -and (Get-FilesLeft) -eq 1 -and
+        (Get-StepNotes) -eq "Could not remove ${vbs}: Access to the path is denied." -and (Get-FilesLeft) -eq 1 -and
         (Microsoft.PowerShell.Management\Test-Path -LiteralPath $vbs)) "$(Get-StepStatus): $(Get-StepNotes); $(Get-FilesLeft) file(s) left"
 
     Reset-State
@@ -5849,7 +6251,10 @@ Invoke-Section 'Setup step 15: the health monitor task, and a monitor already ru
     [System.IO.File]::WriteAllText($watch, '# the monitor')
     $taskKey = "$TaskPath|$TaskName"
     $reg = "Register $TaskPath$TaskName"
-    $start = "Start $TaskPath$TaskName"
+    # A start reads the task before, for an old instance that still reads
+    # running, and after, to check that it took.
+    $get = "Get $TaskPath$TaskName"
+    $start = "$get / Start $TaskPath$TaskName / $get"
     $installed = '^Health monitor installed \(starts 120s after logon, polls every 30s\)$'
     $started = '^Started it now: the monitor begins watching in 120 seconds$'
     $tripBefore = $script:Tripped.Count
@@ -5929,7 +6334,7 @@ Invoke-Section 'Setup step 15: the health monitor task, and a monitor already ru
     Invoke-Step15
     $said = 'The health monitor task could not be started now, so the monitor starts at the next logon: The operator or administrator has refused the request. (Exception from HRESULT: 0x800710E0)'
     Assert-Case "the task cannot be started now: a Warning that says so and why" ((Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq $said -and
-        (Get-Calls) -eq "$reg / $start" -and (Test-LogHas ('^' + [regex]::Escape("[!] $said") + '$')) -and -not (Test-LogHas $started) -and
+        (Get-Calls) -eq "$reg / $get / Start $TaskPath$TaskName" -and (Test-LogHas ('^' + [regex]::Escape("[!] $said") + '$')) -and -not (Test-LogHas $started) -and
         (Test-LogHas $installed)) (Get-Seen)
 
     Reset-Install
@@ -5997,7 +6402,7 @@ Invoke-Section "Setup steps 15 and 17: an older version's watchdog script and .c
     Step 15 19 'monitor' -Name 'Health monitor'
     Invoke-Step15Legacy
     Assert-Case "a script that cannot be deleted: kept, with a Warning that says why" ((Microsoft.PowerShell.Management\Test-Path -LiteralPath $oldWd) -and
-        (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq "Could not remove the old watchdog script ${oldWd}: Access to the path '$oldWd' is denied." -and
+        (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq "Could not remove the old watchdog script ${oldWd}: Access to the path is denied." -and
         -not (Test-LogHas '^Removed old basic watchdog script$')) "$(Get-StepStatus): $(Get-StepNotes)"
 
     Reset-State
@@ -6031,7 +6436,7 @@ Invoke-Section "Setup steps 15 and 17: an older version's watchdog script and .c
     Step 17 19 'launchers' -Name 'Claude (Admin) launcher'
     Invoke-Step17Legacy
     Assert-Case "a launcher that cannot be deleted: kept, with a Warning that says why" ((Microsoft.PowerShell.Management\Test-Path -LiteralPath $oldCmd) -and
-        (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq "Could not remove the superseded .cmd launcher ${oldCmd}: Access to the path '$oldCmd' is denied.") "$(Get-StepStatus): $(Get-StepNotes)"
+        (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq "Could not remove the superseded .cmd launcher ${oldCmd}: Access to the path is denied.") "$(Get-StepStatus): $(Get-StepNotes)"
 }
 
 # =====================================================================
@@ -6251,6 +6656,821 @@ Invoke-Section 'Generated commands: a path or name that holds an apostrophe' {
 }
 
 # =====================================================================
+# Setup step 15 starts the monitor's task once the old monitor is
+# stopped. The task runs one instance at a time (MultipleInstances
+# IgnoreNew), and the scheduler ignores a start, with no error, while it
+# reads an instance as running, which it can for a moment after the old
+# monitor is stopped. So the start waits for that to end, up to 5
+# seconds, and is checked afterwards. Until 6.3.1 neither was done, and
+# "Started it now" was said of a start the scheduler ignored.
+Invoke-Section 'Setup step 15: the start waits for the old instance, and is checked' {
+    $kit = Join-Path $sandbox 'kit'
+    $null = Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $kit -Force
+    [System.IO.File]::WriteAllText((Join-Path $kit 'Watch-ClaudeHealth.ps1'), '# the monitor')
+    $taskKey = "$TaskPath|$TaskName"
+    $reg = "Register $TaskPath$TaskName"
+    $get = "Get $TaskPath$TaskName"
+    $start = "Start $TaskPath$TaskName"
+    $started = '^Started it now: the monitor begins watching in 120 seconds$'
+    $rpc = 'The RPC server is unavailable. (Exception from HRESULT: 0x800706BA)'
+    $tripBefore = $script:Tripped.Count
+    function Reset-Install {
+        Reset-State
+        $script:TaskInstallExpected = $true
+        $script:FakeCommandPath = Join-Path $kit 'Prevent-ClaudeIssues.ps1'
+    }
+    function Get-Calls { return ($script:TaskCalls -join ' / ') }
+    function Get-Count { param([string]$Call) return @($script:TaskCalls | Where-Object { $_ -eq $Call }).Count }
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); tasks: $(Get-Calls); clock $($script:FakeClockMs) ms" }
+
+    Reset-Install
+    $script:Tasks[$taskKey] = 'Running'
+    $script:TaskStopReads[$taskKey] = 0
+    Invoke-Step15
+    Assert-Case "an instance that has ended by the first read: started at once, and Done" ((Get-Calls) -eq "$reg / $get / $start / $get" -and
+        $script:FakeClockMs -eq 0 -and (Get-StepStatus) -eq 'Done' -and (Get-StepNotes) -eq '' -and (Test-LogHas $started)) (Get-Seen)
+
+    Reset-Install
+    $script:Tasks[$taskKey] = 'Running'
+    $script:TaskStopReads[$taskKey] = 3
+    Invoke-Step15
+    Assert-Case "an instance that ends after 3 more reads: started after 750 ms, and Done" ((Get-Calls) -eq "$reg / $get / $get / $get / $get / $start / $get" -and
+        $script:FakeClockMs -eq 750 -and (Get-StepStatus) -eq 'Done' -and (Get-StepNotes) -eq '' -and (Test-LogHas $started)) (Get-Seen)
+
+    Reset-Install
+    $script:Tasks[$taskKey] = 'Running'
+    $script:TaskStopReads[$taskKey] = -1
+    Invoke-Step15
+    $said = 'The health monitor task was not started now, because it still reads as running 5 seconds after the old monitor was stopped, and the scheduler ignores a start while it does; the monitor starts at the next logon'
+    Assert-Case "an instance that never ends: not started, after 5 seconds, and a Warning that says so" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Count $start) -eq 0 -and (Get-Count $get) -eq 21 -and $script:FakeClockMs -eq 5000 -and
+        (Test-LogHas ('^' + [regex]::Escape("[!] $said") + '$')) -and -not (Test-LogHas $started)) (Get-Seen)
+
+    Reset-Install
+    $script:StartTaskNoop = $true
+    Invoke-Step15
+    $said = 'The scheduler accepted the start of the health monitor task, but the task did not start: it reads Ready 3 seconds later. The monitor starts at the next logon'
+    Assert-Case "a start the scheduler takes and does nothing with: a Warning after 3 seconds, not 'Started it now'" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Count $start) -eq 1 -and (Get-Count $get) -eq 14 -and $script:FakeClockMs -eq 3000 -and
+        -not (Test-LogHas $started)) (Get-Seen)
+
+    Reset-Install
+    $script:TaskGoneAfterStart = $true
+    Invoke-Step15
+    $said = 'The scheduler accepted the start of the health monitor task, but the task is no longer there 3 seconds later'
+    Assert-Case "a task that is gone after the start: a Warning that says so, not 'Started it now'" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Count $start) -eq 1 -and (Get-Count $get) -eq 14 -and $script:FakeClockMs -eq 3000 -and
+        -not (Test-LogHas $started)) (Get-Seen)
+
+    Reset-Install
+    $script:TaskQueryFault = $true
+    Invoke-Step15
+    $said = "The health monitor task was not started now, because its state could not be read ($rpc); the monitor starts at the next logon"
+    Assert-Case "a task whose state cannot be read before the start: not started, and a Warning that says why" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Calls) -eq "$reg / $get" -and -not (Test-LogHas $started)) (Get-Seen)
+
+    Reset-Install
+    $script:TaskQueryFaultAfterStart = $true
+    Invoke-Step15
+    $said = "The health monitor task was started, but its state could not be read to check that it runs: $rpc"
+    Assert-Case "a task whose state cannot be read after the start: a Warning, not 'Started it now'" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Calls) -eq "$reg / $get / $start / $get" -and -not (Test-LogHas $started)) (Get-Seen)
+
+    # The old monitor was stopped, and whether it ended cannot be read.
+    Reset-Install
+    $script:PsProcs = @([pscustomobject]@{ ProcessId = 4242; CommandLine = 'powershell.exe -NoProfile -File "C:\ClaudeFix\Watch-ClaudeHealth.ps1" -Quiet' })
+    $script:Procs = @(New-FakeProcess 4242 'powershell')
+    $script:ProcReadFault = @('4242')
+    Invoke-Step15
+    $said = 'Could not read whether the health monitor already running (PID 4242) stopped, so the new one was not started now; it starts at the next logon: Access is denied'
+    Assert-Case "an old monitor that cannot be read after it was stopped: the new one not started, and a Warning that says so" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Calls) -eq $reg -and -not (Test-LogHas '^Stopped the health monitor') -and -not (Test-LogHas $started)) (Get-Seen)
+
+    Assert-Case "and no case here reached a tripwire" ($script:Tripped.Count -eq $tripBefore) (@($script:Tripped) -join ' / ')
+}
+
+# =====================================================================
+# Setup step 17 makes the Claude (Admin) task and the shortcut that starts
+# it. Until 6.3.1 the old task was removed with its errors dropped, and a
+# registration the scheduler refused went on to say "Scheduled task
+# created" and to make a shortcut that started nothing.
+Invoke-Section 'Setup step 17: the Claude (Admin) task' {
+    $adminKey = "$TaskPath|LaunchClaudeAdmin"
+    $get = "Get ${TaskPath}LaunchClaudeAdmin"
+    $unreg = "Unregister ${TaskPath}LaunchClaudeAdmin"
+    $reg = "Register ${TaskPath}LaunchClaudeAdmin"
+    $lnk = Join-Path $fakeDesktop 'Claude (Admin).lnk'
+    $elevVbs = Join-Path $ClaudeAppData 'Launch-Claude-Admin.vbs'
+    $trigVbs = Join-Path $ClaudeAppData 'Launch-Claude-Admin-Trigger.vbs'
+    $created = '^Scheduled task created: \\Claude\\LaunchClaudeAdmin \(Highest \+ Interactive, no console\)$'
+    $rpc = 'The RPC server is unavailable. (Exception from HRESULT: 0x800706BA)'
+    $tripBefore = $script:Tripped.Count
+    function Reset-Admin {
+        Reset-State
+        $script:TaskInstallExpected = $true
+    }
+    function Get-Calls { return ($script:TaskCalls -join ' / ') }
+    function Get-Saved { return (@($script:SavedShortcuts | ForEach-Object { [string]$_.Path }) -join ' / ') }
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); tasks: $(Get-Calls); shortcuts: $(Get-Saved)" }
+    function Test-File { param([string]$Path) return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $Path) }
+
+    Reset-Admin
+    Invoke-Step17
+    Assert-Case "no task yet: it is registered, both launchers written and the shortcut saved: Done" ((Get-Calls) -eq "$get / $reg" -and
+        $script:Tasks[$adminKey] -eq 'Ready' -and (Get-Saved) -eq $lnk -and (Get-StepStatus) -eq 'Done' -and (Get-StepNotes) -eq '' -and
+        (Test-LogHas $created) -and (Test-File $elevVbs) -and (Test-File $trigVbs)) (Get-Seen)
+    $p = $script:RegisteredTask
+    Assert-Case "and the task runs as this user, elevated and on the desktop, replacing any other" ($null -ne $p -and $p.Force -and
+        $p.Principal.UserId -eq 'TESTPC\tester' -and $p.Principal.RunLevel -eq 'Highest' -and $p.Principal.LogonType -eq 'Interactive') (Get-Seen)
+
+    Reset-Admin
+    $script:Tasks[$adminKey] = 'Ready'
+    Invoke-Step17
+    Assert-Case "an old task: it is removed, then registered again: Done" ((Get-Calls) -eq "$get / $unreg / $reg" -and
+        $script:Tasks[$adminKey] -eq 'Ready' -and (Get-Saved) -eq $lnk -and (Get-StepStatus) -eq 'Done' -and (Get-StepNotes) -eq '') (Get-Seen)
+
+    Reset-Admin
+    $script:RegisterFault = $true
+    Invoke-Step17
+    $said = 'Could not configure the elevated launcher: the scheduler refused the task \Claude\LaunchClaudeAdmin, so no Claude (Admin) shortcut was made (Access is denied.)'
+    Assert-Case "a registration the scheduler refuses: Failed with the reason, no shortcut made, and no task said to be created" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -eq $said -and (Get-Saved) -eq '' -and -not (Test-LogHas $created) -and (Get-Calls) -eq "$get / $reg / $get" -and
+        -not (Test-File $trigVbs)) (Get-Seen)
+
+    Reset-Admin
+    $script:RegisterFault = $true
+    [System.IO.File]::WriteAllText($lnk, 'an earlier shortcut')
+    Invoke-Step17
+    Assert-Case "and a shortcut an earlier run made, whose task is not there: removed, and said" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -eq "$said. The shortcut $lnk an earlier run made was removed: the task it starts is not there" -and -not (Test-File $lnk)) (Get-Seen)
+
+    Reset-Admin
+    $script:Tasks[$adminKey] = 'Ready'
+    $script:UnregisterFault = $true
+    $script:RegisterFault = $true
+    [System.IO.File]::WriteAllText($lnk, 'an earlier shortcut')
+    Invoke-Step17
+    Assert-Case "a shortcut an earlier run made, whose task is still there: kept" ((Get-StepStatus) -eq 'Failed' -and (Test-File $lnk) -and
+        (Get-StepNotes).EndsWith($said) -and -not ((Get-StepNotes) -match 'The shortcut ')) (Get-Seen)
+
+    Reset-Admin
+    $script:RegisterFault = $true
+    [System.IO.File]::WriteAllText($lnk, 'an earlier shortcut')
+    $script:ItemReadFault = $lnk
+    Invoke-Step17
+    Assert-Case "a shortcut an earlier run made that cannot be read: kept, and said" ((Get-StepStatus) -eq 'Failed' -and (Test-File $lnk) -and
+        (Get-StepNotes) -eq "$said. Whether the shortcut $lnk an earlier run made still has its task could not be read: Access is denied") (Get-Seen)
+
+    Reset-Admin
+    $script:Tasks[$adminKey] = 'Ready'
+    $script:UnregisterFault = $true
+    Invoke-Step17
+    $said = 'Could not remove the old scheduled task \Claude\LaunchClaudeAdmin; registering it again replaces it: Access is denied.'
+    Assert-Case "an old task that cannot be removed: a Warning that says so, and it is registered over all the same" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Calls) -eq "$get / $unreg / $reg" -and (Get-Saved) -eq $lnk -and (Test-LogHas $created)) (Get-Seen)
+
+    Reset-Admin
+    $script:Tasks[$adminKey] = 'Ready'
+    $script:TaskQueryFault = $true
+    Invoke-Step17
+    $said = "Could not read whether the scheduled task \Claude\LaunchClaudeAdmin is there, so it was not removed first; registering it replaces it: $rpc"
+    Assert-Case "an old task that cannot be read: a Warning, nothing removed, and it is registered over" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and (Get-Calls) -eq "$get / $reg" -and (Get-Saved) -eq $lnk) (Get-Seen)
+
+    Reset-Admin
+    $script:SetContentFault = '*Trigger.vbs'
+    Invoke-Step17
+    Assert-Case "a launcher that cannot be written: Failed with the reason, and no shortcut" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -eq "Could not configure the elevated launcher: Access to the path '$trigVbs' is denied." -and (Get-Saved) -eq '' -and
+        -not (Test-File $trigVbs)) (Get-Seen)
+
+    Reset-Admin
+    $script:FakeIsAdmin = $false
+    Invoke-Step17
+    Assert-Case "not run as an administrator: Skipped, and nothing is made" ((Get-StepStatus) -eq 'Skipped' -and (Get-Calls) -eq '' -and
+        (Get-Saved) -eq '' -and -not (Test-File $elevVbs)) (Get-Seen)
+
+    Assert-Case "and no case here reached a tripwire" ($script:Tripped.Count -eq $tripBefore) (@($script:Tripped) -join ' / ')
+}
+
+# =====================================================================
+# Whether an older version ran here decides what -Undo removes, and what
+# setup step 19 says. A file or a task that cannot be read is not one
+# that is not there: until 6.3.1 it counted as not there, and so as no
+# older version, and setup step 19 left the logon task unchecked.
+Invoke-Section "-Undo step 2 and setup step 19: an older version's traces that cannot be read" {
+    $policyPath  = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    $controlPath = 'HKLM:\SYSTEM\CurrentControlSet\Control'
+    $flagPath    = Join-Path $ClaudeAppData 'disable-dynamic-memory.flag'
+    $rpc = 'The RPC server is unavailable. (Exception from HRESULT: 0x800706BA)'
+    function Set-LegacyValues {
+        Set-FakeRegValue $controlPath 'ServicesPipeTimeout' ([int]120000)
+        Set-FakeRegValue $policyPath 'LocalAccountTokenFilterPolicy' ([int]1)
+        Set-FakeRegValue $policyPath 'FilterAdministratorToken' ([int]0)
+    }
+    function Get-LegacyValuesLeft {
+        $left = @()
+        foreach ($x in @(@($controlPath, 'ServicesPipeTimeout'), @($policyPath, 'LocalAccountTokenFilterPolicy'), @($policyPath, 'FilterAdministratorToken'))) {
+            if (Test-FakeRegValue $x[0] $x[1]) { $left += $x[1] }
+        }
+        return ($left -join ',')
+    }
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); unread $($script:UndoUnread); left $(Get-LegacyValuesLeft)" }
+    $all = 'ServicesPipeTimeout,LocalAccountTokenFilterPolicy,FilterAdministratorToken'
+    $taskWhy = "the scheduled task $TaskPath$BootTaskName could not be read ($rpc)"
+    $told = ' matches what older versions set, but whether one ran here could not be told, so it is left as it is'
+
+    Reset-State
+    Set-LegacyValues
+    $script:TaskQueryFault = $true
+    Invoke-UndoStep2
+    $said = "Whether a version before 6.3.0 ran here could not be told, because $taskWhy, so what -Undo removes only where one ran is left as it is"
+    Assert-Case "-Undo, the logon task cannot be read: a Warning that says so, and the three values left, each said" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "$said | ServicesPipeTimeout = 120000$told | LocalAccountTokenFilterPolicy = 1$told | FilterAdministratorToken = 0$told" -and
+        (Get-LegacyValuesLeft) -eq $all -and @($script:Calls | Where-Object { $_.StartsWith('Remove-ItemProperty ') }).Count -eq 0) (Get-Seen)
+    $end = Get-UndoEnd
+    Assert-Case "and -Undo ends UNDO INCOMPLETE, saying to run it again, with exit code 1" ($end.Box -eq 'UNDO INCOMPLETE' -and $end.Unread -and $end.Exit -eq 1) $end.Text
+
+    Reset-State
+    Set-LegacyValues
+    $script:ItemReadFault = $flagPath
+    Invoke-UndoStep2
+    Assert-Case "-Undo, a file that shows an older version cannot be read: the same, naming the file" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes).StartsWith("Whether a version before 6.3.0 ran here could not be told, because $flagPath could not be read (Access is denied), so") -and
+        (Get-LegacyValuesLeft) -eq $all -and $script:UndoUnread) (Get-Seen)
+
+    Reset-State
+    Set-LegacyValues
+    $script:TaskQueryFault = $true
+    Invoke-Step19
+    $s1 = "Whether a version before 6.3.0 ran here could not be told, because $taskWhy"
+    $s2 = "Could not read the scheduled task $TaskPath$BootTaskName, so the logon task older versions created was not checked or removed: $rpc"
+    $g = ' matches what older versions set, but whether one ran here could not be told, so it is not known whether -Undo removes it'
+    Assert-Case "setup step 19, the logon task cannot be read: a Warning for each, and the values said to be undecided" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "$s1 | $s2 | LocalAccountTokenFilterPolicy = 1$g | FilterAdministratorToken = 0$g | ServicesPipeTimeout = 120000$g" -and
+        @($script:TaskCalls | Where-Object { $_ -like 'Unregister *' }).Count -eq 0) (Get-Seen)
+
+    Reset-State
+    $script:Services[$ServiceName] = 'Running'
+    $script:ServiceReadFault = @($ServiceName)
+    Invoke-Step19
+    Assert-Case "setup step 19, the Cowork VM service cannot be read: a Warning that says so" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "Could not read the service $ServiceName, so the restart recovery older versions set on it was not checked: Access is denied") (Get-Seen)
+}
+
+# =====================================================================
+# A service that cannot be read is not one that is not installed. Until
+# 6.3.1 each of these read it with SilentlyContinue: -Undo dropped the
+# record of a recovery it had not put back, setup step 9 said vmcompute
+# was not there, and setup step 12 said the Windows Time service was not
+# installed.
+Invoke-Section 'Services that cannot be read' {
+    function New-UndoItem { param([string]$Kind, [string]$Key, $Original) return [pscustomobject]@{ Kind = $Kind; Key = $Key; Original = $Original } }
+    $svcKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\vmcompute'
+    $denied = 'Access is denied'
+    function Set-Recovery {
+        Reset-State
+        $script:Services['vmcompute'] = 'Running'
+        Set-FakeRegValue $svcKey 'FailureActions' (New-FailureBlob -Reset 300 -Pairs @(1, 30000, 1, 60000, 1, 120000))
+    }
+    function Test-RecoveryOn { return [bool](Test-RestartRecovery (ConvertFrom-FailureActionsBlob -Bytes (Get-ServiceFailureBytes -Service 'vmcompute'))) }
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); sc: $($script:ScCalls -join ' / ')" }
+
+    Set-Recovery
+    $script:ServiceReadFault = @('vmcompute')
+    Step 1 5 'undo' -Name 'Recorded settings'
+    $threw = ''
+    try { $null = Restore-PreventUndoItem -Item (New-UndoItem 'ServiceFailureActions' 'vmcompute' $null) -CreatedPlan $null } catch { $threw = $_.Exception.Message }
+    Assert-Case "-Undo step 1, a service that cannot be read: it throws, so its recovery stays recorded, and sc.exe is not run" (
+        $threw -eq "the service could not be read, so its recovery settings stay recorded ($denied)" -and $script:ScCalls.Count -eq 0 -and (Test-RecoveryOn)) "threw: $threw; $(Get-Seen)"
+
+    Set-Recovery
+    $script:ServiceReadFault = @('vmcompute')
+    Invoke-UndoStep2
+    Assert-Case "-Undo step 2, vmcompute cannot be read: a Warning, its recovery left, and -Undo incomplete" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "Could not read the service vmcompute, so the restart recovery older versions set on it was not checked: $denied" -and
+        $script:ScCalls.Count -eq 0 -and (Test-RecoveryOn) -and $script:UndoUnread) (Get-Seen)
+
+    Reset-State
+    $script:Services['vmcompute'] = 'Running'
+    $null = Add-FakeRegKey $svcKey
+    $script:ServiceReadFault = @('vmcompute')
+    Invoke-Step9
+    Assert-Case "setup step 9, vmcompute cannot be read: Failed, saying so, and nothing set or recorded" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -eq "Could not read the service vmcompute, so its restart recovery was not checked or set: $denied" -and $script:ScCalls.Count -eq 0 -and
+        $null -eq (Find-Undo 'ServiceFailureActions' 'vmcompute')) (Get-Seen)
+
+    Reset-State
+    $script:Services['W32Time'] = 'Running'
+    $script:ServiceReadFault = @('W32Time')
+    Invoke-Step12
+    Assert-Case "setup step 12, the Windows Time service cannot be read: a Warning that says so, nothing started, and w32tm not asked" (
+        (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq "Could not read the Windows Time service, so it was not started and the clock was not checked: $denied" -and
+        $script:SvcCalls.Count -eq 0 -and $script:W32Calls.Count -eq 0) "$(Get-Seen); $($script:SvcCalls -join ' / ')"
+}
+
+# =====================================================================
+# A process that cannot be read is not one that has exited. Until 6.3.1
+# each of these read it with SilentlyContinue: setup step 10 killed the
+# Cowork VM with Claude perhaps running, step 8 said the worker had
+# exited, step 13 said no antivirus was found, and -Undo step 3 said a
+# monitor was stopped.
+Invoke-Section 'Processes that cannot be read' {
+    $denied = 'Access is denied'
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes)" }
+
+    Reset-State
+    [void]$script:HcsLive.Add($guidA)
+    $script:ProcReadFault = @('claude')
+    Invoke-Step10
+    Assert-Case "setup step 10, the processes named claude cannot be listed: no VM is killed, and a Warning says why" ($script:Killed.Count -eq 0 -and
+        (Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "Could not list the processes named claude, so it is not known whether Claude is running, and the 1 cowork-vm instance(s) are left alone: $denied") (
+        "$(Get-Seen); killed $($script:Killed -join ',')")
+
+    Reset-State
+    Set-VmFixture
+    $script:ProcReadFault = @('10')
+    Invoke-Step8
+    Assert-Case "setup step 8, the Cowork VM's worker cannot be read: a Warning, and it is not raised" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "Could not read the Cowork VM worker (PID 10), so its priority was not checked or raised: $denied" -and
+        (Get-Priority 10) -eq 'Normal' -and -not (Test-LogHas 'has exited')) (Get-Seen)
+
+    Reset-State
+    $script:ProcReadFault = @('*')
+    Invoke-Step13
+    $said = "Could not list the running processes, so an antivirus that is not Defender may go unreported: $denied"
+    Assert-Case "setup step 13, the running processes cannot be listed: a Warning, and only what was read is said" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and -not (Test-LogHas '^No antivirus product detected$') -and (Test-LogHas '^No antivirus product is registered with Windows$')) (Get-Seen)
+
+    Reset-State
+    $script:AvProducts = @([pscustomobject]@{ displayName = 'Windows Defender' })
+    $script:ProcReadFault = @('*')
+    Invoke-Step13
+    Assert-Case "and with Defender registered, its exclusions are added all the same" ($script:MpAdds.Count -gt 0 -and
+        @((Get-StepNotes) -split ' \| ') -contains $said) "$(Get-Seen); adds $($script:MpAdds.Count)"
+
+    Reset-State
+    $script:PsProcs = @([pscustomobject]@{ ProcessId = 4242; CommandLine = 'powershell.exe -NoProfile -File "C:\ClaudeFix\Watch-ClaudeHealth.ps1" -Quiet' })
+    $script:Procs = @(New-FakeProcess 4242 'powershell')
+    $script:ProcReadFault = @('4242')
+    Invoke-UndoStep3
+    Assert-Case "-Undo step 3, whether a stopped monitor ended cannot be read: Failed, and not said to be stopped" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -eq "Could not read whether the health monitor (PID 4242) stopped: $denied" -and -not (Test-LogHas '^Stopped running health monitor')) (Get-Seen)
+}
+
+# =====================================================================
+# Setup step 14 reads the WSL feature and the running distros. Until
+# 6.3.1 a feature that could not be read was said only as a grey line, and
+# wsl.exe's exit code and errors were not looked at: any failure read as
+# "No WSL2 distro running".
+Invoke-Section 'Setup step 14: WSL, and what cannot be read' {
+    function Set-Wsl {
+        param([string[]]$Lines, [int]$Exit)
+        # A wsl.exe of its own, so that the one Reset-State names stays absent.
+        $script:FakeWslPath = Join-Path $sandbox 'wsl\wsl.exe'
+        $null = Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path (Split-Path $script:FakeWslPath -Parent) -Force
+        [System.IO.File]::WriteAllText($script:FakeWslPath, '')
+        $script:WslLines = $Lines
+        $script:WslExit = $Exit
+    }
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); wsl: $($script:WslCalls -join ' / '); $($script:LogLines -join ' / ')" }
+    $noDistro = '^No WSL2 distro running$'
+    $none = 'Windows Subsystem for Linux has no installed distributions.'
+    $wslUtf8 = $env:WSL_UTF8
+
+    Reset-State
+    Invoke-Step14
+    Assert-Case "no wsl.exe: Unchanged, with no distro running, and wsl.exe not run" ((Get-StepStatus) -eq 'Unchanged' -and (Get-StepNotes) -eq '' -and
+        (Test-LogHas $noDistro) -and $script:WslCalls.Count -eq 0) (Get-Seen)
+
+    # 6.3.1: until then wsl.exe was looked for with Test-Path, which answers
+    # $false for a file that cannot be read as for one that is not there.
+    Reset-State
+    Set-Wsl @('  NAME      STATE           VERSION', '* Ubuntu    Running         2') 0
+    $script:ItemReadFault = $script:FakeWslPath
+    Invoke-Step14
+    Assert-Case "a wsl.exe that cannot be read: a Warning that names it and why, and no distro said to run or not" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "Could not read which WSL distros are running: $($script:FakeWslPath) could not be read (Access is denied)" -and
+        $script:WslCalls.Count -eq 0 -and -not (Test-LogHas $noDistro)) (Get-Seen)
+
+    Reset-State
+    $script:WslFeatureState = 'Enabled'
+    Set-Wsl @('  NAME      STATE           VERSION', '* Ubuntu    Running         2', '  Debian    Stopped         2', '  Legacy    Running         1') 0
+    Invoke-Step14
+    Assert-Case "a WSL2 distro running: a Warning naming it, and only it" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq 'WSL2 running (Ubuntu): if Cowork has issues, run wsl --shutdown' -and ($script:WslCalls -join ' / ') -eq '-l -v' -and
+        (Test-LogHas '^WSL is installed$') -and $env:WSL_UTF8 -eq $wslUtf8) (Get-Seen)
+
+    Reset-State
+    Set-Wsl @($none) 1
+    Invoke-Step14
+    Assert-Case "wsl.exe fails while neither WSL service is there: no distro runs, Unchanged" ((Get-StepStatus) -eq 'Unchanged' -and
+        (Get-StepNotes) -eq '' -and (Test-LogHas $noDistro)) (Get-Seen)
+
+    Reset-State
+    Set-Wsl @($none) 1
+    $script:Services['WSLService'] = 'Stopped'
+    $script:Services['LxssManager'] = 'Stopped'
+    Invoke-Step14
+    Assert-Case "and while both are there and stopped: the same" ((Get-StepStatus) -eq 'Unchanged' -and (Test-LogHas $noDistro)) (Get-Seen)
+
+    Reset-State
+    Set-Wsl @('', 'Access is denied.') 1
+    $script:Services['WSLService'] = 'Running'
+    Invoke-Step14
+    $said = 'Could not read which WSL distros are running: wsl.exe -l -v ended with exit code 1 while WSLService runs: Access is denied.'
+    Assert-Case "wsl.exe fails while WSLService runs: a Warning that says so, not 'No WSL2 distro running'" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq $said -and -not (Test-LogHas $noDistro)) (Get-Seen)
+
+    Reset-State
+    Set-Wsl @($none) 1
+    $script:Services['LxssManager'] = 'Running'
+    Invoke-Step14
+    Assert-Case "and while LxssManager runs: the same, naming it" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "Could not read which WSL distros are running: wsl.exe -l -v ended with exit code 1 while LxssManager runs: $none") (Get-Seen)
+
+    Reset-State
+    Set-Wsl @($none) 1
+    $script:ServiceReadFault = @('WSLService')
+    Invoke-Step14
+    Assert-Case "wsl.exe fails and a WSL service cannot be read: a Warning" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq 'Could not read which WSL distros are running: Access is denied' -and -not (Test-LogHas $noDistro)) (Get-Seen)
+
+    Reset-State
+    Set-Wsl @() 0
+    $script:WslThrows = $true
+    Invoke-Step14
+    Assert-Case "wsl.exe cannot be run: a Warning" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq 'Could not read which WSL distros are running: The system cannot execute the specified program.' -and
+        $env:WSL_UTF8 -eq $wslUtf8) (Get-Seen)
+
+    Reset-State
+    $script:WslFeatureFault = $true
+    Invoke-Step14
+    Assert-Case "the WSL feature cannot be read: a Warning that says so" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq 'Could not read whether the WSL feature is installed: Class not registered' -and -not (Test-LogHas '^WSL is installed$')) (Get-Seen)
+}
+
+# =====================================================================
+# Power plans that cannot be read. Until 6.3.1 every error reading the
+# plans in the registry read as no Ultimate Performance plan: setup made
+# one more copy, and -Undo took the plan an older version recorded for
+# yours. A record that could not be read was taken for one that held no
+# plan: Balanced was made active, and the record deleted.
+Invoke-Section 'Power plans that cannot be read' {
+    $why = 'the power plans in the registry could not be read (Requested registry access is not allowed.)'
+    function Get-SetActive { return @($script:PcCalls | Where-Object { $_ -like '/setactive*' }).Count }
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); active $($script:ActivePlan); $($script:PcCalls -join ' / ')" }
+
+    # A PowerSchemes key that is not there holds no plan, and is not an
+    # error: Get-ChildItem says so with PathNotFound, and that alone.
+    Reset-State
+    $guids = $null
+    $err = $null
+    try { $guids = @(Get-UltimatePlanGuids) } catch { $err = $_.Exception.Message }
+    $schemesKeys = @($script:Reg.Keys | Where-Object { $_.StartsWith((Get-RegNorm $schemesRoot)) }).Count
+    Assert-Case "no PowerSchemes key: no Ultimate plan, and no error" ($null -eq $err -and $null -ne $guids -and $guids.Count -eq 0 -and
+        $schemesKeys -eq 0) "error: $err; keys: $schemesKeys"
+
+    Reset-State
+    Set-PowerFixture
+    $script:RegReadFault = $schemesRoot
+    Invoke-SetupStep1
+    Assert-Case "setup step 1, the plans cannot be read from the registry: Failed, and no copy is made" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -eq $why -and @($script:PcCalls | Where-Object { $_ -like '/duplicatescheme*' }).Count -eq 0 -and
+        $null -eq (Find-Undo 'PowerPlan' 'Created') -and $null -eq (Find-Undo 'PowerPlan' 'Active')) (Get-Seen)
+
+    # An older version's record of the plan you had that cannot be read was
+    # taken, until 6.3.1, for one that held no plan: Balanced was recorded as
+    # yours, and the record deleted.
+    Reset-State
+    Set-PowerFixture
+    $script:ActivePlan = $plSaver
+    [System.IO.File]::WriteAllText($BackupFile, "$plHigh`r`n")
+    $lock = [System.IO.File]::Open($BackupFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    try { Invoke-SetupStep1 } finally { $lock.Dispose() }
+    $head = "the older version's record of your plan, $BackupFile, could not be read ("
+    Assert-Case "setup step 1, an older version's record cannot be read: Failed, nothing recorded, and the record kept" ((Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes).StartsWith($head) -and (Get-StepNotes).EndsWith('), so the plan you had is not recorded yet, and the record is kept') -and
+        $null -eq (Find-Undo 'PowerPlan' 'Active') -and (Get-LegacyInstallCount) -eq 0 -and
+        (Microsoft.PowerShell.Management\Test-Path -LiteralPath $BackupFile) -and (Get-SetActive) -eq 0) (Get-Seen)
+
+    Reset-State
+    Set-PowerFixture
+    $script:ActivePlan = $plSaver
+    [System.IO.File]::WriteAllText($BackupFile, "$plHigh`r`n")
+    $script:RegReadFault = $schemesRoot
+    Invoke-UndoStep2
+    Assert-Case "-Undo step 2, the plans cannot be read: the plan an older version recorded is not put back, and its record is kept: Failed" (
+        (Get-StepStatus) -eq 'Failed' -and
+        @((Get-StepNotes) -split ' \| ') -contains "The plan an older version recorded was not put back, because $why; its record is kept for the next -Undo" -and
+        (Microsoft.PowerShell.Management\Test-Path -LiteralPath $BackupFile) -and $script:ActivePlan -eq $plSaver -and (Get-SetActive) -eq 0) (Get-Seen)
+
+    Reset-State
+    Set-PowerFixture
+    $script:ActivePlan = $plSaver
+    [System.IO.File]::WriteAllText($BackupFile, "$plHigh`r`n")
+    $lock = [System.IO.File]::Open($BackupFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    try { Invoke-UndoStep2 } finally { $lock.Dispose() }
+    $head = "The plan an older version recorded was not put back, because $BackupFile could not be read ("
+    Assert-Case "-Undo step 2, the older version's record cannot be read: not taken for an empty one, and kept: Failed" ((Get-StepStatus) -eq 'Failed' -and
+        @((Get-StepNotes) -split ' \| ' | Where-Object { $_.StartsWith($head) -and $_.EndsWith('); its record is kept for the next -Undo') }).Count -eq 1 -and
+        (Microsoft.PowerShell.Management\Test-Path -LiteralPath $BackupFile) -and $script:ActivePlan -eq $plSaver -and (Get-SetActive) -eq 0) (Get-Seen)
+}
+
+# =====================================================================
+# The scripts Prevent writes for later: the Claude (Admin) task's payload
+# and the GPU-free launcher. Each is run here, in this process, against
+# fakes: Invoke-GeneratedScript turns each exit into a return of
+# 'EXIT n', and refuses to run a script that reaches a command that is
+# neither its own, nor in the list it is given, nor one of four that only
+# shape what they are given. Until 6.3.1 both read the process list with
+# SilentlyContinue, so a list that could not be read was taken for no
+# Claude running: the payload started a second Claude, and the launcher
+# started one beside a Claude it had not closed, then said it ran without
+# the GPU.
+function New-GenClaude {
+    param([int]$Id, [string]$Exe = 'C:\FakeApps\Claude\app\Claude.exe')
+    return [pscustomobject]@{ Id = $Id; ProcessName = 'claude'; PriorityClass = 'Normal'; MainModule = [pscustomobject]@{ FileName = $Exe } }
+}
+function Reset-Generated {
+    Reset-State
+    $script:GenHost = New-Object System.Collections.ArrayList
+    $script:GenPopups = New-Object System.Collections.ArrayList
+    $script:GenStarts = New-Object System.Collections.ArrayList
+    $script:GenAppx = @([pscustomobject]@{ Name = 'Claude'; PackageFamilyName = 'Claude_test'; InstallLocation = 'C:\FakeApps\Claude' })
+    $script:GenFiles = @('C:\FakeApps\Claude\app\Claude.exe')
+    $script:GenProduct = @{ 'C:\FakeApps\Claude\app\Claude.exe' = 'Claude' }
+    $script:GenStartRuns = $true
+    $script:GenFaultAfterStop = $false
+    $script:GenFaultAfterStart = $false
+    $script:GenItemFault = $null
+    $script:GenAppxFault = $false
+}
+function Invoke-GeneratedScript {
+    param([string]$Text, [string[]]$Allowed)
+    $shapers = @('Where-Object', 'ForEach-Object', 'Select-Object', 'Join-Path')
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$errs)
+    if (@($errs).Count -gt 0) { return "REFUSED: it does not parse: $($errs[0].Message)" }
+    $exits = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true) |
+        Sort-Object { $_.Extent.StartOffset } -Descending)
+    foreach ($x in $exits) {
+        $code = '0'
+        if ($null -ne $x.Pipeline) { $code = $x.Pipeline.Extent.Text }
+        $Text = $Text.Substring(0, $x.Extent.StartOffset) + "return 'EXIT $code'" + $Text.Substring($x.Extent.EndOffset)
+    }
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$errs)
+    if (@($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExitStatementAst] }, $true)).Count -gt 0) { return 'REFUSED: an exit is left' }
+    $own = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
+    $bad = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) | ForEach-Object { [string]$_.GetCommandName() } |
+        Where-Object { $own -notcontains $_ -and $Allowed -notcontains $_ -and $shapers -notcontains $_ } | Select-Object -Unique)
+    if ($bad.Count -gt 0) { return "REFUSED: it runs $($bad -join ', ')" }
+
+    function Write-Host { param([Parameter(Position = 0)]$Object, $ForegroundColor) [void]$script:GenHost.Add([string]$Object) }
+    function Read-Host { param([Parameter(Position = 0)]$Prompt) [void]$script:GenHost.Add("READ $Prompt") }
+    # Each of these is seen by every function the script calls as well, the
+    # fakes among them, since PowerShell scopes are dynamic: none may be one
+    # that those call.
+    function New-GenShell {
+        $sh = [pscustomobject]@{ Kind = 'FakeShell' }
+        $sh | Add-Member -MemberType ScriptMethod -Name Popup -Value { [void]$script:GenPopups.Add([string]$args[0]); return 1 }
+        return $sh
+    }
+    # $script:GenAppxFault: the package list cannot be read. The payload
+    # takes any error from it for that, so the error's identity is not
+    # what is tested.
+    function Get-AppxPackage {
+        [CmdletBinding()]
+        param()
+        if ($script:GenAppxFault) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.UnauthorizedAccessException' 'Access is denied.' 'GetAppxPackageError' 'PermissionDenied' $null))
+            return
+        }
+        return @($script:GenAppx)
+    }
+    # $script:GenItemFault is a -like pattern: a file it matches cannot be
+    # read. Test-Path then answers $false, and Get-Item gives the error
+    # Get-Item -Force gives under an explicit Deny; a file not in
+    # $script:GenFiles or $script:GenProduct is not there (both measured
+    # 2026-11-23).
+    function Test-Path {
+        [CmdletBinding()]
+        param([Parameter(Position = 0)][string]$Path, [string]$LiteralPath)
+        $p = Select-FakePath $Path $LiteralPath
+        if ($script:GenItemFault -and $p -like $script:GenItemFault) { return $false }
+        return (@($script:GenFiles) -contains $p)
+    }
+    function Get-Item {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [switch]$Force)
+        $null = $Force
+        if ($script:GenItemFault -and $LiteralPath -like $script:GenItemFault) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.UnauthorizedAccessException' 'Access is denied' `
+                'ItemExistsUnauthorizedAccessError' 'PermissionDenied' $LiteralPath))
+            return
+        }
+        if (@($script:GenFiles) -notcontains $LiteralPath -and -not $script:GenProduct.ContainsKey($LiteralPath)) {
+            $PSCmdlet.WriteError((New-FakeErrorRecord 'System.Management.Automation.ItemNotFoundException' `
+                "Cannot find path '$LiteralPath' because it does not exist." 'PathNotFound' 'ObjectNotFound' $LiteralPath))
+            return
+        }
+        return [pscustomobject]@{ PSIsContainer = $false; VersionInfo = [pscustomobject]@{ ProductName = [string]$script:GenProduct[$LiteralPath] } }
+    }
+    function Start-Process {
+        param([Parameter(Position = 0)][string]$FilePath, [string[]]$ArgumentList)
+        [void]$script:GenStarts.Add(("$FilePath " + ($ArgumentList -join ' ')).Trim())
+        if ($script:GenStartRuns) { $script:Procs = @($script:Procs) + @(New-GenClaude 99) }
+        if ($script:GenFaultAfterStart) { $script:ProcReadFault = @('claude') }
+    }
+    function Stop-Process {
+        [CmdletBinding()]
+        param([Parameter(ValueFromPipeline = $true)]$InputObject, [switch]$Force)
+        process {
+            $null = $Force
+            [void]$script:ProcCalls.Add("Stop-Process $($InputObject.Id)")
+            if (-not $script:StopProcLinger) { $script:Procs = @($script:Procs | Where-Object { $_.Id -ne $InputObject.Id }) }
+            if ($script:GenFaultAfterStop) { $script:ProcReadFault = @('claude') }
+        }
+    }
+    foreach ($n in @($Allowed)) {
+        $c = $null
+        try { $c = Get-Command -Name $n -ErrorAction Stop } catch { return "REFUSED: $n is not found: $($_.Exception.Message)" }
+        if ($c.CommandType -ne 'Function') { return "REFUSED: $n is not a fake" }
+    }
+    Set-StrictMode -Off
+    try {
+        return (@(& ([scriptblock]::Create($Text))) -join ' / ')
+    } catch {
+        return "THREW: $($_.Exception.Message)"
+    }
+}
+
+Invoke-Section 'The Claude (Admin) task payload: whether Claude already runs' {
+    $m = [regex]::Match($pSrc, '(?s)\$launchCmd = @''\r?\n(.*?)\r?\n''@')
+    Assert-Case "the payload is found in Prevent" $m.Success
+    $shellCall = 'New-Object -ComObject WScript.Shell'
+    $payload = $m.Groups[1].Value
+    Assert-Case "and it makes its message boxes through WScript.Shell, in its two places" (([regex]::Matches($payload, [regex]::Escape($shellCall))).Count -eq 2)
+    $payload = $payload.Replace($shellCall, 'New-GenShell')
+    $allowed = @('Get-Process', 'Get-Item', 'New-GenShell', 'Get-AppxPackage', 'Test-Path', 'Start-Process')
+    $app = 'C:\FakeApps\Claude\app\Claude.exe'
+    $out = ''
+    function Get-Seen { return "out: $out; popups: $($script:GenPopups -join ' / '); starts: $($script:GenStarts -join ' / ')" }
+
+    Reset-Generated
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "no Claude running: Claude is started" ($out -eq '' -and ($script:GenStarts -join ' / ') -eq $app -and $script:GenPopups.Count -eq 0) (Get-Seen)
+
+    Reset-Generated
+    $script:Procs = @(New-GenClaude 77)
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "Claude running: it ends, and starts nothing" ($out -eq 'EXIT 0' -and $script:GenStarts.Count -eq 0 -and $script:GenPopups.Count -eq 0) (Get-Seen)
+
+    Reset-Generated
+    $script:Procs = @(New-GenClaude 78 'C:\Users\tester\AppData\Roaming\Claude\claude-code\2.1.0\claude.exe')
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "only the Claude Code CLI running: Claude is started" ($out -eq '' -and ($script:GenStarts -join ' / ') -eq $app) (Get-Seen)
+
+    Reset-Generated
+    $script:ProcReadFault = @('claude')
+    $out = Invoke-GeneratedScript $payload $allowed
+    $said = "Claude was not started: the running processes could not be read, so it is not known whether Claude is already running.`n`nAccess is denied"
+    Assert-Case "the processes cannot be listed: Claude is not started, and a message says why" ($out -eq 'EXIT 1' -and $script:GenStarts.Count -eq 0 -and
+        ($script:GenPopups -join ' / ') -eq $said) (Get-Seen)
+
+    # 6.3.1: a place Claude may be installed that cannot be read is a doubt,
+    # not a place where it is not. Until 6.3.1 it was looked for with
+    # Test-Path, which answers $false for both, and Claude was started from
+    # a later place: an older install the user had left.
+    $first = Join-Path $env:LOCALAPPDATA 'Programs\claude-desktop\Claude.exe'
+    $third = Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'
+
+    Reset-Generated
+    $script:GenFiles = @($app, $third)
+    $script:GenItemFault = $app
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "the app's own Claude.exe cannot be read: nothing is started from another place, and a message says why" ($out -eq 'EXIT 1' -and
+        $script:GenStarts.Count -eq 0 -and ($script:GenPopups -join ' / ') -eq "Claude was not started: $app could not be read: Access is denied") (Get-Seen)
+
+    Reset-Generated
+    $script:GenAppx = @()
+    $script:GenFiles = @($first, $third)
+    $script:GenItemFault = $first
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "an installer's place cannot be read: nothing is started from a later one, and a message says why" ($out -eq 'EXIT 1' -and
+        $script:GenStarts.Count -eq 0 -and ($script:GenPopups -join ' / ') -eq "Claude was not started: $first could not be read: Access is denied") (Get-Seen)
+
+    Reset-Generated
+    $script:GenAppx = @()
+    $script:GenFiles = @($third)
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "no app package, and the installer's third place holds it: Claude is started from there" ($out -eq '' -and
+        ($script:GenStarts -join ' / ') -eq $third -and $script:GenPopups.Count -eq 0) (Get-Seen)
+
+    Reset-Generated
+    $script:GenAppx = @()
+    $script:GenFiles = @()
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "Claude installed nowhere: nothing is started, and that is what is said" ($out -eq 'THREW: Claude Desktop not found. Is it installed?' -and
+        $script:GenStarts.Count -eq 0 -and $script:GenPopups.Count -eq 0) (Get-Seen)
+
+    Reset-Generated
+    $script:GenFiles = @($app, $third)
+    $script:GenAppxFault = $true
+    $out = Invoke-GeneratedScript $payload $allowed
+    Assert-Case "the app packages cannot be listed: nothing is started, and a message says why" ($out -eq 'EXIT 1' -and $script:GenStarts.Count -eq 0 -and
+        ($script:GenPopups -join ' / ') -eq 'Claude was not started: Access is denied.') (Get-Seen)
+}
+
+Invoke-Section 'The GPU-free launcher: a Claude that is not closed, and a list that cannot be read' {
+    $as = $pAst.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$ps1Content' }, $true)
+    $tpl = $null
+    if ($null -ne $as -and $as.Right -is [System.Management.Automation.Language.CommandExpressionAst] -and
+        $as.Right.Expression -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) { $tpl = $as.Right.Expression }
+    $vars = @()
+    if ($null -ne $tpl) { $vars = @($tpl.NestedExpressions | ForEach-Object { $_.Extent.Text } | Sort-Object -Unique) }
+    Assert-Case "the launcher's template is found, and expands only `$howNote, `$launchBody and `$ToolkitVersion" ($null -ne $tpl -and
+        ($vars -join ',') -eq '$howNote,$launchBody,$ToolkitVersion') ($vars -join ',')
+    if ($null -eq $tpl) { return }
+    $app = 'C:\FakeApps\Claude\app\Claude.exe'
+    $howNote = 'Traditional install, flag passed directly'
+    $launchBody = "Start-Process -FilePath '$app' -ArgumentList '--disable-gpu'"
+    $ToolkitVersion = '0.0.0-test'
+    $launcher = [string](& ([scriptblock]::Create($tpl.Extent.Text)))
+    $allowed = @('Get-Process', 'Get-Item', 'Write-Host', 'Read-Host', 'Stop-Process', 'Start-Sleep', 'Start-Process')
+    $out = ''
+    function Get-Seen { return "out: $out; stops: $($script:ProcCalls -join ' / '); starts: $($script:GenStarts -join ' / '); $($script:GenHost -join ' / ')" }
+    function Test-HostSaid { param([string]$Line) return (@($script:GenHost | Where-Object { ([string]$_).Trim() -eq $Line }).Count -eq 1) }
+    $runs = 'Claude is running without hardware GPU acceleration.'
+    $notClosed = '[!] Claude could not be closed, or whether it closed could not be read, so it was not started again without the GPU. Close Claude and run this again.'
+
+    Reset-Generated
+    $script:Procs = @(New-GenClaude 77)
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "Claude running: it is closed, started again without the GPU, and said to run so" ($out -eq '' -and ($script:ProcCalls -join ' / ') -eq 'Stop-Process 77' -and
+        ($script:GenStarts -join ' / ') -eq "$app --disable-gpu" -and (Test-HostSaid $runs)) (Get-Seen)
+
+    Reset-Generated
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "no Claude running: started without the GPU, and nothing stopped" ($out -eq '' -and $script:ProcCalls.Count -eq 0 -and
+        ($script:GenStarts -join ' / ') -eq "$app --disable-gpu" -and (Test-HostSaid $runs)) (Get-Seen)
+
+    Reset-Generated
+    $script:Procs = @(New-GenClaude 77)
+    $script:StopProcLinger = $true
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "a Claude that is not closed: it is not started again, and a message says so" ($out -eq 'EXIT 1' -and $script:GenStarts.Count -eq 0 -and
+        (Test-HostSaid $notClosed) -and -not (Test-HostSaid $runs)) (Get-Seen)
+
+    Reset-Generated
+    $script:Procs = @(New-GenClaude 77)
+    $script:GenFaultAfterStop = $true
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "a Claude whose closing cannot be read: the same" ($out -eq 'EXIT 1' -and $script:GenStarts.Count -eq 0 -and (Test-HostSaid $notClosed)) (Get-Seen)
+
+    Reset-Generated
+    $script:Procs = @(New-GenClaude 77)
+    $script:ProcReadFault = @('claude')
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "the processes cannot be listed: nothing closed or started, and a message says why" ($out -eq 'EXIT 1' -and $script:ProcCalls.Count -eq 0 -and
+        $script:GenStarts.Count -eq 0 -and (Test-HostSaid '[!] The running processes could not be read, so Claude was not closed or started: Access is denied')) (Get-Seen)
+
+    Reset-Generated
+    $script:GenStartRuns = $false
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "a start that does not take: said not to have started" ($out -eq '' -and
+        (Test-HostSaid '[!] Claude did not start. Launch it normally and report this.') -and -not (Test-HostSaid $runs)) (Get-Seen)
+
+    Reset-Generated
+    $script:GenFaultAfterStart = $true
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "a start whose result cannot be read: said so, not said to run" ($out -eq '' -and
+        (Test-HostSaid '[!] Claude was started, but the running processes could not be read to check that it runs.') -and -not (Test-HostSaid $runs)) (Get-Seen)
+
+    # 6.3.1: a Claude process whose path cannot be read could be Claude
+    # started as administrator, which takes the launch and ignores the flag.
+    # Until 6.3.1 the launch went ahead, and Claude was said to run without
+    # the GPU. MainModule throws for it, as for a process this one may not
+    # open.
+    $unreadSaid = '[!] 1 running Claude process(es) could not be read (one started as administrator, or a Claude Code session), so Claude was not closed or started without the GPU: a copy already running takes the launch and ignores the flag. Close Claude and run this again.'
+    $shut = [pscustomobject]@{ Id = 79; ProcessName = 'claude'; PriorityClass = 'Normal' }
+    $shut | Add-Member -MemberType ScriptProperty -Name MainModule -Value { throw 'Access is denied' }
+    Reset-Generated
+    $script:Procs = @($shut)
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "a Claude process whose path cannot be read: nothing closed or started, and a message says why" ($out -eq 'EXIT 1' -and
+        $script:ProcCalls.Count -eq 0 -and $script:GenStarts.Count -eq 0 -and (Test-HostSaid $unreadSaid) -and -not (Test-HostSaid $runs)) (Get-Seen)
+
+    Reset-Generated
+    $script:Procs = @((New-GenClaude 77), $shut)
+    $out = Invoke-GeneratedScript $launcher $allowed
+    Assert-Case "and beside a Claude that can be read: that one is not closed either" ($out -eq 'EXIT 1' -and
+        $script:ProcCalls.Count -eq 0 -and $script:GenStarts.Count -eq 0 -and (Test-HostSaid $unreadSaid)) (Get-Seen)
+}
+
+# =====================================================================
 Invoke-Section 'What the script says it does' {
     $first = $pAst.EndBlock.Statements[0]
     $isRefusal = $first -is [System.Management.Automation.Language.IfStatementAst] -and $first.Clauses.Count -eq 1 -and
@@ -6367,9 +7587,373 @@ Invoke-Section 'What the script says it does' {
     Assert-Case "-Undo leaves the user's run-as-administrator marks alone" ($runAs.Count -eq 0) (($runAs | ForEach-Object { $_.Extent.Text }) -join ' / ')
 }
 
+# =====================================================================
+# 6.3.1: a file or folder that cannot be read is not one that is not
+# there. Test-Path answers $false for both (measured 2026-11-23, an explicit
+# Deny on the folder that holds it), and until 6.3.1 each place below used
+# it: -Undo said there was nothing to undo or nothing left, setup recorded
+# the wrong plan as yours, installed the monitor or made the shortcuts from
+# another copy, and said it had checked what it had not.
+# $script:ItemReadFault makes a path unreadable to the fake Get-Item and
+# Test-Path alike.
+Invoke-Section 'Files and folders that cannot be read are not ones that are not there' {
+    $denied = 'Access is denied'
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); unread $($script:UndoUnread); undo: $(Get-UndoKeys); calls: $($script:TaskCalls -join ' / '); $($script:LogLines -join ' / ')" }
+    function Test-File { param([string]$Path) return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $Path) }
+    $flag = Join-Path $ClaudeAppData 'disable-dynamic-memory.flag'
+
+    # The Claude AppData folder, which setup makes first.
+    Reset-State
+    $script:ItemReadFault = $ClaudeAppData
+    $r = $null
+    $threw = ''
+    try { $r = Initialize-ClaudeAppData } catch { $threw = $_.Exception.Message }
+    Assert-Case "the Claude AppData folder cannot be read: setup stops, naming it and why" ($threw -eq "$ClaudeAppData could not be read ($denied)") "returned $r; threw $threw"
+    Reset-State
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $ClaudeAppData -Recurse -Force
+    $r = Initialize-ClaudeAppData
+    Assert-Case "and a folder that is not there is made" ($r -eq $true -and (Test-File $ClaudeAppData)) "returned $r"
+
+    # The undo record.
+    Reset-State
+    [System.IO.File]::WriteAllText($UndoFile, '{"Version":1,"Items":[]}')
+    $script:ItemReadFault = $UndoFile
+    $threw = ''
+    try { Read-PreventUndo } catch { $threw = $_.Exception.Message }
+    Assert-Case "an undo record that cannot be read: the run stops before anything is changed, naming it and why" (
+        $threw -eq "The undo record $UndoFile could not be read ($denied). Nothing was changed. Move the file aside and rerun.") $threw
+    Reset-State
+    [System.IO.File]::WriteAllText($UndoFile, '{"Version":1,"Items":[]}')
+    $script:UndoRecord = New-Object System.Collections.ArrayList
+    $script:ItemReadFault = $UndoFile
+    $threw = ''
+    try { Save-PreventUndo } catch { $threw = $_.Exception.Message }
+    Assert-Case "an emptied record over one that cannot be read: it says so, and the file is kept" (
+        $threw -eq "The undo record $UndoFile could not be read ($denied), so it was not emptied." -and (Test-File $UndoFile)) $threw
+
+    # Remove-PreventFile, which -Undo steps 3 to 5 remove files with.
+    $f = Join-Path $ClaudeAppData 'Launch-Claude-NoGPU.cmd'
+    Reset-State
+    $script:UndoMode = $true
+    [System.IO.File]::WriteAllText($f, 'x')
+    $script:ItemReadFault = $f
+    Step 5 5 'launchers' -Name 'Launchers'
+    $r = Remove-PreventFile -Path $f
+    Assert-Case "a file to remove that cannot be read: kept, counted as there, a Warning that names it and why, and -Undo not complete" ($r -eq $true -and
+        (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq "$f could not be read ($denied), so it was not removed" -and $script:UndoUnread -and
+        (Test-File $f)) (Get-Seen)
+    Reset-State
+    [System.IO.File]::WriteAllText($f, 'x')
+    $script:ItemReadFaultAfterRemove = $f
+    Step 5 5 'launchers' -Name 'Launchers'
+    $r = Remove-PreventFile -Path $f
+    Assert-Case "a file removed, whether it is gone then cannot be read: Failed, and not said removed" ($r -eq $true -and (Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes) -eq "Could not remove ${f}: whether it is gone could not be read ($denied)" -and -not (Test-LogHas '^Removed: ')) (Get-Seen)
+
+    # -Undo step 4.
+    $desk = Join-Path $fakeDesktop 'Fix Claude Desktop.lnk'
+    Reset-State
+    $script:UndoMode = $true
+    [System.IO.File]::WriteAllText($desk, 'lnk')
+    $script:ItemReadFault = $desk
+    Invoke-UndoStep4
+    Assert-Case "-Undo step 4, a shortcut that cannot be read: a Warning that names it, no 'No shortcuts found', and -Undo not complete" (
+        (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes) -eq "$desk could not be read ($denied), so it was not removed" -and
+        -not (Test-LogHas '^No shortcuts found$') -and $script:UndoUnread -and (Test-File $desk)) (Get-Seen)
+
+    # -Undo step 2, where an older version ran: the record of that keeps the
+    # files from being read for it, so each is read only here.
+    foreach ($c in @(
+            @($BackupFile, 'the plan it holds was not put back, and it was not removed'),
+            @($CsBackupFile, 'Connected Standby was not put back from it, and it was not removed'),
+            @($flag, 'it was not removed'))) {
+        Reset-State
+        Set-PowerFixture
+        $script:UndoMode = $true
+        Add-LegacyTrace
+        [System.IO.File]::WriteAllText($c[0], "$plHigh`r`n")
+        $script:ItemReadFault = $c[0]
+        Invoke-UndoStep2
+        Assert-Case "-Undo step 2, $(Split-Path $c[0] -Leaf) cannot be read: a Warning that names it, the mark of an older version kept, and -Undo not complete" (
+            (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes).Contains("$($c[0]) could not be read ($denied), so $($c[1])") -and
+            $null -ne (Find-Undo 'LegacyInstall' 'Dynamic Memory flag') -and $script:UndoUnread -and (Test-File $c[0]) -and
+            -not (Test-LogHas '^Nothing from older versions found$')) (Get-Seen)
+    }
+
+    # Setup step 1: an older version's record of your plan.
+    Reset-State
+    Set-PowerFixture
+    [System.IO.File]::WriteAllText($BackupFile, "$plHigh`r`n")
+    $script:ItemReadFault = $BackupFile
+    Invoke-SetupStep1
+    Assert-Case "setup step 1, an older version's plan record that cannot be read: the step stops, no plan is recorded as yours, and the record is kept" (
+        (Get-StepStatus) -eq 'Failed' -and $null -eq (Find-Undo 'PowerPlan' 'Active') -and (Test-File $BackupFile) -and
+        (Get-StepNotes).Contains("the older version's record of your plan, $BackupFile, could not be read ($denied), so the plan you had is not recorded yet, and the record is kept")) (Get-Seen)
+    Reset-State
+    Set-PowerFixture
+    Add-PreventUndoItem -Kind PowerPlan -Key Active -Original $plBal
+    [System.IO.File]::WriteAllText($BackupFile, "$plHigh`r`n")
+    $script:ItemReadFault = $BackupFile
+    Invoke-SetupStep1
+    Assert-Case "and with your plan recorded already: a Warning that it was not recorded or removed, and it is kept" (
+        (Get-StepNotes).Contains("$BackupFile could not be read ($denied), so it was not recorded or removed") -and (Get-StepStatus) -eq 'Warning' -and
+        $null -eq (Find-Undo 'LegacyInstall' 'power plan record') -and (Test-File $BackupFile)) (Get-Seen)
+
+    # Setup step 15: the monitor's script, and the old watchdog script.
+    $kit = Join-Path $sandbox 'kit-unread'
+    $null = Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $kit -Force
+    $beside = Join-Path $kit 'Watch-ClaudeHealth.ps1'
+    [System.IO.File]::WriteAllText($beside, '# the monitor')
+    $null = Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $fakeKitRoot -Force
+    $other = Join-Path $fakeKitRoot 'Watch-ClaudeHealth.ps1'
+    [System.IO.File]::WriteAllText($other, '# another copy')
+    Reset-State
+    $script:TaskInstallExpected = $true
+    $script:FakeCommandPath = Join-Path $kit 'Prevent-ClaudeIssues.ps1'
+    $script:ItemReadFault = $beside
+    Invoke-Step15
+    Assert-Case "setup step 15, the monitor's script beside Prevent cannot be read: Failed, saying why, and the copy in C:\ClaudeFix not installed" (
+        (Get-StepStatus) -eq 'Failed' -and $script:TaskCalls.Count -eq 0 -and $null -eq $script:RegisteredTask -and
+        (Get-StepNotes) -eq "Could not look for Watch-ClaudeHealth.ps1, because $beside could not be read ($denied), so the health monitor was not installed") (Get-Seen)
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $other -Force
+    $oldWd = Join-Path $ClaudeAppData 'cowork-watchdog.ps1'
+    Reset-State
+    [System.IO.File]::WriteAllText($oldWd, '# old')
+    $script:ItemReadFault = $oldWd
+    Step 15 19 'monitor' -Name 'Health monitor'
+    Invoke-Step15Legacy
+    Assert-Case "an old watchdog script that cannot be read: kept, not recorded, and a Warning that names it" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "$oldWd could not be read ($denied), so it was not recorded or removed" -and
+        $null -eq (Find-Undo 'LegacyInstall' 'watchdog script') -and (Test-File $oldWd)) (Get-Seen)
+
+    # Setup step 16: the Fix Claude Desktop shortcuts.
+    $kit16 = Join-Path $sandbox 'kit16'
+    $null = Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $kit16 -Force
+    $bat = Join-Path $kit16 'Fix-ClaudeDesktop.bat'
+    [System.IO.File]::WriteAllText($bat, '@echo off')
+    function Get-Targets { return (@($script:SavedShortcuts | ForEach-Object { [string]$_.TargetPath }) -join ',') }
+    Reset-State
+    $script:FakeCommandPath = Join-Path $kit16 'Prevent-ClaudeIssues.ps1'
+    Invoke-Step16
+    Assert-Case "setup step 16: both shortcuts start the launcher beside Prevent" ((Get-StepStatus) -eq 'Done' -and (Get-Targets) -eq "$bat,$bat") "$(Get-Seen); $(Get-Targets)"
+    $null = Microsoft.PowerShell.Management\New-Item -ItemType Directory -Path $fakeKitRoot -Force
+    $otherPs1 = Join-Path $fakeKitRoot 'Fix-ClaudeDesktop.ps1'
+    $otherBat = Join-Path $fakeKitRoot 'Fix-ClaudeDesktop.bat'
+    [System.IO.File]::WriteAllText($otherPs1, '# another copy')
+    [System.IO.File]::WriteAllText($otherBat, '@echo off')
+    Reset-State
+    $script:FakeCommandPath = Join-Path $kit16 'Prevent-ClaudeIssues.ps1'
+    $script:ItemReadFault = $bat
+    Invoke-Step16
+    Assert-Case "the launcher beside Prevent cannot be read: Failed, saying why, and no shortcut made to the copy in C:\ClaudeFix" (
+        (Get-StepStatus) -eq 'Failed' -and $script:SavedShortcuts.Count -eq 0 -and
+        (Get-StepNotes) -eq "Could not look for Fix-ClaudeDesktop.bat, because $bat could not be read ($denied), so the shortcuts were not made") "$(Get-Seen); $(Get-Targets)"
+    Reset-State
+    $script:FakeCommandPath = Join-Path $sandbox 'elsewhere\Prevent-ClaudeIssues.ps1'
+    Invoke-Step16
+    Assert-Case "no launcher beside Prevent: the shortcuts start the copy beside the Fix script in C:\ClaudeFix" ((Get-StepStatus) -eq 'Done' -and
+        (Get-Targets) -eq "$otherBat,$otherBat") "$(Get-Seen); $(Get-Targets)"
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $otherPs1, $otherBat -Force
+
+    # Setup step 17: the .cmd launcher versions up to 6.1.0 made.
+    $oldCmd = Join-Path $ClaudeAppData 'Launch-Claude-Admin.cmd'
+    Reset-State
+    [System.IO.File]::WriteAllText($oldCmd, '@echo off')
+    $script:ItemReadFault = $oldCmd
+    Step 17 19 'admin' -Name 'Claude (Admin) launcher'
+    Invoke-Step17Legacy
+    Assert-Case "setup step 17, an old .cmd launcher that cannot be read: kept, not recorded, and a Warning that names it" ((Get-StepStatus) -eq 'Warning' -and
+        (Get-StepNotes) -eq "$oldCmd could not be read ($denied), so it was not recorded or removed" -and
+        $null -eq (Find-Undo 'LegacyInstall' 'admin launcher') -and (Test-File $oldCmd)) (Get-Seen)
+
+    # Setup step 19, where an older version ran.
+    foreach ($c in @(
+            @($flag, 'it was not recorded or removed'),
+            @($CsBackupFile, 'whether Connected Standby is left as an older version set it is not known'))) {
+        Reset-State
+        Add-LegacyTrace
+        [System.IO.File]::WriteAllText($c[0], '0')
+        $script:ItemReadFault = $c[0]
+        Invoke-Step19
+        Assert-Case "setup step 19, $(Split-Path $c[0] -Leaf) cannot be read: a Warning that names it, and no 'Nothing left from older versions'" (
+            (Get-StepStatus) -eq 'Warning' -and (Get-StepNotes).Contains("$($c[0]) could not be read ($denied), so $($c[1])") -and
+            -not (Test-LogHas '^Nothing left from older versions$') -and (Test-File $c[0])) (Get-Seen)
+    }
+    Reset-State
+}
+
+Invoke-Section 'Registry keys that cannot be opened are not ones with no value' {
+    # Until 6.3.1 Get-RegistryValue read any error as a value that is not
+    # there: a step recorded "there was none" before it wrote one, and -Undo
+    # said it removed a value it never looked at.
+    $refused = 'Requested registry access is not allowed.'
+    $policyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); unread $($script:UndoUnread); undo: $(Get-UndoKeys); calls: $($script:Calls -join ' / '); $($script:LogLines -join ' / ')" }
+    function New-UndoItem { param([string]$Kind, [string]$Key, $Original) return [pscustomobject]@{ Kind = $Kind; Key = $Key; Original = $Original } }
+
+    Reset-State
+    Set-FakeRegValue 'HKLM:\T\Shut' 'V' ([int]5)
+    Set-FakeRegValue 'HKLM:\T\Open' 'V' ([int]5)
+    $script:RegItemReadFault = 'HKLM:\T\Shut'
+    $v = 'unset'
+    $err = $null
+    try { $v = Get-RegistryValue -Path 'HKLM:\T\Shut' -Name 'V' } catch { $err = $_.Exception.Message }
+    Assert-Case "Get-RegistryValue, a key that cannot be opened: throws, naming the value, the key and why" (
+        $err -eq "The registry value V in HKLM:\T\Shut could not be read ($refused)") "got '$v'; error: $err"
+    $err = $null
+    $a = 'unset'; $b2 = 'unset'; $c = 'unset'
+    try {
+        $a = Get-RegistryValue -Path 'HKLM:\T\Open' -Name 'V'
+        $b2 = Get-RegistryValue -Path 'HKLM:\T\Open' -Name 'Absent'
+        $c = Get-RegistryValue -Path 'HKLM:\T\NoSuchKey' -Name 'V'
+    } catch { $err = $_.Exception.Message }
+    Assert-Case "and a value that is there, one that is not and a key that is not are read as before" (
+        $null -eq $err -and $a -eq 5 -and $null -eq $b2 -and $null -eq $c) "error: $err; got '$a' '$b2' '$c'"
+
+    $r = 'unset'
+    $err = $null
+    try { $r = Write-RecordedDword -Path 'HKLM:\T\Shut' -Name 'V' -Value 1 } catch { $err = $_.Exception.Message }
+    Assert-Case "Write-RecordedDword, a key that cannot be opened: throws, and nothing is recorded or written" (
+        $err -eq "The registry value V in HKLM:\T\Shut could not be read ($refused)" -and $script:UndoRecord.Count -eq 0 -and
+        $script:Calls.Count -eq 0 -and (Get-FakeRegValue 'HKLM:\T\Shut' 'V') -eq 5) "got $r; error: $err; $(Get-UndoKeys); calls: $($script:Calls -join ' / ')"
+
+    # The MachineGuid is best effort: the record is then told apart by the
+    # computer's name, as for a record that holds none.
+    Reset-State
+    Set-FakeRegValue 'HKLM:\SOFTWARE\Microsoft\Cryptography' 'MachineGuid' 'abc'
+    $script:RegItemReadFault = 'HKLM:\SOFTWARE\Microsoft\Cryptography'
+    $g = 'unset'
+    $err = $null
+    try { $g = Get-PreventMachineGuid } catch { $err = $_.Exception.Message }
+    Assert-Case "Get-PreventMachineGuid, its key cannot be opened: '', and the run goes on" ($null -eq $err -and $g -eq '') "got '$g'; error: $err"
+
+    # -Undo step 1, a value recorded as none.
+    Reset-State
+    Set-PowerFixture
+    Set-FakeRegValue 'HKLM:\T\Shut' 'V' ([int]1)
+    $null = $script:UndoRecord.Add((New-UndoItem 'Registry' 'HKLM:\T\Shut|V' $null))
+    $script:RegItemReadFault = 'HKLM:\T\Shut'
+    Invoke-UndoStep1
+    Assert-Case "-Undo step 1, a value recorded as none in a key that cannot be opened: Failed, naming it, not said removed, and its record kept" (
+        (Get-StepStatus) -eq 'Failed' -and
+        @((Get-StepNotes) -split ' \| ') -contains "Registry HKLM:\T\Shut|V: The registry value V in HKLM:\T\Shut could not be read ($refused)" -and
+        -not (Test-LogHas 'there was none') -and $null -ne (Find-Undo 'Registry' 'HKLM:\T\Shut|V') -and
+        (Get-FakeRegValue 'HKLM:\T\Shut' 'V') -eq 1) (Get-Seen)
+
+    # -Undo step 2, where an older version ran.
+    Reset-State
+    Add-LegacyTrace
+    Set-FakeRegValue $policyPath 'LocalAccountTokenFilterPolicy' ([int]1)
+    $script:RegItemReadFault = $policyPath
+    Invoke-UndoStep2
+    Assert-Case "-Undo step 2, the policy key cannot be opened: Failed, naming it, the value left, and the mark of an older version kept" (
+        (Get-StepStatus) -eq 'Failed' -and
+        @((Get-StepNotes) -split ' \| ') -contains "The registry value LocalAccountTokenFilterPolicy in $policyPath could not be read ($refused)" -and
+        (Get-FakeRegValue $policyPath 'LocalAccountTokenFilterPolicy') -eq 1 -and $null -ne (Find-Undo 'LegacyInstall' 'Dynamic Memory flag') -and
+        -not (Test-LogHas '^Nothing from older versions found$')) (Get-Seen)
+
+    # Setup step 19.
+    Reset-State
+    Set-FakeRegValue $policyPath 'LocalAccountTokenFilterPolicy' ([int]1)
+    $script:RegItemReadFault = $policyPath
+    Invoke-Step19
+    Assert-Case "setup step 19, the policy key cannot be opened: Failed, naming it, and no 'Nothing left from older versions'" (
+        (Get-StepStatus) -eq 'Failed' -and
+        (Get-StepNotes).Contains("The registry value LocalAccountTokenFilterPolicy in $policyPath could not be read ($refused)") -and
+        -not (Test-LogHas '^Nothing left from older versions$')) (Get-Seen)
+    Reset-State
+}
+
+Invoke-Section 'A file that cannot be removed is named' {
+    # Until 6.3.1 these removals let Remove-Item's error through as it came,
+    # and for a file the user may not delete it does not name the file
+    # (measured 2026-11-23): the step said what failed, but not on which file.
+    function Get-Seen { return "$(Get-StepStatus): $(Get-StepNotes); undo: $(Get-UndoKeys); $($script:LogLines -join ' / ')" }
+    function Test-File { param([string]$Path) return (Microsoft.PowerShell.Management\Test-Path -LiteralPath $Path) }
+    $refusedRm = 'Access to the path is denied.'
+    $flag = Join-Path $ClaudeAppData 'disable-dynamic-memory.flag'
+
+    # Emptying the undo record.
+    Reset-State
+    [System.IO.File]::WriteAllText($UndoFile, '{"Version":1,"Items":[]}')
+    $script:UndoRecord = New-Object System.Collections.ArrayList
+    $script:FileRemoveFault = $UndoFile
+    $threw = ''
+    try { Save-PreventUndo } catch { $threw = $_.Exception.Message }
+    Assert-Case "an emptied record that cannot be removed: it throws, naming it and why, and the file is kept" (
+        $threw -eq "$UndoFile could not be removed ($refusedRm)" -and (Test-File $UndoFile)) $threw
+
+    # -Undo step 2, an older version's record of your plan: once your plan
+    # is put back from it, and once step 1 has put it back from this
+    # script's own record.
+    foreach ($restored in @($false, $true)) {
+        Reset-State
+        Set-PowerFixture
+        $script:UndoMode = $true
+        Add-LegacyTrace
+        $script:FakePlanRestored = $restored
+        [System.IO.File]::WriteAllText($BackupFile, "$plHigh`r`n")
+        $script:FileRemoveFault = $BackupFile
+        Invoke-UndoStep2
+        Assert-Case "-Undo step 2, the older version's plan record cannot be removed (plan put back by step 1: $restored): Failed, naming it and why, and the mark of an older version kept" (
+            (Get-StepStatus) -eq 'Failed' -and (Get-StepNotes).Contains("$BackupFile could not be removed ($refusedRm)") -and
+            $null -ne (Find-Undo 'LegacyInstall' 'Dynamic Memory flag') -and (Test-File $BackupFile)) (Get-Seen)
+    }
+
+    # -Undo step 2, Connected Standby: put back, and its record not removed.
+    Reset-State
+    Set-PowerFixture
+    $script:UndoMode = $true
+    Add-LegacyTrace
+    Set-FakeRegValue $powerKey 'CsEnabled' ([int]0)
+    [System.IO.File]::WriteAllText($CsBackupFile, '1')
+    $script:FileRemoveFault = $CsBackupFile
+    Invoke-UndoStep2
+    Assert-Case "-Undo step 2, CsEnabled put back and its record cannot be removed: Failed, saying it was put back, naming the record and why" (
+        (Get-StepStatus) -eq 'Failed' -and
+        @((Get-StepNotes) -split ' \| ') -contains "CsEnabled (Connected Standby) was put back to 1, but $CsBackupFile could not be removed ($refusedRm)" -and
+        (Get-FakeRegValue $powerKey 'CsEnabled') -eq 1 -and (Get-LastStep).Reboot -and -not (Test-LogHas 'Could not put back CsEnabled') -and
+        (Test-File $CsBackupFile)) (Get-Seen)
+
+    # -Undo step 2, the Dynamic Memory flag.
+    Reset-State
+    Set-PowerFixture
+    $script:UndoMode = $true
+    Add-LegacyTrace
+    [System.IO.File]::WriteAllText($flag, '')
+    $script:FileRemoveFault = $flag
+    Invoke-UndoStep2
+    Assert-Case "-Undo step 2, the Dynamic Memory flag cannot be removed: Failed, naming it and why, and the mark of an older version kept" (
+        (Get-StepStatus) -eq 'Failed' -and (Get-StepNotes).Contains("$flag could not be removed ($refusedRm)") -and
+        $null -ne (Find-Undo 'LegacyInstall' 'Dynamic Memory flag') -and (Test-File $flag)) (Get-Seen)
+
+    # Setup step 1, an older version's record of your plan.
+    Reset-State
+    Set-PowerFixture
+    [System.IO.File]::WriteAllText($BackupFile, "$plHigh`r`n")
+    $script:FileRemoveFault = $BackupFile
+    Invoke-SetupStep1
+    Assert-Case "setup step 1, an older version's plan record that cannot be removed: Failed, naming it and why, and it is kept" (
+        (Get-StepStatus) -eq 'Failed' -and (Get-StepNotes).Contains("$BackupFile could not be removed ($refusedRm)") -and
+        (Test-File $BackupFile)) (Get-Seen)
+
+    # Setup step 19, the Dynamic Memory flag.
+    Reset-State
+    Add-LegacyTrace
+    [System.IO.File]::WriteAllText($flag, '0')
+    $script:FileRemoveFault = $flag
+    Invoke-Step19
+    Assert-Case "setup step 19, the Dynamic Memory flag cannot be removed: Failed, naming it and why, and it is kept" (
+        (Get-StepStatus) -eq 'Failed' -and (Get-StepNotes).Contains("$flag could not be removed ($refusedRm)") -and
+        (Test-File $flag)) (Get-Seen)
+    Reset-State
+}
+
 # ---------------------------------------------------------------------
 Write-Host ""
 Assert-Case "no tripwire was touched" ($script:Tripped.Count -eq 0) ($script:Tripped -join ' / ')
+# Best effort: every case is counted by now, and a folder left in %TEMP%
+# changes nothing.
 Microsoft.PowerShell.Management\Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ""

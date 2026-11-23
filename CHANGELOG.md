@@ -8,6 +8,514 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.3.1] - 2026-11-23
+
+A read that fails is no longer taken as an answer. Many of the toolkit's reads
+of a service, the running processes, a scheduled task, a folder or a log
+passed over an error, so a read that failed looked like "not installed", "not
+running", "not found" or "nothing recent", and the scripts acted on that. Each
+of those reads now tells "not there" from "could not be read" by the error's
+identity, and says what it could not read and why. Where the answer decides
+whether something is stopped, killed, restarted or deleted, or whether a
+repair may run, a read that failed changes nothing and holds the repair back.
+
+The Claude (Admin) and Claude (no GPU) launchers are written by Prevent, so
+run `Prevent-ClaudeIssues.bat` again to get the launcher fixes below.
+
+### Fixed
+
+- Finding the app says what it could not read.
+
+  Fix, Prevent and the health monitor first look up where the app and its
+  data live. An `hcsdiag.exe` that could not be read was called not present,
+  a VM log folder that could not be read was passed over as one with no VM
+  log, and when `Claude.exe` was not located, a place that could not be read
+  went unsaid, so not located read as not installed. Each is now a read
+  error, naming the path and why, shown with the other reads this lookup
+  could not make: at the top of Fix's log, as `READ ERROR at start` in the
+  health monitor, and as step 0 in Prevent. A VM cache folder that could not
+  be read makes the cache size in `fix-logs\claude-env.json` a lower bound,
+  and says so, naming the folder. A folder named `claude.exe` is no longer
+  taken for the app, and the lookup no longer fails when `LOCALAPPDATA` is
+  not set.
+
+- Prevent and `-Undo` say what they could not read about this PC.
+
+  Before step 1, Prevent and `-Undo` look up where the app and its data live.
+  A read they could not make there went unsaid. Each one is now printed
+  before step 1, and the summary lists them first, as step 0,
+  "Looking at this PC", with the outcome Warning. They do not change the exit
+  code.
+
+- Prevent and `-Undo` no longer take a service, process, scheduled task or
+  file they could not read as one that is not there.
+
+  Each is now reported as unreadable, with the reason, and the step changes
+  nothing on it. `-Undo` keeps what it could not check, such as a service's
+  recorded recovery settings, ends with UNDO INCOMPLETE and exits 1, so the
+  next `-Undo` looks again. A health monitor whose stop cannot be checked
+  fails `-Undo` step 3. In setup, step 8 does not raise a Cowork VM worker it
+  cannot read, step 9 fails when it cannot read vmcompute, step 12 does not
+  start a Windows Time service it cannot read and does not check the clock
+  then, and step 13 warns that an antivirus that is not Defender may go
+  unreported when it cannot list the running processes.
+
+- Prevent stops, naming it, when it cannot read the Claude folder in
+  `%APPDATA%` or the undo record.
+
+  Setup took a Claude folder it could not read for one that is not there, and
+  said it could not be created. Prevent and `-Undo` took an undo record they
+  could not read for none, so `-Undo` said there was nothing to undo. Each
+  now stops the run before anything changes, naming the folder or file and
+  why.
+
+- `-Undo` keeps a file it cannot read, and says so.
+
+  The files older versions left, the Fix Claude Desktop shortcuts and the
+  launcher files were taken for none when they could not be read, so `-Undo`
+  could say "No shortcuts found" while one was left. Each is now a Warning
+  naming it, the file is kept, and `-Undo` ends UNDO INCOMPLETE, so the next
+  `-Undo` looks again. A removal whose result cannot be read fails the step.
+
+  A file that cannot be removed is named in the step's outcome, where the
+  error did not name it, and `-Undo` says `CsEnabled` was put back when only
+  its backup could not be removed, where it said it could not put it back.
+
+- A registry value whose key cannot be opened fails the step that reads it.
+
+  It read as a value that is not there, so a step could record that there was
+  none before it wrote one, and `-Undo` would then delete the value instead
+  of putting it back. The step now fails, naming the value, the key and why.
+
+- Step 10 leaves the cowork-vm instances alone when it cannot list the claude
+  processes.
+
+  Whether Claude is running is not known then, so nothing is removed, and the
+  step warns.
+
+- Steps 8 and 10 warn when they cannot read `hcsdiag.exe`.
+
+  They said Skipped, "hcsdiag.exe is not available". The Warning now names it
+  and why: step 8 raises no VM worker, since the Cowork VM's cannot be told
+  from the others, and step 10 looks for no stale Cowork VM.
+
+- Step 11 warns when it cannot read the VM cache folder, and still checks its
+  drive.
+
+  It read as no VM cache: whether the cache is on a network drive was not
+  checked, and the step said "Storage location OK".
+
+- Step 1 fails on power plans, or an older version's power-plan record, that
+  it cannot read.
+
+  Step 1 and `-Undo` step 2 took an older version's `power-plan-backup.txt`
+  that could not be read for an empty one. They now fail and keep the record
+  for the next run. Power plans that cannot be read from the registry were
+  taken for none, so another Ultimate Performance copy was made. They now fail
+  step 1, and no copy is made.
+
+  When whether the record is there cannot be read, step 1 fails the same way
+  while the plan you had is not yet recorded. Once it is, and in `-Undo`,
+  that is a Warning, the record is kept, and `-Undo` ends UNDO INCOMPLETE.
+
+- Step 14 reads wsl.exe's exit code.
+
+  A `wsl.exe -l -v` that failed read as "No WSL2 distro running". A non-zero
+  exit now counts as no distro only while neither WSLService nor LxssManager
+  runs. While one of them does, the step warns and names the exit code and
+  the first line wsl.exe printed. A WSL feature that cannot be read is a
+  Warning too.
+
+  A `wsl.exe` that cannot be read is a Warning naming it, where it read as
+  "No WSL2 distro running".
+
+- Step 15 says "Started it now" only when the monitor's task runs.
+
+  The scheduler ignores a start while the task still reads as running, and
+  the old monitor can take a moment to end. The step now waits up to 5
+  seconds for the task to stop reading as running, starts it, and checks for
+  up to 3 seconds that it runs. When it still reads as running, its state
+  cannot be read before the start, the start fails, or it reads another state
+  3 seconds after the start, the step warns that the monitor starts at the
+  next logon. When the task is no longer there 3 seconds after the start, the
+  step warns that it is gone, and when its state cannot be read then, that
+  whether the monitor runs could not be checked. When it cannot read whether
+  the old monitor stopped, it warns and starts nothing now.
+
+- Steps 15 and 16 fail when a place they look for the toolkit's scripts
+  cannot be read.
+
+  They look beside Prevent, then in `C:\ClaudeFix`, the Desktop and
+  Documents. A place that could not be read was passed over, so the health
+  monitor could be installed, or the shortcuts made, from an older copy found
+  later, and with none found the step said the script was not beside Prevent.
+  The step now fails, naming the place and why, and installs nothing from
+  elsewhere.
+
+- Steps 15, 17 and 19 warn about an older version's file they cannot read.
+
+  `cowork-watchdog.ps1`, `Launch-Claude-Admin.cmd`,
+  `disable-dynamic-memory.flag` and `connected-standby-backup.txt` were
+  passed over as gone when they could not be read. Each is now a Warning
+  naming it and why, and the file is kept.
+
+- Step 17 fails when the scheduler refuses the Claude (Admin) task.
+
+  The step now fails with the scheduler's reason, and no shortcut is made. A
+  Claude (Admin) shortcut an earlier run left on the Desktop, whose task is
+  gone, is removed. An old task that cannot be read or removed is a Warning.
+
+- Neither launcher starts Claude when the running processes cannot be read.
+
+  The Claude (Admin) launcher shows "Claude was not started" with the reason,
+  and exits 1. The Claude (no GPU) launcher says so and waits for Enter. It
+  also no longer starts Claude again without the GPU while a copy it tried to
+  close is still running, or when whether it closed cannot be read, and it
+  says when it cannot check that the Claude it started runs.
+
+  The Claude (Admin) launcher also shows "Claude was not started", with the
+  reason, when `Claude.exe` at a place it looks, or the list of app packages,
+  cannot be read, and starts no Claude from a later place. A folder named
+  `Claude.exe` is not taken for it.
+
+  The Claude (no GPU) launcher closes nothing and starts nothing while a
+  running Claude process cannot be read, as one started as administrator or a
+  Claude Code session, since a copy already running takes the launch and
+  ignores the flag. It went ahead, and then said Claude ran without the GPU
+  or had not started.
+
+- Step 19 and `-Undo` step 2 say when they cannot tell whether an older
+  version ran here.
+
+  They tell by the files and the boot-fix task older versions left. When
+  those cannot be read, the values `-Undo` removes only where an older version
+  ran (ServicesPipeTimeout, LocalAccountTokenFilterPolicy and
+  FilterAdministratorToken at the values older versions set) are left as they
+  are, with a warning, and `-Undo` ends UNDO INCOMPLETE. Step 19 warns when it
+  cannot read the boot-fix task `\Claude\ClaudeCoworkBootFix`, which is then
+  neither checked nor removed, and when it cannot read CoworkVMService, whose
+  restart recovery from older versions is then not checked.
+
+- Fix says each read it would act on that fails, and no longer acts on it as
+  on an empty one.
+
+  Each one is now said, with the reason, mostly in a DarkYellow `[!] ...
+  could not be read (reason)` or `could not be listed` line, and Fix does not
+  take the action an empty read would have justified: it does not stop, kill,
+  restart, purge or delete on it. A few reads that decide nothing stay
+  silent, such as the cache size that only extends the Step 9 wait. The reads
+  discovery could not make are logged at the top of the run, and old logs,
+  old VHDX backups and a discovery record that could not be cleaned up or
+  saved are said once logging starts.
+
+  Step 3 says when it cannot read the Claude log folder, which was passed
+  over as one with no HCS error. A taskbar flash that cannot be loaded no
+  longer prints a red Add-Type error.
+
+- Fix passes over a Claude.exe path it cannot read, and says so, and no
+  longer takes a folder for it.
+
+  A cached path, the App Paths key or a Start Menu folder that cannot be read
+  is named and passed over, and the cached path is kept. When the cached
+  path, the App Paths key or a Start Menu shortcut named a folder, Step 8
+  started it, which opened the folder in Explorer instead of starting Claude.
+  A folder is now passed over.
+
+- `-Quiet` holds a repair back on a read it cannot make.
+
+  The Claude Code sessions the app started, the Claude Code transcripts, the
+  processes named claude, their CPU time, the VM logs and the time of the last
+  keyboard or mouse input could each be passed over when they could not be
+  read, so an unattended repair could close the app under a working session.
+  Each one now holds the run back: Fix logs `BLOCKED: <what could not be
+  read>, skipping automated fix` and exits 3.
+
+  The reason says why each read failed: an input check that could not be
+  loaded gives its error, and a transcript folder that could not be read is
+  named.
+
+- Fix stops nothing on a process list it cannot read.
+
+  Step 0 leaves a stale cowork-vm for Step 5, and says so, when whether
+  Claude is running cannot be read. Steps 1 and 4 and `-Close` say when
+  Claude's processes, or cowork-svc's, could not be listed, and stop none of
+  them. Step 1 and `-Close` count only the processes that stopped, with
+  `[!] N could not be stopped (reason)` after it, and `-Close` no longer calls
+  the shutdown complete when its process list could not be read. Step 5 stops
+  no VM worker when it cannot list them, and says the check did not finish.
+
+- Fix does not stop, force-kill or restart a service it cannot read.
+
+  Steps 2 and 9, `-Close` and the service restart say why instead, and a stop
+  that was refused says "Asking ... to stop failed (reason)" instead of
+  nothing. Step 3 still restarts vmcompute on HCS errors, but when whether it
+  came back cannot be read it escalates no further, and it does not restart a
+  vmms or HvHost it cannot read. A vmms or HvHost restart that reported an
+  error is said instead of being called restarted. Smart mode does not
+  escalate to Deep when the service's state cannot be read. The wait for the
+  service process to exit says when the process list could not be read, with
+  the warning that the VHDX files may be locked.
+
+- Step 9 does not escalate or retry on a VM log it cannot read, and the run
+  then exits 1.
+
+  A guest that says it is connected, with a VM log that could not be read,
+  no longer counts as ready. When a VM log could not be read, the run ends
+  with "Whether the workspace came up is not known: a VM log could not be
+  read", escalates and retries nothing on it, and exits 1; for a service
+  that cannot start (below), it ends with that cause instead. A
+  cowork-service.log that cannot be read is said once per run. After the
+  guest-connection timeout, "Service restarted" is said only when the start
+  went out, and "Continuing to wait..." otherwise.
+
+  The line that says a VM log could not be read names the log, or its folder
+  when the error gives no path.
+
+- Step 6, both escalation purges and the VHDX backup do not purge what they
+  cannot read.
+
+  A cache folder that cannot be read is reported as not purged; Step 6 called
+  it not present, and the escalation purges said nothing. A delete that
+  failed in part says "could not be removed in full" instead of "removed".
+  The VHDX backup does not purge when it cannot read whether a VHDX is in the
+  VM cache, and the free-space line says why the free space is unknown. With
+  the cache kept, by `-KeepCache`, Quick mode, or Smart mode before it
+  escalates, a cache folder that cannot be read is said.
+
+  When the app's data folder is not known, a Step 6 that purges says the
+  cache folders are not known; a Step 6 that keeps the cache, and the
+  escalation purges, pass over them. Step 6, the escalation purges and the
+  Diagnostic run stopped there with UNEXPECTED ERROR.
+
+  A VHDX restore no longer writes a backup over a file it could not read, and
+  says when a backup could not be read, and so was not restored.
+
+- Step 8 tries the other launch methods when it cannot read the
+  LaunchClaudeAdmin task.
+
+  It said "task not found, run Prevent". It now says the task could not be
+  read and falls back to the standard launch. When it finds no Start Menu
+  shortcut and part of the Start Menu could not be searched, it says so.
+
+- The HCS clean-up says when a kill could not be sent, and when it stopped on
+  an error.
+
+  Its non-critical lines now name the error.
+
+- `-PurgeSessions` says what it could not read or delete.
+
+  When the sessions folder cannot be read, it says so and purges nothing.
+  Part of the folder that cannot be read is said, and the files there are not
+  considered. It reports "Deleted N of M" with `[!] K could not be deleted`,
+  and keeps session folders it could not read in full.
+
+- `-Close` says what it did to the service process.
+
+  It says "No service process was running" when there was none, and "Killed
+  service process" only when a kill went out. When the service could not be
+  read, it ends with "Clean shutdown complete (whether the service is running
+  is not known)" and "Whether the service is running is not known: see the
+  warning above. If the relaunch fails, run Fix."
+
+- `-Diagnostics` and the final summary say "could not be read" instead of
+  absent.
+
+  The services, the vmcompute handle count, the HCS VMs, the session files,
+  the log listing and the Windows features say "could not be read" or "could
+  not be recorded", with the reason, where they reported a failed read as
+  absent or not configured. Without admin, the Defender line says "not
+  checked (needs admin to read the exclusions)". The final summary shows "VM
+  Service: could not be read (reason)" and "Claude processes: could not be
+  listed (reason)".
+
+  The VM cache folders say "could not be read" where they said "Not present",
+  and "Not known" when the app's data folder is not known. The support bundle
+  names each log it could not read or copy, and says it is not in the bundle,
+  where it was listed as skipped, and gives no "the Cowork VM may never have
+  started" note for a VM log it could not read.
+
+- `-WhatIf` on Fix no longer force-kills or starts the service process, or
+  reports either as done.
+
+- The health monitor says what it could not read at start, and a poll that
+  cannot list Claude's processes does nothing.
+
+  Each read discovery could not make is logged at start as `READ ERROR at
+  start`, and a start that could not list Claude's processes is said on its
+  own. A poll that cannot list Claude's processes checks nothing and does
+  nothing. The monitor's new "could not be read" lines that end with "the
+  same error is logged at most once an hour" are written at most once an
+  hour for the same check and error.
+
+- The health monitor's service check and staleness check do nothing on a read
+  they cannot make.
+
+  A CoworkVMService whose status could not be read counted as one that is not
+  installed. When the service or Claude's processes cannot be read, the
+  service check now says so and does nothing, and the count of failed checks
+  stays as it was. When the VM logs cannot be read, the staleness check says
+  so and does nothing.
+
+- The health monitor says when it cannot read the Windows Time service, and
+  does not start it then.
+
+  The clock is still measured every 5 minutes. A Windows Time service that is
+  not installed is still passed over without a word.
+
+- After a forced clock resync, the hour with no further forced resync runs
+  from when the resync finished, not from just before it.
+
+- The health monitor does not kill a Cowork VM as stale while it cannot tell
+  the live one.
+
+  When the VM workers cannot be listed, or a worker's command line or a
+  Cowork VM worker's start time cannot be read, no VM is killed, and this is
+  said.
+
+- A vmcompute process list or handle count that cannot be read is said,
+  naming the error, and no longer resets the run of high handle counts.
+
+- The restart of vmcompute after a spike of HCS failures is held when the
+  Cowork service or Claude's processes cannot be read, and this is said.
+
+- A Claude log folder that cannot be listed is said, and the log triggers
+  keep their place until it can be listed.
+
+  A folder that is not there is still silent.
+
+- The health monitor's guards answer "active" on a read they cannot make.
+
+  The Cowork guard takes a session to be active when the Cowork VM log cannot
+  be read or read through, so nothing that would end a session is done. The
+  Claude Code and user-activity guards answer "active" when a folder, the
+  process list or a CPU time could not be read, and say why at most once an
+  hour, where they were logged on every check.
+
+- A repair is deferred or cancelled when a read just before it fails.
+
+  A repair waits, saying why, when Claude's processes cannot be listed or
+  the start time of one of them cannot be read: a running Claude process
+  whose start time cannot be read is no longer taken as exited. The 30-second
+  grace period before a repair cancels it when Claude's processes, their CPU
+  time or the VM logs cannot be read.
+
+  Where the CPU time of a `claude` process cannot be read, the reason now
+  says too when whether it has ended could not be read, here and in Fix's
+  `-Quiet` check.
+
+- The health monitor's data-folder sync moves nothing while a candidate
+  folder cannot be read.
+
+  A candidate folder that disappears while it is listed is no longer reported
+  as unreadable.
+
+- The health monitor's stop line says the service's state is "not known"
+  when it could not be read, rather than "absent".
+
+- Watch logs over 30 days old that cannot be deleted are said, naming the
+  folder and the error.
+
+  This is checked at startup and at the daily rollover. A log folder that is
+  not there is not an error.
+
+- The health monitor says, after its startup banner, when the foreground
+  window and input checks could not be loaded, naming the error.
+
+- A background hcsdiag call that cannot run hcsdiag says why, at most once an
+  hour, instead of reading as hcsdiag not answering.
+
+- The health monitor holds automatic repairs for a cooldown when it cannot
+  read its saved state.
+
+  `watch-state.json` keeps the cooldown, the repairs of the last 30 minutes,
+  which stop a fourth after three, and a held-back repair. A file that was
+  there but could not be read or parsed read as no state at all, as on a
+  first start, so a repair loop bad enough to leave the file broken could run
+  again at once; an empty file, or one that could not be looked for, did so
+  without a word. Now a cooldown starts, as after a repair, and no automatic
+  repair runs until it is over. This is logged at most once an hour, as
+  `STATE: The state saved in ... could not be restored in full`, naming the
+  reason and how long no repair runs. A file that is not there is still a
+  first start.
+
+  A stealth-update marker written before the monitor started is then not
+  acted on, since whether the monitor before it relaunched Claude for it is
+  not known, and this is logged.
+
+- The health monitor stops, naming the error, when it cannot read its Fix
+  script.
+
+  It looks for `Fix-ClaudeDesktop.ps1` beside itself, then in `C:\ClaudeFix`,
+  the Desktop and Documents. A place that could not be read was passed over,
+  and the monitor started with a copy found later. It now stops with `FATAL:
+  Fix-ClaudeDesktop.ps1 at '...' could not be read`, naming the error.
+
+- A stealth-update marker the health monitor cannot look for is logged as
+  `STEALTH WARNING: marker at ... could not be read`, once while it lasts,
+  where it read as no marker.
+
+- The health monitor's storage check reports a VM cache folder it cannot
+  read, naming it, where it read as no VM cache. Each different storage
+  warning text, this one or a volume low on space, is logged at most once an
+  hour, with no cap on how many, so a new warning, or one whose text changes
+  to one not logged in that hour, is logged at once. The low-space warning
+  was written on every poll, about 120 times an hour.
+
+- The health monitor's `BLOCKED` and "still waiting" lines say why the Claude
+  Code sessions the app started could not be listed, or why the transcript
+  folder could not be read, naming it.
+
+- The `.bat` launchers start their script from a folder whose path holds a
+  parenthesis, or that may be read but not listed.
+
+  `Fix-ClaudeDesktop.bat`, `Stop-ClaudeDesktop.bat` and
+  `Watch-ClaudeHealth.bat` stopped with "... was unexpected at this time."
+  before running anything when their folder's path held a parenthesis, as in
+  "ClaudeFix (1)" or "Program Files (x86)". All four launchers said their
+  script was "not found" in a folder that may be read but not listed. When a
+  launcher cannot look for its script because its folder cannot be read, it
+  now says "could not be looked for: this folder could not be read", and
+  exits 1.
+
+  `Watch-ClaudeHealth.bat`'s message after the monitor stops on startup, and
+  its message when PowerShell could not run the script, now show when the
+  profile path holds a parenthesis.
+
+- The Quick Fix line in Fix's menu, in its `-Mode` help and in the README
+  says what Quick mode runs.
+
+  It said "Steps 1-5, skip cache purge". Quick mode runs every step but two:
+  the cache purge in Step 6, and the HvHost restart in Step 3, which only
+  Deep mode runs. The README's Smart mode escalation said the same of
+  Smart's first pass, and left out its second escalation, when the
+  workspace is not ready after Step 9.
+
+- Fix in Smart mode no longer purges the VM cache with `-KeepCache` set
+  (Keep cache [ON] in the menu).
+
+  Both of Smart's escalations to Deep purge the VM cache, and neither looked
+  at `-KeepCache`, so a Smart run set to keep the cache deleted the roughly
+  13 GB bundle when it escalated. Neither escalation runs with `-KeepCache`
+  now, and the run says `Smart mode: ... not escalating to Deep: -KeepCache
+  keeps the VM cache`; the retry cycle after Step 9 still runs.
+
+- Fix no longer escalates to Deep, or retries, after Step 9 on a service
+  that cannot start.
+
+  When the prerequisite check found that CoworkVMService cannot start, as
+  when it is disabled, and it was down when Step 9's wait began, the wait
+  was skipped, and a restart in the wait that failed on such a cause
+  stopped the wait; either way Smart mode's escalation after it still
+  purged the VM cache, and the retry cycle still restarted the service
+  three times with a wait of up to a minute each. Neither can fix that,
+  and neither runs then now: the run says
+  `Workspace not ready, but not retrying:` and the cause (in Smart mode as
+  administrator, before it has escalated to Deep,
+  `not escalating to Deep or retrying:`), and exits 1, as it did after the
+  retries. Step 9 no longer says then that the workspace was not confirmed
+  ready, after 0s when the wait was skipped, nor to open a Cowork session
+  to trigger setup.
+
 ## [6.3.0] - 2026-11-22
 
 If you ran Prevent from an older version, run `Prevent-ClaudeIssues.bat`

@@ -98,7 +98,7 @@
     Suppress console output (for scheduled task use).
 
 .NOTES
-    Version : 6.3.0
+    Version : 6.3.1
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -125,6 +125,169 @@ Set-StrictMode -Version Latest
 # 53 happened.
 # =====================================================================
 #region ClaudeEnv
+# -- Reads that tell "not there" from "could not read" ----------------------
+# Until 6.3.1 most reads in this toolkit passed -ErrorAction SilentlyContinue,
+# so a read that failed (access denied, a broken WMI, a service manager that
+# did not answer) came back empty and was taken as "nothing there": no such
+# service, no Claude process running. The helpers below answer "not there"
+# only for the one error that says so, told by its identity, and throw any
+# other error unchanged, so the caller can say what it could not read and
+# hold back what that read would have justified.
+
+function Test-ClaudeNotFoundError {
+    <#
+    .SYNOPSIS
+        Whether an error says the thing asked for is not there, rather than
+        that it could not be read.
+    .DESCRIPTION
+        Told by the error's identity, never by its message, which Windows
+        translates into the display language. All three must match: the
+        error id, the category, which must be ObjectNotFound, and the full
+        name of the exception type.
+
+        The error id is the FullyQualifiedErrorId up to its first comma.
+        PowerShell adds the name of the command that wrote the error after
+        the comma, and a test's stand-in for a cmdlet has a different name
+        from the cmdlet: measured 2026-11-22, a function named Get-FakeA that
+        writes id NoServiceFoundForGivenName arrives as
+        "NoServiceFoundForGivenName,Get-FakeA".
+    .PARAMETER ErrorId
+        The ids that mean "not there" for the command that was run.
+    .PARAMETER ExceptionType
+        The full name of the exception type that command raises for it.
+    #>
+    param(
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [string[]]$ErrorId,
+        [string]$ExceptionType
+    )
+    if ($null -eq $ErrorRecord -or $null -eq $ErrorRecord.Exception) { return $false }
+    $id = @("$($ErrorRecord.FullyQualifiedErrorId)" -split ',')[0]
+    return (($ErrorId -contains $id) -and
+            $ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound -and
+            $ErrorRecord.Exception.GetType().FullName -eq $ExceptionType)
+}
+
+function Get-ClaudeErrorText {
+    <#
+    .SYNOPSIS
+        An error's message on one line, or the name of its type when it has
+        no message, for a line that says what could not be read and why.
+    #>
+    param($ErrorRecord)
+    $ex = $ErrorRecord
+    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ex = $ErrorRecord.Exception }
+    if ($null -eq $ex) { return 'unknown error' }
+    $text = ([string]$ex.Message -replace '\s*[\r\n]+\s*', ' ').Trim()
+    if (-not $text) { $text = $ex.GetType().FullName }
+    return $text
+}
+
+function Get-ClaudeServiceOrNull {
+    <#
+    .SYNOPSIS
+        The service of that name, $null when no service has that name, and
+        throws, with the error Get-Service gave, when it could not be read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with a
+        read-only probe (Get-Service -Name NoSuchSvc_cf): error id
+        NoServiceFoundForGivenName, category ObjectNotFound, exception
+        Microsoft.PowerShell.Commands.ServiceCommandException. Any other
+        error means the service could not be read.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    try {
+        return (Get-Service -Name $Name -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'NoServiceFoundForGivenName' `
+                -ExceptionType 'Microsoft.PowerShell.Commands.ServiceCommandException') { return $null }
+        throw
+    }
+}
+
+function Get-ClaudeProcessByName {
+    <#
+    .SYNOPSIS
+        Every running process of that name, nothing when none runs, and
+        throws, with the error Get-Process gave, when the list could not be
+        read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with a
+        read-only probe (Get-Process -Name NoSuchProc_cf): error id
+        NoProcessFoundForGivenName, category ObjectNotFound, exception
+        Microsoft.PowerShell.Commands.ProcessCommandException. Any other
+        error means the list could not be read. Wrap a call in @() for an
+        array: none running outputs nothing.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    try {
+        return @(Get-Process -Name $Name -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'NoProcessFoundForGivenName' `
+                -ExceptionType 'Microsoft.PowerShell.Commands.ProcessCommandException') { return }
+        throw
+    }
+}
+
+function Get-ClaudeScheduledTaskOrNull {
+    <#
+    .SYNOPSIS
+        The scheduled task of that name in that folder, $null when there is
+        no such task, and throws, with the error Get-ScheduledTask gave, when
+        it could not be read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with a
+        read-only probe (Get-ScheduledTask -TaskName NoSuch_cf -TaskPath
+        \NoSuch_cf\, and again with -TaskPath \): error id
+        CmdletizationQuery_NotFound, category ObjectNotFound, exception
+        Microsoft.PowerShell.Cmdletization.Cim.CimJobException, whether or
+        not the folder exists. Without -TaskPath the id is
+        CmdletizationQuery_NotFound_TaskName, which is why the path is
+        required here. Any other error means the task could not be read.
+    .PARAMETER TaskPath
+        The task's folder, with a backslash at each end: \Claude\.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][string]$TaskPath
+    )
+    try {
+        return (Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskPath -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'CmdletizationQuery_NotFound' `
+                -ExceptionType 'Microsoft.PowerShell.Cmdletization.Cim.CimJobException') { return $null }
+        throw
+    }
+}
+
+function Get-ClaudeItemOrNull {
+    <#
+    .SYNOPSIS
+        The file, folder or registry key at that path, $null when there is
+        nothing there, and throws, with the error Get-Item gave, when it
+        could not be read.
+    .DESCRIPTION
+        Measured 2026-11-22 on Windows 11, Windows PowerShell 5.1, with
+        read-only probes of a missing file, a file under a missing folder
+        and a missing registry key: error id PathNotFound, category
+        ObjectNotFound, exception
+        System.Management.Automation.ItemNotFoundException, all three. Any
+        other error means the path could not be read. Hidden items count
+        as there (-Force).
+
+        Test-Path cannot be used for this: it answers $false for a path it
+        could not read, which is the confusion this exists to end.
+    #>
+    param([Parameter(Mandatory)][string]$LiteralPath)
+    try {
+        return (Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' `
+                -ExceptionType 'System.Management.Automation.ItemNotFoundException') { return $null }
+        throw
+    }
+}
+
 function Get-ClaudeEnvironment {
     <#
     .SYNOPSIS
@@ -135,6 +298,14 @@ function Get-ClaudeEnvironment {
         determined stays $null and is recorded in Warnings, so a partial result
         is still usable by a caller that only needs some of the fields.
 
+        A read that failed, as opposed to one that found nothing, is also
+        listed in ReadErrors, one line each naming the read and the error,
+        for the scripts to show: Warnings holds notes about the choices made
+        as well. ServiceFound and ServiceRecoveryConfigured are $null when
+        they could not be read. Until 6.3.1 a failed read of the package, the
+        processes, the service or its recovery settings looked the same as
+        finding nothing.
+
         Locations are discoverable and are discovered. Thresholds and log
         signatures are NOT in scope here: those are not location problems and
         cannot be fixed by looking harder at the filesystem.
@@ -142,13 +313,15 @@ function Get-ClaudeEnvironment {
         Skip the recursive walk of the VM cache. That walk is the expensive half
         of discovery and only the backup and purge paths consume its results, so
         anything that polls should pass this. CacheSizeBytes is left at -1 when
-        skipped, which is distinguishable from a genuine zero.
+        skipped, which is distinguishable from a genuine zero, and is -1 as
+        well when the walk failed.
     #>
     param([switch]$SkipCacheInventory)
 
     # Version 2 (6.2.0): the app's folders come from Resolve-ClaudeDataPaths
-    # instead of %APPDATA%\Claude. A version 1 record names the old folders,
-    # so Import-ClaudeEnvironment turns it away.
+    # instead of %APPDATA%\Claude. The version is written into claude-env.json
+    # so that a person reading the record knows which fields it has; nothing in
+    # this toolkit reads the record back, since every run discovers afresh.
     $info = [ordered]@{
         SchemaVersion = 2
         DiscoveredUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -200,7 +373,16 @@ function Get-ClaudeEnvironment {
         HasTickCount64 = $false
         IsAdmin        = $false
 
-        Warnings = @()
+        Warnings   = @()
+        ReadErrors = @()
+    }
+
+    # A read that failed: said in Warnings and in ReadErrors.
+    $readFailed = {
+        param([string]$What, $ErrorRecord)
+        $line = "$What could not be read: $(Get-ClaudeErrorText $ErrorRecord)"
+        $info.Warnings   += $line
+        $info.ReadErrors += $line
     }
 
     # -- Host capabilities ------------------------------------------------
@@ -208,18 +390,26 @@ function Get-ClaudeEnvironment {
         $info.IsAdmin = ([Security.Principal.WindowsPrincipal] `
             [Security.Principal.WindowsIdentity]::GetCurrent()
             ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { $info.Warnings += "Could not determine admin status: $($_.Exception.Message)" }
+    } catch { & $readFailed 'Whether this shell is elevated' $_ }
 
     # TickCount64 is .NET Core and up. Windows PowerShell 5.1 runs on .NET
     # Framework and does not have it, which is why the idle-time maths has to
     # survive the 24.9 day TickCount wrap instead of just using the 64-bit call.
+    # A probe: the error is the answer "not there".
     try { $null = [Environment]::TickCount64; $info.HasTickCount64 = $true }
     catch { $info.HasTickCount64 = $false }
 
+    # hcsdiag.exe ships with Windows. Not there is said as not present, and
+    # one that could not be read is a read error (Get-ClaudeItemOrNull); HCS
+    # cleanup is unavailable either way, since a run of it would fail the same
+    # way. Until 6.3.1 Test-Path said "not present" for both. The outer catch
+    # is for a SystemRoot that is not set, and says so.
     try {
         $hcs = Join-Path $env:SystemRoot "System32\hcsdiag.exe"
-        if (Test-Path $hcs) { $info.HcsDiagPath = $hcs }
-        else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
+        try {
+            if (Get-ClaudeItemOrNull -LiteralPath $hcs) { $info.HcsDiagPath = $hcs }
+            else { $info.Warnings += "hcsdiag.exe not present; HCS cleanup unavailable" }
+        } catch { & $readFailed "hcsdiag.exe ($hcs)" $_ }
     } catch { $info.Warnings += "hcsdiag probe failed: $($_.Exception.Message)" }
 
     # -- This toolkit's own folder -----------------------------------------
@@ -236,8 +426,12 @@ function Get-ClaudeEnvironment {
     } catch { $info.Warnings += "AppData probe failed: $($_.Exception.Message)" }
 
     # -- MSIX package -------------------------------------------------------
+    # No match is an empty answer with no error (measured 2026-11-22 with
+    # Get-AppxPackage -Name NoSuch_cf*), so any error is a failed read. Until
+    # 6.3.1 it was passed over and read as "no package installed".
+    $pkgs = @()
     try {
-        $pkgs = @(Get-AppxPackage -Name "Claude*" -ErrorAction SilentlyContinue |
+        $pkgs = @(Get-AppxPackage -Name "Claude*" -ErrorAction Stop |
                   Where-Object { $_.Name -like "Claude*" })
         if ($pkgs.Count -gt 1) {
             $info.Warnings += "$($pkgs.Count) Claude packages registered; duplicates make the service start fail with error 87"
@@ -254,35 +448,44 @@ function Get-ClaudeEnvironment {
             $info.InstallLocation  = "$($p.InstallLocation)"
             # Get-AppxPackage hands back Version as a String on Windows
             # PowerShell 5.1, so the PackageVersion struct accessors are not
-            # there. PackageFullName carries the same version as a second source.
+            # there. PackageFullName carries the same version as a second source,
+            # which is why a failure of the first is not said: the second is
+            # read next.
             try { $info.PackageVersion = "$($p.Version)" } catch { $null = $_ }
             if (-not $info.PackageVersion -and $info.PackageFullName) {
+                # String work on text already read; nothing here can fail to
+                # read, and a version not found stays $null.
                 try {
                     $parts = @($info.PackageFullName -split '_')
                     if ($parts.Count -ge 2) { $info.PackageVersion = $parts[1] }
                 } catch { $null = $_ }
             }
         }
-    } catch { $info.Warnings += "Package query failed: $($_.Exception.Message)" }
+    } catch { & $readFailed 'The Claude package (Get-AppxPackage)' $_ }
 
     # Application Id comes from the manifest. The old hardcoded "App" fallback
     # produced an invalid AUMID, and it only ever ran when the manifest read had
     # already failed, which is precisely when a wrong guess does damage.
     if ($info.InstallLocation) {
+        # A manifest that is not there leaves the fallback below, which says
+        # so. One that could not be read is said as well: until 6.3.1
+        # Test-Path answered "not there" for it.
         try {
             $manifestPath = Join-Path $info.InstallLocation "AppxManifest.xml"
-            if (Test-Path $manifestPath) {
-                [xml]$mx = Get-Content $manifestPath -ErrorAction Stop
+            if (Get-ClaudeItemOrNull -LiteralPath $manifestPath) {
+                [xml]$mx = Get-Content -LiteralPath $manifestPath -ErrorAction Stop
                 $ns = New-Object Xml.XmlNamespaceManager($mx.NameTable)
                 $ns.AddNamespace("x", "http://schemas.microsoft.com/appx/manifest/foundation/windows10")
                 $appNode = $mx.SelectSingleNode("//x:Application", $ns)
                 if ($appNode) { $info.ApplicationId = $appNode.GetAttribute("Id") }
             }
-        } catch { $info.Warnings += "Manifest read failed: $($_.Exception.Message)" }
+        } catch { & $readFailed 'The package manifest' $_ }
     }
     if (-not $info.ApplicationId -and $info.PackageFound) {
         # Every shipped Claude manifest to date uses Id="Claude", matching the
         # package Name. Better than a literal guess, and it is recorded as one.
+        # The name was read with the package; a failure here leaves no Id,
+        # which the line below does not claim.
         try { $info.ApplicationId = "$($pkgs[0].Name)" } catch { $null = $_ }
         if ($info.ApplicationId) {
             $info.Warnings += "Application Id fell back to package name '$($info.ApplicationId)'"
@@ -305,7 +508,9 @@ function Get-ClaudeEnvironment {
             $info[$k] = $paths.$k
         }
         $info.Warnings += @($paths.Notes)
-    } catch { $info.Warnings += "Data folder discovery failed: $($_.Exception.Message)" }
+        # Each candidate folder that could not be read is in Notes already.
+        foreach ($e in @($paths.Errors)) { $info.ReadErrors += "Data folder candidate $e" }
+    } catch { & $readFailed "The app's data folders" $_ }
 
     # -- Claude executable ---------------------------------------------------
     # Ordered by authority, not by convenience. The package branch runs first
@@ -322,11 +527,34 @@ function Get-ClaudeEnvironment {
     # therefore cache the CLI path and turn every later relaunch into a CLI
     # start instead of an app start. Test-ClaudeCodeCliPath rejects both kinds;
     # the path pattern it replaced here only knew the first.
+    # Each source below that cannot be read is said in ReadErrors, and the
+    # next one is tried. A candidate path that is there but could not be read
+    # is passed over too, since the search is for a file that is there and
+    # the next source may have it; when no source has one, each such path is
+    # said in ReadErrors, so that "not located" is not taken for "not
+    # installed". Until 6.3.1 Test-Path answered "not there" for such a path,
+    # without a word, and answered "there" for a folder.
+    $exeUnread = New-Object 'System.Collections.Generic.List[string]'
+    # $true for a file at that path. Nothing there, or a folder, is $false; a
+    # path that could not be read is $false and noted in $exeUnread.
+    $exeAt = {
+        param([string]$Path)
+        if (-not $Path) { return $false }
+        try {
+            $it = Get-ClaudeItemOrNull -LiteralPath $Path
+        } catch {
+            $exeUnread.Add("Claude executable candidate $Path could not be read: $(Get-ClaudeErrorText $_)")
+            return $false
+        }
+        return ($null -ne $it -and -not $it.PSIsContainer)
+    }
     if ($info.InstallLocation) {
         foreach ($rel in @('app\claude.exe', 'claude.exe')) {
+            # Join-Path fails only for a drive that is not there; such a
+            # candidate is passed over like one with nothing there.
             try {
                 $cand = Join-Path $info.InstallLocation $rel
-                if (Test-Path $cand) {
+                if (& $exeAt $cand) {
                     $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'package'; break
                 }
             } catch { $null = $_ }
@@ -334,94 +562,132 @@ function Get-ClaudeEnvironment {
     }
     if (-not $info.ClaudeExe) {
         try {
-            foreach ($rp in @(Get-Process -Name $info.ProcessName -ErrorAction SilentlyContinue)) {
+            foreach ($rp in @(Get-ClaudeProcessByName -Name $info.ProcessName)) {
                 try {
                     $cand = $rp.MainModule.FileName
-                    if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
+                    if ($cand -and (& $exeAt $cand) -and -not (Test-ClaudeCodeCliPath $cand)) {
                         $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'process'; break
                     }
-                } catch { $null = $_ }
+                } catch {
+                    # MainModule needs more access than the image name does,
+                    # and the process may have exited since the list was
+                    # read. The CIM query below answers for such a process.
+                    $null = $_
+                }
             }
-        } catch { $null = $_ }
+        } catch { & $readFailed 'The processes named claude' $_ }
     }
     if (-not $info.ClaudeExe) {
+        # No match is an empty answer with no error (measured 2026-11-22), so
+        # any error is a failed read.
         try {
             foreach ($wp in @(Get-CimInstance Win32_Process -Filter "Name LIKE '%claude%'" `
-                              -ErrorAction SilentlyContinue)) {
+                              -ErrorAction Stop)) {
                 $cand = "$($wp.ExecutablePath)"
-                if ($cand -and -not (Test-ClaudeCodeCliPath $cand) -and (Test-Path $cand)) {
+                if ($cand -and (& $exeAt $cand) -and -not (Test-ClaudeCodeCliPath $cand)) {
                     $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'wmi'; break
                 }
             }
-        } catch { $null = $_ }
+        } catch { & $readFailed 'The process list (CIM Win32_Process)' $_ }
     }
     if (-not $info.ClaudeExe) {
-        foreach ($cand in @(
-            (Join-Path $env:LOCALAPPDATA "Programs\claude\Claude.exe"),
-            (Join-Path $env:LOCALAPPDATA "AnthropicClaude\Claude.exe"),
-            (Join-Path $env:LOCALAPPDATA "Anthropic\Claude\Claude.exe"),
-            (Join-Path $env:ProgramFiles "Claude\Claude.exe")
+        # Guesses at the usual install folders. A folder variable that is not
+        # set has no guess: until 6.3.1 Join-Path of $null threw out of the
+        # whole discovery when LOCALAPPDATA was not set. Join-Path fails only
+        # for a drive that is not there, which is passed over as well.
+        $guesses = @()
+        foreach ($g in @(
+            @($env:LOCALAPPDATA, 'Programs\claude\Claude.exe'),
+            @($env:LOCALAPPDATA, 'AnthropicClaude\Claude.exe'),
+            @($env:LOCALAPPDATA, 'Anthropic\Claude\Claude.exe'),
+            @($env:ProgramFiles, 'Claude\Claude.exe')
         )) {
-            try { if ($cand -and (Test-Path $cand)) {
-                $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'commonpath'; break
-            } } catch { $null = $_ }
+            if ($g[0]) { try { $guesses += (Join-Path $g[0] $g[1]) } catch { $null = $_ } }
+        }
+        foreach ($cand in $guesses) {
+            if (& $exeAt $cand) { $info.ClaudeExe = $cand; $info.ClaudeExeSource = 'commonpath'; break }
         }
     }
-    if (-not $info.ClaudeExe) { $info.Warnings += "Claude executable not located" }
+    if (-not $info.ClaudeExe) {
+        $info.Warnings += "Claude executable not located"
+        foreach ($u in $exeUnread) { $info.Warnings += $u; $info.ReadErrors += $u }
+    }
 
     # -- Service -------------------------------------------------------------
+    # Not registered and could not be read are told apart
+    # (Get-ClaudeServiceOrNull). Until 6.3.1 a failed read said "is not
+    # registered".
+    $svc = $null
     try {
-        $svc = Get-Service -Name $info.ServiceName -ErrorAction SilentlyContinue
-        if ($svc) {
-            $info.ServiceFound = $true
-            try {
-                $cim = Get-CimInstance Win32_Service `
-                       -Filter "Name='$($info.ServiceName)'" -ErrorAction Stop
-                if ($cim) {
-                    $info.ServiceStartMode = "$($cim.StartMode)"
-                    $raw = "$($cim.PathName)"
-                    if ($raw) {
-                        # PathName may be quoted and may carry arguments.
-                        if ($raw -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
-                        elseif ($raw -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
-                        else { $exe = $raw.Trim() }
-                        $info.ServiceBinaryPath = $exe
-                        try {
-                            $leaf = [System.IO.Path]::GetFileNameWithoutExtension($exe)
-                            if ($leaf) { $info.ServiceProcessName = $leaf }
-                        } catch { $null = $_ }
+        $svc = Get-ClaudeServiceOrNull -Name $info.ServiceName
+        if (-not $svc) { $info.Warnings += "$($info.ServiceName) is not registered" }
+    } catch {
+        $info.ServiceFound = $null
+        & $readFailed "Service $($info.ServiceName)" $_
+    }
+    if ($svc) {
+        $info.ServiceFound = $true
+        try {
+            $cim = Get-CimInstance Win32_Service `
+                   -Filter "Name='$($info.ServiceName)'" -ErrorAction Stop
+            if ($cim) {
+                $info.ServiceStartMode = "$($cim.StartMode)"
+                $raw = "$($cim.PathName)"
+                if ($raw) {
+                    # PathName may be quoted and may carry arguments.
+                    if ($raw -match '^\s*"([^"]+)"') { $exe = $Matches[1] }
+                    elseif ($raw -match '^\s*(\S+\.exe)') { $exe = $Matches[1] }
+                    else { $exe = $raw.Trim() }
+                    $info.ServiceBinaryPath = $exe
+                    try {
+                        $leaf = [System.IO.Path]::GetFileNameWithoutExtension($exe)
+                        if ($leaf) { $info.ServiceProcessName = $leaf }
+                    } catch {
+                        $info.Warnings += "The service's process name could not be taken from '$exe'; it stays $($info.ServiceProcessName)"
                     }
                 }
-            } catch {
-                try { $info.ServiceStartMode = "$($svc.StartType)" } catch { $null = $_ }
             }
-        } else {
-            $info.Warnings += "$($info.ServiceName) is not registered"
+        } catch {
+            # The start mode is on the service object as well. The binary
+            # path is not, and the process name stays the one measured on
+            # app 6.18355.
+            & $readFailed "The details of service $($info.ServiceName) (CIM Win32_Service)" $_
+            if ($null -ne $svc.StartType) { $info.ServiceStartMode = "$($svc.StartType)" }
         }
-    } catch { $info.Warnings += "Service query failed: $($_.Exception.Message)" }
+    }
 
     # Recovery actions are read from the registry, not from parsed sc.exe output.
     # Matching the literal string RESTART in console text fails on any Windows
     # whose display language is not English.
+    #
+    # No key means no such service, and GetValue answers $null for a value
+    # that is not there, so neither is an error. Any error is a failed read,
+    # and the answer is then $null, not "not configured": until 6.3.1 an
+    # error here read as not configured, and Fix's report said so.
     try {
-        $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($info.ServiceName)"
-        if (Test-Path $svcKey) {
-            $fa = (Get-ItemProperty -Path $svcKey -Name FailureActions `
-                   -ErrorAction SilentlyContinue).FailureActions
+        $svcKey = Get-ClaudeItemOrNull -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($info.ServiceName)"
+        if ($svcKey) {
+            $fa = $svcKey.GetValue('FailureActions')
             if ($fa) { $info.ServiceRecoveryConfigured = $true }
         }
-    } catch { $null = $_ }
+    } catch {
+        $info.ServiceRecoveryConfigured = $null
+        & $readFailed "The recovery settings of service $($info.ServiceName)" $_
+    }
 
     # -- VM log selection ----------------------------------------------------
-    # See Get-ClaudeVmLogCandidates for which logs count and why.
+    # See Get-ClaudeVmLogCandidates for which logs count and why. A log folder
+    # with nothing there holds no VM log and is passed over, as before; one
+    # that could not be read is a read error (Get-ClaudeItemOrNull), where
+    # until 6.3.1 Test-Path passed over it without a word.
     try {
-        if ($info.LogDir -and (Test-Path $info.LogDir)) {
+        if ($info.LogDir -and (Get-ClaudeItemOrNull -LiteralPath $info.LogDir)) {
             $cands = @(Get-ClaudeVmLogCandidates -LogDir $info.LogDir)
             $info.VmLogCandidates = $cands
             if ($cands.Count -gt 0) { $info.VmLogFile = $cands[0].Path }
             else { $info.Warnings += "No VM log present in $($info.LogDir)" }
         }
-    } catch { $info.Warnings += "VM log probe failed: $($_.Exception.Message)" }
+    } catch { & $readFailed "The VM logs in $($info.LogDir)" $_ }
 
     # -- VM cache inventory --------------------------------------------------
     # One walk yields both the real cache size and the real VHDX sizes, so the
@@ -433,9 +699,29 @@ function Get-ClaudeEnvironment {
         try {
             $vhdx  = @()
             $total = [long]0
+            # A file or folder the walk cannot read is left out of the total
+            # and counted, and Warnings says the total is then a lower bound.
+            # An estimate, not a decision: the backup measures what it copies.
+            $unread = 0
+            $firstUnread = $null
             foreach ($dir in @($info.VmCachePath, $info.BundlePath)) {
-                if (-not $dir -or -not (Test-Path $dir)) { continue }
-                foreach ($f in @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue)) {
+                if (-not $dir) { continue }
+                # A folder with nothing there holds nothing to count. One that
+                # could not be read is counted as unread, so the total is said
+                # to be a lower bound; until 6.3.1 Test-Path passed over it and
+                # the total read as complete.
+                try {
+                    if ($null -eq (Get-ClaudeItemOrNull -LiteralPath $dir)) { continue }
+                } catch {
+                    # Get-Item's message for a path it may not read does not
+                    # name the path (measured 2026-11-23: "Access is denied"),
+                    # so the folder is named here.
+                    $unread++
+                    if (-not $firstUnread) { $firstUnread = $dir + ': ' + (Get-ClaudeErrorText $_) }
+                    continue
+                }
+                $walkErrors = $null
+                foreach ($f in @(Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue -ErrorVariable walkErrors)) {
                     $total += $f.Length
                     if ($f.Extension -eq '.vhdx') {
                         $vhdx += [pscustomobject]@{
@@ -445,10 +731,22 @@ function Get-ClaudeEnvironment {
                         }
                     }
                 }
+                foreach ($we in @($walkErrors)) {
+                    if ($null -eq $we) { continue }
+                    $unread++
+                    if (-not $firstUnread) { $firstUnread = Get-ClaudeErrorText $we }
+                }
             }
             $info.VhdxFiles      = @($vhdx)
             $info.CacheSizeBytes = $total
-        } catch { $info.Warnings += "Cache inventory failed: $($_.Exception.Message)" }
+            if ($unread -gt 0) {
+                $info.Warnings += "Cache inventory: $unread item(s) could not be read, so CacheSizeBytes is a lower bound (first: $firstUnread)"
+            }
+        } catch {
+            # -1 as when skipped: not known, which a 0 would not say.
+            $info.CacheSizeBytes = [long](-1)
+            & $readFailed 'The VM cache inventory' $_
+        }
     }
 
     return $info
@@ -457,9 +755,11 @@ function Get-ClaudeEnvironment {
 function Save-ClaudeEnvironment {
     <#
     .SYNOPSIS
-        Persists a discovery result so sibling scripts and bug reports can use it.
+        Writes a discovery result to a file, claude-env.json, for a person
+        reading what discovery found and for bug reports.
     .DESCRIPTION
-        Written as UTF-8 without a BOM. Out-File -Encoding utf8 emits a BOM on
+        Nothing in this toolkit reads the file back: every run discovers
+        afresh. Written as UTF-8 without a BOM. Out-File -Encoding utf8 emits a BOM on
         Windows PowerShell 5.1, which breaks anything reading the file as plain
         JSON. Never throws: persistence is a convenience, not a dependency.
     #>
@@ -469,6 +769,10 @@ function Save-ClaudeEnvironment {
     )
     try {
         $dir = Split-Path $Path -Parent
+        # A folder Test-Path could not read is made again here, which is
+        # harmless: New-Item -Force hands back a folder that is there as it
+        # is (measured 2026-11-23), and one that cannot be written to fails
+        # the write below, which answers $false.
         if ($dir -and -not (Test-Path $dir)) {
             New-Item $dir -ItemType Directory -Force | Out-Null
         }
@@ -477,38 +781,6 @@ function Save-ClaudeEnvironment {
             (New-Object System.Text.UTF8Encoding($false)))
         return $true
     } catch { return $false }
-}
-
-function Import-ClaudeEnvironment {
-    <#
-    .SYNOPSIS
-        Reads a persisted discovery result, but only if it still describes this
-        machine's current install.
-    .DESCRIPTION
-        Returns $null when the file is missing, unreadable, from a different
-        schema, or stamped with a package version other than the one asked for.
-        That version stamp is the whole point: the existing .claude-exe-path
-        cache has no stamp, which is why a stale entry there survives until
-        something downstream trips over it.
-
-        Pass -ExpectedPackageVersion from a live query when correctness matters.
-        Omit it to accept whatever was recorded, which is fine for bug reports.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [string]$ExpectedPackageVersion
-    )
-    try {
-        if (-not (Test-Path $Path)) { return $null }
-        $raw = Get-Content $Path -Raw -ErrorAction Stop
-        if (-not $raw) { return $null }
-        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
-        if (-not $obj) { return $null }
-        if ($obj.SchemaVersion -ne 2) { return $null }
-        if ($ExpectedPackageVersion -and
-            "$($obj.PackageVersion)" -ne "$ExpectedPackageVersion") { return $null }
-        return $obj
-    } catch { return $null }
 }
 
 function Get-CoworkHcsGuids {
@@ -574,15 +846,39 @@ function Test-ClaudeCodeCliPath {
         it, %USERPROFILE%\.local\bin on this machine, so the file's ProductName
         decides the rest. Measured 2026-11-21 on app 6.18355: the app's
         Claude.exe says "Claude", both CLI copies say "Claude Code".
+
+        Every caller asks so that it never takes the CLI for the app. The
+        answers:
+          $false  an empty path.
+          $true   a path with a claude-code folder in it.
+          $false  a path with nothing there; the caller's own check of
+                  whether it is there passes it over.
+          $false  a folder: it is not the CLI. Whether a folder may be used
+                  as an exe is the caller's question.
+          $true   a path that is there but could not be read, or whose
+                  product name could not be read: not one to start or
+                  record as the app.
+          $true   a file whose product name is "Claude Code".
+          $false  any other file.
+        Until 6.3.1 any failed read answered $false, "not the CLI".
     #>
     param([string]$Path)
     if (-not $Path) { return $false }
     if ($Path -match '[\\/]claude-code[\\/]') { return $true }
     try {
-        $vi = (Get-Item -LiteralPath $Path -ErrorAction Stop).VersionInfo
-        if ($vi -and "$($vi.ProductName)" -eq 'Claude Code') { return $true }
-    } catch { $null = $_ }
-    return $false
+        $item = Get-ClaudeItemOrNull -LiteralPath $Path
+    } catch {
+        return $true
+    }
+    if (-not $item) { return $false }
+    # A folder is not the CLI, and it has no VersionInfo: reading a property
+    # an object does not have throws under StrictMode Latest.
+    if ($item.PSIsContainer) { return $false }
+    # VersionInfo is read when asked for, and a getter that throws reads as
+    # $null, so $null here is a product name that could not be read.
+    $vi = $item.VersionInfo
+    if ($null -eq $vi) { return $true }
+    return ("$($vi.ProductName)" -eq 'Claude Code')
 }
 
 function Get-ClaudeProcessInventory {
@@ -608,6 +904,14 @@ function Get-ClaudeProcessInventory {
 
         A process whose path cannot be read is not counted as the desktop app.
         A process this function cannot place is not one the toolkit may kill.
+        Kind is unknown for it, and for a process whose product name was
+        needed and could not be read.
+
+        Throws, with the original error, when the processes could not be
+        listed, and when a process's path could not be read and the one CIM
+        query that answers for it failed. Until 6.3.1 a list that could not
+        be read came back empty, which every caller took for "Claude is not
+        running".
 
         Each result carries Process, Id, Path, Kind and IsDesktop. Kind is
         desktop, cli, other or unknown.
@@ -639,25 +943,32 @@ function Get-ClaudeProcessInventory {
             if ((Split-Path $dir -Leaf) -match '^app-\d') { $dir = Split-Path $dir -Parent }
             $roots += $dir.TrimEnd('\') + '\'
         }
-    } catch { $null = $_ }
+    } catch {
+        # String work on fields discovery already read. With no roots the
+        # product name decides below, so a failure here places nothing wrong.
+        $null = $_
+    }
 
     $result = @()
     $cimPaths = $null
     $products = @{}
-    foreach ($p in @(Get-Process -Name $Environment.ProcessName -ErrorAction SilentlyContinue)) {
+    # Throws when the list cannot be read (Get-ClaudeProcessByName).
+    foreach ($p in @(Get-ClaudeProcessByName -Name $Environment.ProcessName)) {
         $path = $null
+        # MainModule needs more access than the image name does, and the
+        # process may have exited since the list was read. The CIM query
+        # below answers for either.
         try { $path = $p.MainModule.FileName } catch { $null = $_ }
         if (-not $path) {
-            # MainModule needs more access than the image name does. One CIM
-            # query answers for every process it could not read.
+            # One CIM query answers for every process MainModule could not
+            # read. When it fails, this process cannot be placed, so the
+            # inventory cannot be told: the error is thrown as it came.
             if ($null -eq $cimPaths) {
                 $cimPaths = @{}
-                try {
-                    $flt = "Name='$($Environment.ProcessName).exe'"
-                    foreach ($w in @(Get-CimInstance Win32_Process -Filter $flt -ErrorAction Stop)) {
-                        if ($w.ExecutablePath) { $cimPaths[[int]$w.ProcessId] = "$($w.ExecutablePath)" }
-                    }
-                } catch { $null = $_ }
+                $flt = "Name='$($Environment.ProcessName).exe'"
+                foreach ($w in @(Get-CimInstance Win32_Process -Filter $flt -ErrorAction Stop)) {
+                    if ($w.ExecutablePath) { $cimPaths[[int]$w.ProcessId] = "$($w.ExecutablePath)" }
+                }
             }
             if ($cimPaths.ContainsKey([int]$p.Id)) { $path = $cimPaths[[int]$p.Id] }
         }
@@ -674,13 +985,21 @@ function Get-ClaudeProcessInventory {
                 if ($kind -eq 'other') {
                     # Read once per distinct path: fourteen desktop processes
                     # share one executable.
+                    # A product name that could not be read is $null, and the
+                    # process is then unknown, not other: it may be the CLI,
+                    # or with no roots the app. Until 6.3.1 it was other.
                     if (-not $products.ContainsKey($path)) {
-                        $products[$path] = ''
+                        $products[$path] = $null
                         try {
-                            $products[$path] = "$((Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.ProductName)"
-                        } catch { $null = $_ }
+                            $vi = (Get-Item -LiteralPath $path -Force -ErrorAction Stop).VersionInfo
+                            if ($null -ne $vi) { $products[$path] = "$($vi.ProductName)" }
+                        } catch {
+                            # Said through Kind, which every caller reads.
+                            $null = $_
+                        }
                     }
-                    if ($products[$path] -eq 'Claude Code') { $kind = 'cli' }
+                    if ($null -eq $products[$path]) { $kind = 'unknown' }
+                    elseif ($products[$path] -eq 'Claude Code') { $kind = 'cli' }
                     elseif ($roots.Count -eq 0 -and $products[$path] -eq 'Claude') { $kind = 'desktop' }
                 }
             }
@@ -705,7 +1024,9 @@ function Get-ClaudeDesktopProcess {
         whether the app is running before it does something. A check that only
         holds a repair back because Claude looks busy may keep counting every
         "claude" process: a busy CLI is a reason to wait as well.
-        Get-ClaudeProcessInventory says how the two are told apart.
+        Get-ClaudeProcessInventory says how the two are told apart, and when
+        it throws, which this passes on: a caller must not read a list that
+        could not be read as "not running".
     .PARAMETER Environment
         A Get-ClaudeEnvironment result.
     #>
@@ -729,17 +1050,20 @@ function Get-ClaudeAppCliProcess {
 
         A CLI counts when its parent is any desktop process, so which of the
         app's processes started it does not matter. A terminal CLI is not
-        counted: a repair does not end it.
+        counted: a repair does not end it. A child of the app whose kind
+        could not be told (unknown) counts as well, since it may be a
+        session; until 6.3.1 one whose product name could not be read was
+        not counted.
 
-        Throws when the parent ids cannot be read, so a caller deciding
-        whether a repair may run can fail closed.
+        Throws when the processes or their parent ids cannot be read, so a
+        caller deciding whether a repair may run can fail closed.
     .PARAMETER Environment
         A Get-ClaudeEnvironment result.
     #>
     param([Parameter(Mandatory)]$Environment)
 
     $inventory = @(Get-ClaudeProcessInventory -Environment $Environment)
-    $cli = @($inventory | Where-Object { $_.Kind -eq 'cli' })
+    $cli = @($inventory | Where-Object { $_.Kind -eq 'cli' -or $_.Kind -eq 'unknown' })
     if ($cli.Count -eq 0) { return @() }
     $desktop = @{}
     foreach ($e in $inventory) { if ($e.IsDesktop) { $desktop[[int]$e.Id] = $true } }
@@ -773,19 +1097,48 @@ function Test-ClaudeCodeTranscriptRecent {
         change, and until 6.3.0 a transcript written 20 minutes before the
         spring change read as 80 minutes old, so an unattended repair could
         start while a session was working.
+
+        Throws when it cannot tell: no config dir to look in, a projects
+        folder that could not be read, or a folder in it that could not be
+        listed and no recent transcript elsewhere. A caller deciding whether
+        a repair may run holds back on the throw and says why. Until 6.3.1
+        each of these answered $false, "no session busy", and let the repair
+        run. No projects folder at all is $false: nothing has been written.
     #>
     param([int]$Minutes = 35)
 
     $cfgDir = $env:CLAUDE_CONFIG_DIR
     if (-not $cfgDir -and $env:USERPROFILE) { $cfgDir = Join-Path $env:USERPROFILE ".claude" }
-    if (-not $cfgDir) { return $false }
+    if (-not $cfgDir) { throw 'Neither CLAUDE_CONFIG_DIR nor USERPROFILE is set, so there is no transcript folder to read' }
     $projects = Join-Path $cfgDir "projects"
-    if (-not (Test-Path -LiteralPath $projects -PathType Container)) { return $false }
+    # Named here: the error Get-Item gives for a folder it may not open says
+    # only "Access is denied" (measured 2026-11-23), and a caller says this
+    # error as why it could not tell. Until 6.3.1 the monitor's line was
+    # "Test-ClaudeCodeActive failed (Access is denied)".
+    try {
+        $folder = Get-ClaudeItemOrNull -LiteralPath $projects
+    } catch {
+        throw "The Claude Code transcript folder $projects could not be read: $(Get-ClaudeErrorText $_)"
+    }
+    if (-not $folder -or -not $folder.PSIsContainer) { return $false }
     $now = [datetime]::UtcNow
-    $recent = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -ErrorAction SilentlyContinue |
+    # Errors are gathered, not shown: a recent transcript answers the
+    # question whatever else could not be listed. Without one, the first
+    # error is thrown, unless it is a file or folder that went away during
+    # the walk (PathNotFound), which a session does when it ends.
+    $walkErrors = $null
+    $recent = Get-ChildItem -LiteralPath $projects -Filter "*.jsonl" -Recurse -File -Force `
+            -ErrorAction SilentlyContinue -ErrorVariable walkErrors |
         Where-Object { ($now - $_.LastWriteTimeUtc).TotalMinutes -lt $Minutes } |
         Select-Object -First 1
-    return [bool]$recent
+    if ($recent) { return $true }
+    # @($null) holds one element, so a $null is passed over.
+    foreach ($we in @($walkErrors)) {
+        if ($null -eq $we) { continue }
+        if (-not (Test-ClaudeNotFoundError -ErrorRecord $we -ErrorId 'PathNotFound' `
+                -ExceptionType 'System.Management.Automation.ItemNotFoundException')) { throw $we }
+    }
+    return $false
 }
 
 function Get-ClaudeDataCandidates {
@@ -814,8 +1167,16 @@ function Get-ClaudeDataCandidates {
         LogDirs: the logs folder of each candidate, where it exists. Newest is
         the latest write to a *.log directly in it.
 
-        Cheap enough to call on every poll: Test-Path and one directory listing
-        per candidate, nothing recursive. Never throws.
+        Cheap enough to call on every poll: one item read and one directory
+        listing per candidate, nothing recursive. Never throws.
+
+        Errors: one line for each folder or file that is there but could not
+        be read, naming it and the error. A candidate behind such an error
+        may be missing from DataRoots or LogDirs, or carry a Newest that is
+        too old, so a caller that would act on the choice (move a folder,
+        call the app idle) must not while Errors holds anything. Until 6.3.1
+        a folder that could not be read looked the same as one that was not
+        there.
     .PARAMETER PackageFamilyName
         The MSIX package family. Its LocalCache, where Windows redirects a
         packaged app's AppData writes, is probed as well.
@@ -835,16 +1196,25 @@ function Get-ClaudeDataCandidates {
     if ($env:CLAUDE_USER_DATA_DIR) {
         $wanted += @{ Path = $env:CLAUDE_USER_DATA_DIR; Source = 'CLAUDE_USER_DATA_DIR' }
     }
+    $errors = @()
+    $readError = { param($What, $ErrorRecord) "$What could not be read: $(Get-ClaudeErrorText $ErrorRecord)" }
+    # A folder found and then gone when listed (PathNotFound, the identity
+    # Get-ChildItem gives for a path not there, measured 2026-11-22) holds
+    # nothing, as one never found does: an update that removes the folder it
+    # moved from must not read as a folder that could not be read.
+    $goneError = { param($ErrorRecord) Test-ClaudeNotFoundError -ErrorRecord $ErrorRecord -ErrorId 'PathNotFound' `
+            -ExceptionType 'System.Management.Automation.ItemNotFoundException' }
     foreach ($b in $bases) {
         foreach ($n in @('Claude-Data', 'Claude-3p')) {
+            $parent = Join-Path $b.Path $n
             try {
-                $parent = Join-Path $b.Path $n
-                if (Test-Path -LiteralPath $parent -PathType Container) {
-                    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue)) {
+                $pi = Get-ClaudeItemOrNull -LiteralPath $parent
+                if ($pi -and $pi.PSIsContainer) {
+                    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction Stop)) {
                         $wanted += @{ Path = $d.FullName; Source = "$($b.Tag)\$n" }
                     }
                 }
-            } catch { $null = $_ }
+            } catch { if (-not (& $goneError $_)) { $errors += & $readError $parent $_ } }
         }
         $wanted += @{ Path = (Join-Path $b.Path 'Claude'); Source = "$($b.Tag)\Claude" }
     }
@@ -855,37 +1225,45 @@ function Get-ClaudeDataCandidates {
     $logs  = @()
     $seen  = @{}
     foreach ($w in $wanted) {
+        $full = "$($w.Path)".TrimEnd('\')
+        if (-not $full -or $seen.ContainsKey($full.ToLowerInvariant())) { continue }
+        $seen[$full.ToLowerInvariant()] = $true
         try {
-            $full = "$($w.Path)".TrimEnd('\')
-            if (-not $full -or $seen.ContainsKey($full.ToLowerInvariant())) { continue }
-            $seen[$full.ToLowerInvariant()] = $true
-            if (-not (Test-Path -LiteralPath $full -PathType Container)) { continue }
+            $fi = Get-ClaudeItemOrNull -LiteralPath $full
+        } catch { $errors += & $readError $full $_; continue }
+        if (-not $fi -or -not $fi.PSIsContainer) { continue }
 
-            $newest = $null
-            $isApp  = $false
-            foreach ($m in $markers) {
-                $mi = Get-Item -LiteralPath (Join-Path $full $m) -Force -ErrorAction SilentlyContinue
-                if (-not $mi) { continue }
-                if ($m -eq 'Preferences' -or $m -eq 'Local State') { $isApp = $true }
-                if ($null -eq $newest -or $mi.LastWriteTime -gt $newest) { $newest = $mi.LastWriteTime }
-            }
-            $roots += [pscustomobject]@{ Path = $full; Source = $w.Source; IsAppData = $isApp; Newest = $newest }
+        $newest = $null
+        $isApp  = $false
+        foreach ($m in $markers) {
+            $mp = Join-Path $full $m
+            try {
+                $mi = Get-ClaudeItemOrNull -LiteralPath $mp
+            } catch { $errors += & $readError $mp $_; continue }
+            if (-not $mi) { continue }
+            if ($m -eq 'Preferences' -or $m -eq 'Local State') { $isApp = $true }
+            if ($null -eq $newest -or $mi.LastWriteTime -gt $newest) { $newest = $mi.LastWriteTime }
+        }
+        $roots += [pscustomobject]@{ Path = $full; Source = $w.Source; IsAppData = $isApp; Newest = $newest }
 
-            $ld = Join-Path $full 'logs'
-            if (Test-Path -LiteralPath $ld -PathType Container) {
+        $ld = Join-Path $full 'logs'
+        try {
+            $li = Get-ClaudeItemOrNull -LiteralPath $ld
+            if ($li -and $li.PSIsContainer) {
                 $lnewest = $null
-                foreach ($f in @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -Force -ErrorAction SilentlyContinue)) {
+                foreach ($f in @(Get-ChildItem -LiteralPath $ld -Filter '*.log' -File -Force -ErrorAction Stop)) {
                     if ($null -eq $lnewest -or $f.LastWriteTime -gt $lnewest) { $lnewest = $f.LastWriteTime }
                 }
                 $logs += [pscustomobject]@{ Path = $ld; Source = $w.Source; Newest = $lnewest }
             }
-        } catch { $null = $_ }
+        } catch { if (-not (& $goneError $_)) { $errors += & $readError $ld $_ } }
     }
 
     $byNewest = @{ Expression = { if ($_.Newest) { $_.Newest } else { [datetime]::MinValue } }; Descending = $true }
     return [pscustomobject]@{
         DataRoots = @($roots | Sort-Object -Property @{ Expression = { [int]$_.IsAppData }; Descending = $true }, $byNewest)
         LogDirs   = @($logs | Sort-Object -Property $byNewest)
+        Errors    = @($errors)
     }
 }
 
@@ -915,6 +1293,10 @@ function Resolve-ClaudeDataPaths {
         generated launchers) stays in AppDataDir whatever is chosen here.
         Never throws: Get-ClaudeDataCandidates does not, and the rest is string
         work.
+
+        Errors passes on Get-ClaudeDataCandidates' Errors, and Notes has a
+        line for each: a choice made while one of them stands may be the
+        wrong one, and a caller that would act on it must not.
     .PARAMETER PackageFamilyName
         Passed to Get-ClaudeDataCandidates for the MSIX LocalCache candidates.
     .PARAMETER AppDataDir
@@ -960,6 +1342,9 @@ function Resolve-ClaudeDataPaths {
         $logSource = 'fallback'
         $notes += "No logs folder holding a *.log was found; the log folder falls back to $logDir"
     }
+    foreach ($e in @($c.Errors)) {
+        $notes += "Candidate not read, so the choice above may be wrong: $e"
+    }
 
     $under = { param($leaf) if ($dataRoot) { Join-Path $dataRoot $leaf } else { $null } }
     return [pscustomobject]@{
@@ -978,6 +1363,7 @@ function Resolve-ClaudeDataPaths {
             '{0} ({1}, newest log {2})' -f $_.Path, $_.Source, (& $stamp $_.Newest)
         })
         Notes              = @($notes)
+        Errors             = @($c.Errors)
     }
 }
 
@@ -993,30 +1379,30 @@ function Get-ClaudeVmLogCandidates {
         caller can reject a candidate that predates its own lookback window.
 
         A function of its own since 6.2.0 so Watch can pick the VM log again
-        when the log folder moves under it. Never throws.
+        when the log folder moves under it.
+
+        Throws, with the original error, when a VM log, or the folder, could
+        not be read. A log that is not there is left out. Until 6.3.1 a log
+        that could not be read was left out as well, so the newest log could
+        be one that had stopped while the live one went unseen.
     #>
     param([string]$LogDir)
 
     $cands = @()
     if (-not $LogDir) { return $cands }
     foreach ($n in @('cowork_vm_node.log', 'coworkd.log', 'cowork-service.log')) {
-        try {
-            $p = Join-Path $LogDir $n
-            if (Test-Path -LiteralPath $p) {
-                $fi = Get-Item -LiteralPath $p -ErrorAction SilentlyContinue
-                if ($fi) {
-                    $cands += [pscustomobject]@{
-                        Name          = $n
-                        Path          = $fi.FullName
-                        LastWriteTime = $fi.LastWriteTime
-                        LastWriteTimeUtc = $fi.LastWriteTimeUtc
-                        AgeHours      = [math]::Round( `
-                            ([datetime]::UtcNow - $fi.LastWriteTimeUtc).TotalHours, 2)
-                        Length        = $fi.Length
-                    }
-                }
+        $fi = Get-ClaudeItemOrNull -LiteralPath (Join-Path $LogDir $n)
+        if ($fi) {
+            $cands += [pscustomobject]@{
+                Name          = $n
+                Path          = $fi.FullName
+                LastWriteTime = $fi.LastWriteTime
+                LastWriteTimeUtc = $fi.LastWriteTimeUtc
+                AgeHours      = [math]::Round( `
+                    ([datetime]::UtcNow - $fi.LastWriteTimeUtc).TotalHours, 2)
+                Length        = $fi.Length
             }
-        } catch { $null = $_ }
+        }
     }
     return @($cands | Sort-Object LastWriteTimeUtc -Descending)
 }
@@ -1032,8 +1418,12 @@ function Get-ClaudeVmLogAge {
         (each boot, each Cowork command) and coworkd.log is the daemon inside
         the VM (each command again, and a clock line every few hours). A
         freshness test that read only the log that happened to be newest when
-        the script started could be reading the quiet one. Never throws.
-        Measured in UTC, so a daylight-saving change does not move it an hour.
+        the script started could be reading the quiet one. Throws when a VM
+        log could not be read (Get-ClaudeVmLogCandidates): until 6.3.1 the
+        age was then that of the logs that could be read, or $null, "no VM
+        log", and an age is what the staleness repair and the repair gate
+        act on. Measured in UTC, so a daylight-saving change does not move
+        it an hour.
     #>
     param([string]$LogDir)
 
@@ -1183,7 +1573,7 @@ function Get-W32tmOffsetSeconds {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -----------------------------------------------------------
-$ToolkitVersion = "6.3.0"
+$ToolkitVersion = "6.3.1"
 $ServiceName    = $script:ClaudeEnv.ServiceName
 $ProcessName    = $script:ClaudeEnv.ProcessName
 # This toolkit's folder, %APPDATA%\Claude: watch-logs and watch-state.json
@@ -1338,10 +1728,29 @@ try {
     $script:IsInteractiveSession = ($sessionId -gt 0)
 } catch { $script:SessionReadError = $_ }
 
-# Set once the Add-Type below is confirmed to have produced a usable type.
-$script:Win32ActivityLoaded = $false
+function Import-Win32Activity {
+    <#
+    .SYNOPSIS
+        Loads the Win32Activity type the foreground-window and input checks
+        call, and sets $script:Win32ActivityLoaded once the type is there.
+        Returns why it is not, or nothing.
+    .DESCRIPTION
+        The type is looked for after the Add-Type, whatever the Add-Type
+        said: one already loaded in this session is a type that works, and
+        the error Add-Type gives for it is not worth a word.
 
-Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
+        If it is not there, the first [Win32Activity] reference threw inside
+        the single try wrapping the user-activity checks, so checks 2
+        through 6 were all skipped, the empty catch swallowed the error, and
+        the function returned $false, which means "user is not active". The
+        auto-fix then proceeded while someone was working. Hence the check
+        that it loaded. Until 6.3.1 the Add-Type ran with SilentlyContinue
+        and nothing said why the checks were off; the caller now says it.
+    #>
+    $script:Win32ActivityLoaded = $false
+    $why = $null
+    try {
+        Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -1358,35 +1767,50 @@ public static class Win32Activity {
     [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 }
 '@
-
-# Verify the type actually loaded, rather than assuming it did.
-#
-# The Add-Type above runs with -ErrorAction SilentlyContinue and its result was
-# never checked. If it failed, the first [Win32Activity] reference threw inside
-# the single try wrapping the user-activity checks, so checks 2 through 6 were
-# all skipped, the empty catch swallowed the error, and the function returned
-# $false, which means "user is not active". The auto-fix then proceeded while
-# someone was working.
-try {
-    $null = [Win32Activity]
-    $script:Win32ActivityLoaded = $true
-} catch {
-    $null = $_
-    $script:Win32ActivityLoaded = $false
+    } catch {
+        $why = $_
+    }
+    try {
+        $null = [Win32Activity]
+        $script:Win32ActivityLoaded = $true
+        return
+    } catch {
+        if (-not $why) { $why = $_ }
+    }
+    return $why
 }
+$script:Win32ActivityError = Import-Win32Activity
 
 # -- Find Fix script -----------------------------------------------------
+# Whether each is there is asked by the error's identity. One that could not
+# be read is not passed over for the next place: that would start a
+# different Fix. The monitor stops on it instead, below, saying why. Until
+# 6.3.1 Test-Path answered $false for it, so the next copy was started, or
+# the monitor stopped saying the script was not found.
 $myDir = if ($PSCommandPath) { Split-Path $PSCommandPath -Parent } else { $PWD.Path }
 $fixScript = Join-Path $myDir "Fix-ClaudeDesktop.ps1"
+$fixScriptThere = $false
+$fixScriptError = $null
+try {
+    $fixScriptThere = ($null -ne (Get-ClaudeItemOrNull -LiteralPath $fixScript))
+} catch {
+    $fixScriptError = $_
+}
 
-if (-not (Test-Path $fixScript)) {
+if (-not $fixScriptThere -and -not $fixScriptError) {
     $fallbacks = @(
         "C:\ClaudeFix\Fix-ClaudeDesktop.ps1",
         (Join-Path $env:USERPROFILE "Desktop\Fix-ClaudeDesktop.ps1"),
         (Join-Path $env:USERPROFILE "Documents\Fix-ClaudeDesktop.ps1")
     )
     foreach ($fb in $fallbacks) {
-        if (Test-Path $fb) { $fixScript = $fb; break }
+        try {
+            if ($null -ne (Get-ClaudeItemOrNull -LiteralPath $fb)) { $fixScript = $fb; $fixScriptThere = $true; break }
+        } catch {
+            $fixScript = $fb
+            $fixScriptError = $_
+            break
+        }
     }
 }
 
@@ -1399,17 +1823,50 @@ if (-not (Test-Path $fixScript)) {
 # -- Logging -------------------------------------------------------------
 if (-not (Test-Path $WatchLogDir)) { New-Item $WatchLogDir -ItemType Directory -Force | Out-Null }
 
-# Clean old watch logs (>30 days). Measured in UTC, like every age this
-# monitor keeps: local time jumps an hour when summer time starts or ends.
-try {
-    Get-ChildItem $WatchLogDir -Filter "watch_*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-30) } |
-        Remove-Item -Force -ErrorAction SilentlyContinue
-} catch {
-    # Housekeeping, before there is a log to say it in: an old log left
-    # now is tried again at the next start or rollover, and no check reads it.
-    $null = $_
+function Remove-OldWatchLog {
+    <#
+    .SYNOPSIS
+        Deletes the watch logs last written more than 30 days ago. Returns
+        the first error, or nothing.
+    .DESCRIPTION
+        Measured in UTC, like every age this monitor keeps: local time jumps
+        an hour when summer time starts or ends.
+
+        A folder that is not there has no logs, and a log gone before it is
+        deleted needs no deleting: both give PathNotFound with ObjectNotFound
+        and ItemNotFoundException (measured 2026-11-22). Any other error is
+        returned, and the caller says it. Until 6.3.1 the list and the
+        deletes ran with SilentlyContinue, and a folder that could not be
+        listed, or a log that could not be deleted, was left without a word
+        while the logs grew.
+    #>
+    # SupportsShouldProcess: this deletes files.
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    $notThere = 'System.Management.Automation.ItemNotFoundException'
+    try {
+        $logs = @(Get-ChildItem -LiteralPath $WatchLogDir -Filter 'watch_*.log' -File -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' -ExceptionType $notThere) { return }
+        return $_
+    }
+    $firstError = $null
+    $cutoff = [datetime]::UtcNow.AddDays(-30)
+    foreach ($f in $logs) {
+        if ($f.LastWriteTimeUtc -ge $cutoff) { continue }
+        if (-not $PSCmdlet.ShouldProcess($f.FullName, 'Delete watch log older than 30 days')) { continue }
+        try {
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+        } catch {
+            if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' -ExceptionType $notThere) { continue }
+            if (-not $firstError) { $firstError = $_ }
+        }
+    }
+    return $firstError
 }
+
+# Before there is a log to say it in: kept, and said after the banner.
+$script:LogCleanupError = Remove-OldWatchLog
 
 $script:WatchLogFile = Join-Path $WatchLogDir ("watch_{0:yyyyMMdd}.log" -f (Get-Date))
 
@@ -1451,24 +1908,29 @@ function Update-LogFile {
         # The 30-day watch-log cleanup used to run only at startup, but this is
         # a daemon with ExecutionTimeLimit P365D, so in practice it never ran
         # again. Doing it on rollover is the only point at which it recurs.
-        try {
-            Get-ChildItem $WatchLogDir -Filter "watch_*.log" -ErrorAction SilentlyContinue |
-                Where-Object { $_.LastWriteTimeUtc -lt [datetime]::UtcNow.AddDays(-30) } |
-                Remove-Item -Force -ErrorAction SilentlyContinue
-        } catch {
-            # Housekeeping: an old log left now is tried again at the next
-            # rollover, and no check reads it.
-            $null = $_
+        $cleanupError = Remove-OldWatchLog
+        if ($cleanupError) {
+            Write-CheckError -Check 'old logs' -ErrorRecord $cleanupError `
+                -Text "The watch logs older than 30 days in $WatchLogDir could not all be deleted ({0}); they are tried again at the next rollover"
         }
     }
 }
 
 # Fatal check for the Fix script, placed AFTER Write-WatchLog exists so the
 # reason lands in the watch log rather than on a console that is not there.
-if (-not (Test-Path $fixScript)) {
-    Write-WatchLog "FATAL: Fix-ClaudeDesktop.ps1 not found. Looked next to this script at '$myDir' and in the standard fallback locations. The health monitor cannot start."
+# One that could not be read is said with why (see Find Fix script).
+if ($fixScriptError -or -not $fixScriptThere) {
+    if ($fixScriptError) {
+        Write-WatchLog "FATAL: Fix-ClaudeDesktop.ps1 at '$fixScript' could not be read ($(Get-ClaudeErrorText $fixScriptError)). The health monitor cannot start."
+    } else {
+        Write-WatchLog "FATAL: Fix-ClaudeDesktop.ps1 not found. Looked next to this script at '$myDir' and in the standard fallback locations. The health monitor cannot start."
+    }
     if (-not $Quiet) {
-        Write-Host "  [!] Fix-ClaudeDesktop.ps1 not found. Health monitor cannot start." -ForegroundColor Red
+        if ($fixScriptError) {
+            Write-Host "  [!] Fix-ClaudeDesktop.ps1 at '$fixScript' could not be read. Health monitor cannot start." -ForegroundColor Red
+        } else {
+            Write-Host "  [!] Fix-ClaudeDesktop.ps1 not found. Health monitor cannot start." -ForegroundColor Red
+        }
         Write-Host "      Reason written to: $script:WatchLogFile" -ForegroundColor DarkGray
     }
     exit 1
@@ -1507,15 +1969,31 @@ function Invoke-HcsDiag {
     } -ArgumentList $HcsdiagPath, $Arguments
     $completed = Wait-Job $job -Timeout $TimeoutSeconds
     if (-not $completed) {
+        # Clean-up of a job that has not answered: one that cannot be
+        # stopped or removed now ends with the monitor, and the timeout is
+        # what is said.
         Stop-Job $job -ErrorAction SilentlyContinue
         Remove-Job $job -Force -ErrorAction SilentlyContinue
         Write-WatchLog "hcsdiag timed out after ${TimeoutSeconds}s (args: $($Arguments -join ' '))"
         return $null
     }
-    $result = @(Receive-Job $job -ErrorAction SilentlyContinue) |
+    # The job's errors are kept and said: a job that could not run hcsdiag
+    # gives no exit code, and until 6.3.1 that returned $null without a
+    # word, read by the callers as hcsdiag not answering.
+    $jobErrors = $null
+    $result = @(Receive-Job $job -ErrorAction SilentlyContinue -ErrorVariable jobErrors) |
         Where-Object { $null -ne $_ -and $_.PSObject.Properties['ExitCode'] } | Select-Object -Last 1
+    $jobState = $job.State
+    # As above: the result is in hand.
     Remove-Job $job -Force -ErrorAction SilentlyContinue
-    if ($null -eq $result) { return $null }
+    if ($null -eq $result -or $null -eq $result.ExitCode) {
+        $first = @($jobErrors) | Where-Object { $null -ne $_ } | Select-Object -First 1
+        $why = if ($first) { Get-CheckErrorText -ErrorRecord $first } else { "the job ended $jobState with no exit code" }
+        if (Test-CheckErrorDue -Check 'hcsdiag' -Message $why -Now ([datetime]::UtcNow)) {
+            Write-WatchLog "hcsdiag $(@($Arguments)[0]) could not be run ($why); the same error is logged at most once an hour"
+        }
+        return $null
+    }
     if ($result.ExitCode -ne 0) {
         $firstLine = @(([string]$result.Text) -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -First 1
         $said = if ($firstLine) { ": $($firstLine.Trim())" } else { '' }
@@ -1581,6 +2059,9 @@ $script:ResyncBackoffUntil   = [datetime]::MinValue
 # When each error a check failed with was last logged, by the check and the
 # error's message, UTC (Test-CheckErrorDue). In memory only.
 $script:CheckErrorsSaid      = @{}
+# When each STORAGE WARNING Check 4b logged was last logged, by its text, UTC
+# (Test-StorageWarningDue). In memory only.
+$script:StorageWarningsSaid  = @{}
 $script:VmLogStaleCount      = 0     # Consecutive stale checks
 $script:VmLogEverActive      = $false  # Has VM log ever been active this session?
 $script:ServiceDownCount     = 0     # Consecutive service-down checks
@@ -1631,6 +2112,10 @@ $script:RepeatLinesSaid       = @{}
 # none. Persisted, because the whole point of it is to survive the restart that
 # a failed launch attempt could otherwise turn into a 30-second relaunch loop.
 $script:LastStealthMarkerTs  = [long]0
+# $true when the state saved at start was there and could not be restored
+# (Import-WatchState), so which stealth markers the monitor before this one
+# acted on is not known. In memory only.
+$script:StateUnread          = $false
 # Last line the stealth path wrote about a marker it could not use. In memory
 # only, and declared here rather than on first use because reading an unset
 # variable is an error under Set-StrictMode -Version Latest.
@@ -1646,8 +2131,17 @@ $script:NoCodeSessionDirLogged = $false
 $script:NextDataPathSync = [datetime]::UtcNow.AddMinutes(10)
 $script:StatePath           = Join-Path $WatchLogDir "watch-state.json"
 # Seeded from the current state so the first poll does not report a transition
-# that did not happen. The app only, as in the main loop.
-$script:ClaudeWasRunning     = (@(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0)
+# that did not happen. The app only, as in the main loop. $null when the
+# processes could not be listed: the first poll that lists them seeds it, and
+# the error is said after the banner. Until 6.3.1 a list that could not be
+# read was empty, and seeded "not running".
+$script:ClaudeWasRunning     = $null
+$script:SeedReadError        = $null
+try {
+    $script:ClaudeWasRunning = (@(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0)
+} catch {
+    $script:SeedReadError = $_
+}
 
 function ConvertFrom-WatchStateTime {
     <#
@@ -1698,95 +2192,137 @@ function Import-WatchState {
 
         The times are UTC, whatever version wrote the file: see
         ConvertFrom-WatchStateTime.
+
+        A file that is not there is a first start, and is silent. One that
+        is there but could not be read, or whose state could not be, fails
+        closed: what was not restored starts empty, and a cooldown starts
+        now, as after a repair that ran, so no automatic repair runs until
+        it is over. That is said, once in the hour (Write-CheckError). A
+        field of its own that cannot be read loses only that field, as
+        before. Until 6.3.1 such a file read as no state at all, and one
+        that could not be tested (Test-Path), or was empty, without a word.
+        Such a file also sets $script:StateUnread: see
+        Invoke-StealthRelaunch.
     #>
+    $script:StateUnread = $false
     try {
-        if (Test-Path $script:StatePath) {
-            $raw = Get-Content $script:StatePath -Raw -ErrorAction Stop
-            if ($raw) {
-                $st = $raw | ConvertFrom-Json -ErrorAction Stop
-                if ($st.LastFixTime) {
-                    $script:LastFixTime = ConvertFrom-WatchStateTime -Value $st.LastFixTime
-                }
-                if ($st.FixCount) { $script:FixCount = [int]$st.FixCount }
-                # Probed through PSObject.Properties, not read directly. Every
-                # state file written before v6.1.0 lacks this field, and under
-                # Set-StrictMode -Version Latest a bare $st.LastStealthMarkerTs
-                # on such a file throws PropertyNotFound. That throw would be
-                # swallowed by the catch below, silently abandoning the fix
-                # history restore that follows it.
-                if ($st.PSObject.Properties['LastStealthMarkerTs']) {
-                    try { $script:LastStealthMarkerTs = [long]$st.LastStealthMarkerTs }
-                    catch { $script:LastStealthMarkerTs = [long]0 }
-                }
-                foreach ($h in @($st.FixHistory)) {
-                    if (-not $h) { continue }
-                    $null = $script:FixHistory.Add((ConvertFrom-WatchStateTime -Value $h))
-                }
-                # Probed like LastStealthMarkerTs: a file written before 6.3.0
-                # has neither field, and loads as no repair pending. In a try
-                # of its own, so a bad value loses only this.
-                $script:PendingFixHeldAt = [datetime]::MinValue
-                $script:PendingFixTries  = 0
-                $script:PendingFixRetriesHeld = 0
-                if ($st.PSObject.Properties['PendingFixReason'] -and $st.PSObject.Properties['PendingFixSince'] -and
-                    $st.PendingFixReason) {
-                    try {
-                        $since = ConvertFrom-WatchStateTime -Value $st.PendingFixSince
-                        if ($since -ne [datetime]::MinValue) {
-                            $script:PendingFixReason = [string]$st.PendingFixReason
-                            $script:PendingFixSince  = $since
-                        }
-                    } catch {
-                        Write-CheckError -Check 'state' -ErrorRecord $_ `
-                            -Text "STATE: The held-back repair saved in $($script:StatePath) could not be restored ({0}), so it is not tried again"
+        # Asked through Get-ClaudeItemOrNull: $null only when nothing is
+        # there, which is a first start. Until 6.3.1 this was Test-Path,
+        # which answers $false, with no error a caller sees, for a file
+        # that is there but could not be tested: access denied on it or on
+        # its folder, or a drive that is gone (measured 2026-11-23). Such a
+        # file read as no state at all.
+        if ($null -ne (Get-ClaudeItemOrNull -LiteralPath $script:StatePath)) {
+            $raw = Get-Content -LiteralPath $script:StatePath -Raw -ErrorAction Stop
+            # Save-WatchState always writes an object, so a file that is
+            # empty, or holds anything else, is one whose write did not
+            # finish, as when the machine went down during it, and nothing
+            # in it can be trusted. Until 6.3.1 an empty file read as no
+            # state at all.
+            if ([string]::IsNullOrWhiteSpace($raw)) { throw 'the file is empty' }
+            $st = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($st -isnot [System.Management.Automation.PSCustomObject]) { throw 'the file does not hold a saved state' }
+            if ($st.LastFixTime) {
+                $script:LastFixTime = ConvertFrom-WatchStateTime -Value $st.LastFixTime
+            }
+            if ($st.FixCount) { $script:FixCount = [int]$st.FixCount }
+            # Probed through PSObject.Properties, not read directly. Every
+            # state file written before v6.1.0 lacks this field, and under
+            # Set-StrictMode -Version Latest a bare $st.LastStealthMarkerTs
+            # on such a file throws PropertyNotFound. That throw would go
+            # to the catch below, abandoning the fix history restore that
+            # follows it.
+            if ($st.PSObject.Properties['LastStealthMarkerTs']) {
+                try { $script:LastStealthMarkerTs = [long]$st.LastStealthMarkerTs }
+                catch { $script:LastStealthMarkerTs = [long]0 }
+            }
+            foreach ($h in @($st.FixHistory)) {
+                if (-not $h) { continue }
+                $null = $script:FixHistory.Add((ConvertFrom-WatchStateTime -Value $h))
+            }
+            # Probed like LastStealthMarkerTs: a file written before 6.3.0
+            # has neither field, and loads as no repair pending. In a try
+            # of its own, so a bad value loses only this.
+            $script:PendingFixHeldAt = [datetime]::MinValue
+            $script:PendingFixTries  = 0
+            $script:PendingFixRetriesHeld = 0
+            if ($st.PSObject.Properties['PendingFixReason'] -and $st.PSObject.Properties['PendingFixSince'] -and
+                $st.PendingFixReason) {
+                try {
+                    $since = ConvertFrom-WatchStateTime -Value $st.PendingFixSince
+                    if ($since -ne [datetime]::MinValue) {
+                        $script:PendingFixReason = [string]$st.PendingFixReason
+                        $script:PendingFixSince  = $since
                     }
-                    # The latest hold, the tries and the retries held back,
-                    # probed the same way and each in a try of its own. A
-                    # file written before they were kept has none of them,
-                    # and they load as none: the latest hold is then the
-                    # first, and no try is counted.
-                    if ($script:PendingFixReason) {
-                        if ($st.PSObject.Properties['PendingFixHeldAt']) {
-                            try { $script:PendingFixHeldAt = ConvertFrom-WatchStateTime -Value $st.PendingFixHeldAt }
-                            catch { $script:PendingFixHeldAt = [datetime]::MinValue }
-                        }
-                        if ($st.PSObject.Properties['PendingFixTries']) {
-                            try { $script:PendingFixTries = [math]::Max(0, [int]$st.PendingFixTries) }
-                            catch { $script:PendingFixTries = 0 }
-                        }
-                        if ($st.PSObject.Properties['PendingFixRetriesHeld']) {
-                            try { $script:PendingFixRetriesHeld = [math]::Max(0, [int]$st.PendingFixRetriesHeld) }
-                            catch { $script:PendingFixRetriesHeld = 0 }
-                        }
+                } catch {
+                    Write-CheckError -Check 'state' -ErrorRecord $_ `
+                        -Text "STATE: The held-back repair saved in $($script:StatePath) could not be restored ({0}), so it is not tried again"
+                }
+                # The latest hold, the tries and the retries held back,
+                # probed the same way and each in a try of its own. A
+                # file written before they were kept has none of them,
+                # and they load as none: the latest hold is then the
+                # first, and no try is counted.
+                if ($script:PendingFixReason) {
+                    if ($st.PSObject.Properties['PendingFixHeldAt']) {
+                        try { $script:PendingFixHeldAt = ConvertFrom-WatchStateTime -Value $st.PendingFixHeldAt }
+                        catch { $script:PendingFixHeldAt = [datetime]::MinValue }
+                    }
+                    if ($st.PSObject.Properties['PendingFixTries']) {
+                        try { $script:PendingFixTries = [math]::Max(0, [int]$st.PendingFixTries) }
+                        catch { $script:PendingFixTries = 0 }
+                    }
+                    if ($st.PSObject.Properties['PendingFixRetriesHeld']) {
+                        try { $script:PendingFixRetriesHeld = [math]::Max(0, [int]$st.PendingFixRetriesHeld) }
+                        catch { $script:PendingFixRetriesHeld = 0 }
                     }
                 }
-                # The runs Fix held back in a row, probed the same way and
-                # each in a try of its own. A file written before they were
-                # kept has neither, and loads as none held back.
-                $script:FixHeldInARow   = 0
-                $script:FixHeldLastTime = [datetime]::MinValue
-                if ($st.PSObject.Properties['FixHeldInARow']) {
-                    try { $script:FixHeldInARow = [math]::Max(0, [int]$st.FixHeldInARow) }
-                    catch { $script:FixHeldInARow = 0 }
-                }
-                if ($st.PSObject.Properties['FixHeldLastTime']) {
-                    try { $script:FixHeldLastTime = ConvertFrom-WatchStateTime -Value $st.FixHeldLastTime }
-                    catch { $script:FixHeldLastTime = [datetime]::MinValue }
-                }
-                # Whether the cooldown was left by a hold, probed the same
-                # way. A file written before it was kept has none, and loads
-                # as not: a one-shot trigger in that cooldown is skipped, as
-                # it was then.
-                $script:CooldownFromHold = $false
-                if ($st.PSObject.Properties['CooldownFromHold']) {
-                    try { $script:CooldownFromHold = ($st.CooldownFromHold -is [bool] -and $st.CooldownFromHold) }
-                    catch { $script:CooldownFromHold = $false }
-                }
+            }
+            # The runs Fix held back in a row, probed the same way and
+            # each in a try of its own. A file written before they were
+            # kept has neither, and loads as none held back.
+            $script:FixHeldInARow   = 0
+            $script:FixHeldLastTime = [datetime]::MinValue
+            if ($st.PSObject.Properties['FixHeldInARow']) {
+                try { $script:FixHeldInARow = [math]::Max(0, [int]$st.FixHeldInARow) }
+                catch { $script:FixHeldInARow = 0 }
+            }
+            if ($st.PSObject.Properties['FixHeldLastTime']) {
+                try { $script:FixHeldLastTime = ConvertFrom-WatchStateTime -Value $st.FixHeldLastTime }
+                catch { $script:FixHeldLastTime = [datetime]::MinValue }
+            }
+            # Whether the cooldown was left by a hold, probed the same
+            # way. A file written before it was kept has none, and loads
+            # as not: a one-shot trigger in that cooldown is skipped, as
+            # it was then.
+            $script:CooldownFromHold = $false
+            if ($st.PSObject.Properties['CooldownFromHold']) {
+                try { $script:CooldownFromHold = ($st.CooldownFromHold -is [bool] -and $st.CooldownFromHold) }
+                catch { $script:CooldownFromHold = $false }
             }
         }
     } catch {
+        # Fail closed. The cooldown, the fix history and a held-back repair
+        # are not all known. The history is what matters: three repairs in
+        # thirty minutes stop a fourth (Test-PersistentFailure), and a
+        # repair loop bad enough to take the machine down is the very thing
+        # that leaves such a file behind. Starting as on a first start let
+        # that loop run again at once. So a cooldown starts now, as after a
+        # repair that ran, and no automatic repair runs until it is over,
+        # Invoke-HeldBackRetry's included. A wait already longer, as an
+        # escalation leaves, is kept. Whether a hold left the wait is not
+        # known either, and is taken as not: a one-shot trigger in it is
+        # then skipped, not kept to be tried once it is over. The history
+        # itself is not made up: repairs that did not run here are not
+        # counted toward the escalation.
+        $now = [datetime]::UtcNow
+        if ($script:LastFixTime -lt $now) { $script:LastFixTime = $now }
+        $script:CooldownFromHold = $false
+        # The stealth markers already acted on are not known either.
+        $script:StateUnread = $true
+        $waitMin = [math]::Round(($script:LastFixTime - $now).TotalMinutes + $Cooldown, 1)
         Write-CheckError -Check 'state' -ErrorRecord $_ `
-            -Text "STATE: The state saved in $($script:StatePath) could not be restored in full ({0}); what was not restored starts empty, as on a first start"
+            -Text "STATE: The state saved in $($script:StatePath) could not be restored in full ({0}); what was not restored starts empty, and a cooldown starts now, as after a repair: no automatic repair runs for $waitMin min"
     }
 
     # Seed from the logs themselves, not from the saved file.
@@ -1913,7 +2449,18 @@ function Get-StealthRelaunchMarker {
     # the repeat-suppression record: a marker that is gone cannot still be the
     # one whose complaint is being held down.
     if (-not $Path) { $script:LastStealthNotice = $null; return $null }
-    if (-not (Test-Path -LiteralPath $Path)) { $script:LastStealthNotice = $null; return $null }
+    # Whether it is there is asked by the error's identity: a marker that
+    # could not be looked for is said, as one that could not be read is.
+    # Until 6.3.1 Test-Path answered $false for it, and it was passed over
+    # as absent without a word.
+    $markerItem = $null
+    try {
+        $markerItem = Get-ClaudeItemOrNull -LiteralPath $Path
+    } catch {
+        Write-StealthNotice "STEALTH WARNING: marker at $Path could not be read: $(Get-ClaudeErrorText $_)"
+        return $null
+    }
+    if ($null -eq $markerItem) { $script:LastStealthNotice = $null; return $null }
 
     $raw = $null
     try {
@@ -1998,7 +2545,7 @@ function Invoke-StealthRelaunch {
         after the update already happened, sees no transition at all, and the
         act-once guard makes re-evaluating each poll free.
 
-        Four ways this declines, in order:
+        Five ways this declines:
 
           - the operator passed -NoStealthRelaunch
           - there is no marker, so this was a crash or a deliberate quit, and
@@ -2006,6 +2553,9 @@ function Invoke-StealthRelaunch {
           - the marker is older than -MaxStealthMarkerAgeMinutes, so the
             machine was off or the user chose to stay closed
           - the marker's ts is one already decided about
+          - the state saved at start could not be restored, and the marker
+            was written before this monitor started: the monitor before it
+            may have decided about it already (since 6.3.1)
 
         The ts is recorded BEFORE the launch, not after. If Start-Process
         throws, the record is already down and the next poll will not retry the
@@ -2029,6 +2579,21 @@ function Invoke-StealthRelaunch {
     if ($marker.AgeMinutes -gt $MaxStealthMarkerAgeMinutes) {
         Write-WatchLog ("Stale stealth marker, not resurrecting: written {0}, {1:N1} min old, limit {2} min." -f `
             $marker.Written.ToString('yyyy-MM-dd HH:mm:ss'), $marker.AgeMinutes, $MaxStealthMarkerAgeMinutes)
+        $script:LastStealthMarkerTs = $marker.TsRaw
+        Save-WatchState
+        return $false
+    }
+
+    # The ts of the last marker decided about is kept in the state file. When
+    # that could not be restored, a marker written before this monitor
+    # started may be one the monitor before it already relaunched for, and
+    # starting Claude again could undo a quit that came after. So it is not
+    # acted on: it is recorded as decided, and said. A marker written after
+    # the start is a new one, and is acted on as ever. Until 6.3.1 the ts read
+    # as 0, and such a marker as new.
+    if ($script:StateUnread -and $marker.AgeSeconds -gt ([datetime]::UtcNow - $script:StartTime).TotalSeconds) {
+        Write-WatchLog ("Stealth marker written {0}, before this monitor started, not acted on: the saved state that records whether it was could not be read." -f `
+            $marker.Written.ToString('yyyy-MM-dd HH:mm:ss'))
         $script:LastStealthMarkerTs = $marker.TsRaw
         Save-WatchState
         return $false
@@ -2154,10 +2719,25 @@ function Test-LogsForErrors {
         are limited by $LogTriggerFilePattern and the lines by
         Find-LogErrorPattern. $LegacyErrorPatterns records what the logs hold.
     #>
-    if (-not (Test-Path $ClaudeLogDir)) { return $null }
-
-    $logFiles = @(Get-ChildItem $ClaudeLogDir -Filter "*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match $LogTriggerFilePattern })
+    # A folder that is not there gives PathNotFound with ObjectNotFound and
+    # ItemNotFoundException, for a missing parent too (measured 2026-11-22):
+    # no logs yet. Any other error is said through the hourly throttle and
+    # the scan ends before the baselines are pruned. Until 6.3.1 the folder
+    # was listed with SilentlyContinue after a Test-Path that answers false
+    # for a folder it may not read, and a listing that failed read as a
+    # folder with no logs: no trigger could fire, and every baseline was
+    # dropped, so the errors written meanwhile were never scanned.
+    try {
+        $listed = @(Get-ChildItem -LiteralPath $ClaudeLogDir -Filter '*.log' -File -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' -ExceptionType 'System.Management.Automation.ItemNotFoundException') {
+            return $null
+        }
+        Write-CheckError -Check 'Claude logs' -ErrorRecord $_ `
+            -Text "LOG WARNING: The Claude log folder $ClaudeLogDir could not be listed ({0}), so no log trigger can fire until it can"
+        return $null
+    }
+    $logFiles = @($listed | Where-Object { $_.Name -match $LogTriggerFilePattern })
     $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]'
 
     foreach ($logFile in $logFiles) {
@@ -2258,13 +2838,30 @@ function Test-ServiceHealth {
     #>
     # The app, not any "claude". The service backs the app's workspace, and a
     # Claude Code CLI process alone neither needs it nor means the app is up.
-    $claude = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
+    #
+    # A read that failed is said, at most once an hour, and the check passes
+    # this poll with its count as it was: a repair is never started on it.
+    # Until 6.3.1 a process list that could not be read was empty, and a
+    # service that could not be read was "not installed".
+    try {
+        $claude = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
+    } catch {
+        Write-CheckError -Check 'service health' -ErrorRecord $_ `
+            -Text "Claude's processes could not be listed ({0}), so whether $ServiceName is needed is not known and nothing is done about it"
+        return $true
+    }
     if ($claude.Count -eq 0) {
         $script:ServiceDownCount = 0
         return $true
     }
 
-    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    try {
+        $svc = Get-ClaudeServiceOrNull -Name $ServiceName
+    } catch {
+        Write-CheckError -Check 'service health' -ErrorRecord $_ `
+            -Text "$ServiceName could not be read ({0}), so whether it is running is not known and nothing is done about it"
+        return $true
+    }
     if (-not $svc) {
         $script:ServiceDownCount = 0
         return $true   # Service not installed -- not a Cowork setup
@@ -2482,20 +3079,38 @@ function Test-WorkspaceStorage {
         claim to test them. It tests what it can actually see.
 
         Reports only. It does not trigger an auto-fix, because neither a full
-        disk nor a missing file is something a VM restart repairs. A free
-        space that cannot be read is logged, at most once an hour for the
-        same error (Write-CheckError); until 6.3.0 it was passed over.
+        disk nor a missing file is something a VM restart repairs. What it
+        returns, a VM cache folder that could not be read (naming the folder
+        and the error) or a volume with less than 2 GB free, the main loop's
+        Check 4b logs as a STORAGE WARNING, each different text at most once
+        an hour and with no cap on how many (Test-StorageWarningDue). Until
+        6.3.1 that line was written on every poll, about 120 times an hour.
+        A free space that cannot be read is logged here, at most once an hour
+        for the same error and no more than 3 different errors in an hour
+        (Write-CheckError, key 'storage'); until 6.3.0 it was passed over.
     #>
     if (Test-StartupGracePeriod) { return $null }
 
     $cachePath = $script:ClaudeEnv.VmCachePath
-    if (-not $cachePath -or -not (Test-Path $cachePath)) { return $null }
+    if (-not $cachePath) { return $null }
+    # Whether it is there is asked by the error's identity: a folder that
+    # could not be read is the fault this check is here to report. Until
+    # 6.3.1 Test-Path answered $false for it, which read as no VM cache.
+    # Both lines name the folder: the error Get-Item gives for a Deny,
+    # "Access is denied", does not.
+    $cacheItem = $null
+    try {
+        $cacheItem = Get-ClaudeItemOrNull -LiteralPath $cachePath
+    } catch {
+        return "The VM cache directory $cachePath could not be read ($(Get-CheckErrorText -ErrorRecord $_))"
+    }
+    if ($null -eq $cacheItem) { return $null }
 
     # 1. Readability.
     try {
         $null = @(Get-ChildItem $cachePath -Force -ErrorAction Stop | Select-Object -First 1)
     } catch {
-        return "VM cache directory is not readable: $($_.Exception.Message)"
+        return "The VM cache directory $cachePath could not be read ($(Get-CheckErrorText -ErrorRecord $_))"
     }
 
     # 2. Free space on the volume that holds it.
@@ -2537,8 +3152,18 @@ function Test-VmLogStaleness {
     # main.log is deliberately NOT a candidate. It is the Electron main process
     # log and it can sit frozen for a day at a time on a completely healthy
     # machine, which makes staleness there a guaranteed false positive.
-    if ($null -eq (Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir)) {
-        $script:VmLogStaleCount = 0
+    #
+    # A VM log that could not be read is said, at most once an hour, and the
+    # count stays as it was. Until 6.3.1 it read as no VM log, and the count
+    # started again from 0.
+    try {
+        if ($null -eq (Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir)) {
+            $script:VmLogStaleCount = 0
+            return $null
+        }
+    } catch {
+        Write-CheckError -Check 'VM log staleness' -ErrorRecord $_ `
+            -Text "STALENESS WARNING: The VM logs could not be read ({0}), so whether one has gone stale is not known and nothing is done about it"
         return $null
     }
 
@@ -2630,6 +3255,8 @@ function Invoke-W32tm {
     }
     try {
         if (-not (Wait-Job $job -Timeout $TimeoutSeconds)) {
+            # Clean-up of a job that has not answered: one that cannot be
+            # stopped ends with the monitor. The caller says the timeout.
             Stop-Job $job -ErrorAction SilentlyContinue
             return $null
         }
@@ -2647,6 +3274,8 @@ function Invoke-W32tm {
         }
         return $result
     } finally {
+        # Clean-up: the result, or why there is none, is in hand, and a job
+        # that cannot be removed ends with the monitor.
         Remove-Job $job -Force -ErrorAction SilentlyContinue
     }
 }
@@ -2765,7 +3394,20 @@ function Test-TimeSyncHealth {
     if ($script:ResyncBackoffUntil -gt $now.AddMinutes(60)) { $script:ResyncBackoffUntil = [datetime]::MinValue }
 
     try {
-        $w32svc = Get-Service -Name "W32Time" -ErrorAction SilentlyContinue
+        # Until 6.3.1 W32Time was read with SilentlyContinue, so a read that
+        # failed looked like a service that is not installed, and nobody was
+        # told. Get-ClaudeServiceOrNull tells the two apart by the error's
+        # identity (NoServiceFoundForGivenName, ServiceCommandException).
+        # A read that fails is said through the hourly throttle, and the
+        # service is not started on it, since whether it runs is not known;
+        # the clock is still measured.
+        $w32svc = $null
+        try {
+            $w32svc = Get-ClaudeServiceOrNull -Name 'W32Time'
+        } catch {
+            Write-CheckError -Check 'W32Time' -ErrorRecord $_ -Now $now `
+                -Text 'TIME WARNING: The Windows Time service could not be read ({0}), so it is not started if it is stopped; the clock is still measured every 5 min'
+        }
         if ($w32svc -and $w32svc.Status -ne "Running") {
             try {
                 Start-Service -Name "W32Time" -ErrorAction Stop
@@ -2839,7 +3481,11 @@ function Test-TimeSyncHealth {
         } catch {
             $source = "unknown ($(Get-CheckErrorText -ErrorRecord $_))"
         }
-        $script:ResyncBackoffUntil = $now.AddMinutes(60)
+        # From the time after the resync, not $now, which was read before
+        # it. Until 6.3.1 it ran from $now: a resync that set the clock
+        # forward left a hold that had already ended, or nearly, and the
+        # next check forced another resync at once.
+        $script:ResyncBackoffUntil = [datetime]::UtcNow.AddMinutes(60)
         return "Clock drift ${drift}s and $what; time source: $source. No resync is forced for 60 min while the drift lasts; it is still measured every 5 min"
     } catch {
         Write-CheckError -Check 'clock' -ErrorRecord $_ -Now $now `
@@ -2866,6 +3512,7 @@ function Test-CheckErrorDue {
         Whether a line saying that a check failed may be written now: $true
         once for each error of a check, and again at most once an hour while
         it lasts, for at most 3 different errors of one check in an hour.
+        Check 4b's STORAGE WARNING has its own (Test-StorageWarningDue).
     .DESCRIPTION
         The checks run on every poll or every few minutes, and what breaks a
         check once most often breaks it every time: unthrottled, the same
@@ -2920,6 +3567,42 @@ function Write-CheckError {
     }
 }
 
+function Test-StorageWarningDue {
+    <#
+    .SYNOPSIS
+        Whether Check 4b may log a STORAGE WARNING now: $true for a text not
+        logged in the last hour, so a new warning, or one whose text changes
+        to one not logged in that hour, is logged at once, and the same text
+        again at most once an hour while it lasts.
+    .DESCRIPTION
+        Keyed on the text alone, with no cap on how many different texts are
+        logged in an hour. The texts are few, so the log stays small: the
+        low-space text moves in steps of 0.1 GB below 2 GB, so a volume that
+        fills gives at most 21 different texts, from 2 GB free to 0 GB; a
+        free space that goes back and forth across one step gives 2 an hour,
+        and a VM cache folder that cannot be read gives one for each error.
+
+        Not Test-CheckErrorDue: its cap of 3 different errors of one check in
+        an hour held back the fourth low-space text as the volume filled, the
+        one nearest to full, and a new fault after three, for up to an hour;
+        and the storage check's own free-space read errors, which go through
+        it under the key 'storage', were held back by the warnings too.
+
+        Entries an hour old are dropped first; a time in the future, after
+        the clock was set back, counts as old. UTC, and in memory only: after
+        a restart a warning that lasts is logged again once. Until 6.3.1 the
+        warning was written on every poll, about 120 times an hour.
+    #>
+    param([string]$Message, [datetime]$Now)
+    foreach ($k in @($script:StorageWarningsSaid.Keys)) {
+        $age = ($Now - $script:StorageWarningsSaid[$k]).TotalMinutes
+        if ($age -ge 60 -or $age -lt 0) { $script:StorageWarningsSaid.Remove($k) }
+    }
+    if ($script:StorageWarningsSaid.ContainsKey($Message)) { return $false }
+    $script:StorageWarningsSaid[$Message] = $Now
+    return $true
+}
+
 function Test-VmcomputeHealth {
     <#
     .SYNOPSIS
@@ -2940,10 +3623,17 @@ function Test-VmcomputeHealth {
         # @()-wrapped. Get-Process returns a scalar for a single match, and
         # .HandleCount on a scalar is fine, but the collection form is what the
         # rest of this file assumes and it also survives zero matches.
-        $vmcomputeProcs = @(Get-Process -Name "vmcompute" -ErrorAction SilentlyContinue)
+        #
+        # Through Get-ClaudeProcessByName: a vmcompute that is not running
+        # (NoProcessFoundForGivenName) gives nothing, and any other error is
+        # thrown to the catch below, which says it. Until 6.3.1 it was read
+        # with SilentlyContinue, and a list that could not be read was taken
+        # for a vmcompute that is not running.
+        $vmcomputeProcs = @(Get-ClaudeProcessByName -Name 'vmcompute')
         if ($vmcomputeProcs.Count -eq 0) { return $null }
 
         $handleCount = 0
+        $countsRead = 0
         foreach ($vp in $vmcomputeProcs) {
             # Through the getter method: a property whose getter throws reads
             # as nothing in PowerShell, with no error (measured on 5.1), so
@@ -2951,12 +3641,18 @@ function Test-VmcomputeHealth {
             # the catch below was never reached.
             try {
                 $hc = $vp.get_HandleCount()
+                $countsRead++
                 if ($hc -gt $handleCount) { $handleCount = $hc }
             } catch {
                 Write-CheckError -Check 'vmcompute handles' -ErrorRecord $_ `
                     -Text "The handle count of vmcompute (PID $($vp.Id)) could not be read ({0}), so a handle leak in it would not be seen"
             }
         }
+        # No count read is not a count of 0. Until 6.3.1 it was taken for
+        # one and set the run of high counts back to 0, so a count that
+        # could be read only now and then could never reach the second
+        # high check that starts a repair.
+        if ($countsRead -eq 0) { return $null }
 
         # Thresholds are 20000 and 12000, not 10000 and 5000.
         #
@@ -3080,20 +3776,38 @@ function Test-HcsStateHealth {
             $recentSpike = @($allShutdownEvents | Where-Object { $_.TimeCreated -and $_.TimeCreated.ToUniversalTime() -gt $fiveMinAgoUtc })
             if ($recentSpike.Count -gt 15) {
                 # Before restarting vmcompute, check if there is an active session
-                $coworkSvc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+                #
                 # Every process named claude counts, the Claude Code CLI
                 # included: this only holds a vmcompute restart back, and
                 # erring that way is safe.
-                $claudeRunning = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue).Count -gt 0
+                #
+                # Until 6.3.1 both were read with SilentlyContinue, and a read
+                # that failed read as no service and no app, which let the
+                # restart through under a session that may be live. The
+                # helpers give nothing only for the error that means not
+                # there (NoServiceFoundForGivenName, NoProcessFoundForGivenName)
+                # and throw any other; a read that fails holds the restart
+                # back, said through the hourly throttle.
+                $sessionReadError = $null
+                $coworkSvc = $null
+                $claudeRunning = $false
+                try {
+                    $coworkSvc = Get-ClaudeServiceOrNull -Name $ServiceName
+                    $claudeRunning = @(Get-ClaudeProcessByName -Name $ProcessName).Count -gt 0
+                } catch {
+                    $sessionReadError = $_
+                }
                 # Fix's lock, as Invoke-AutoFix asks it. This was pinned to
                 # "Global\ClaudeDesktopFix_v4.8", so it never found the lock and
                 # would have restarted vmcompute out from under a running
                 # repair; and until 6.3.0 it kept a copy of the check of its
                 # own, which read a lock it may not open as not held.
-                $fixRunning = Test-FixLockHeld
-                if ($claudeRunning -and $coworkSvc -and $coworkSvc.Status -eq "Running") {
+                if ($sessionReadError) {
+                    Write-CheckError -Check 'HCS spike' -ErrorRecord $sessionReadError `
+                        -Text "HCS SPIKE: $($recentSpike.Count) failures in 5 min, but whether a session is active could not be read ({0}); skipping vmcompute restart"
+                } elseif ($claudeRunning -and $coworkSvc -and $coworkSvc.Status -eq "Running") {
                     Write-WatchLog "HCS SPIKE: $($recentSpike.Count) failures in 5 min but active session detected, skipping vmcompute restart"
-                } elseif ($fixRunning) {
+                } elseif (Test-FixLockHeld) {
                     Write-WatchLog "HCS SPIKE: $($recentSpike.Count) failures in 5 min but Fix is running, skipping vmcompute restart"
                 } else {
                     Write-WatchLog "HCS SPIKE: $($recentSpike.Count) shutdown failures in 5 min, restarting vmcompute"
@@ -3235,11 +3949,36 @@ function Stop-StaleCoworkVm {
             return
         }
         $started = @{}
+        $unread = 0
         foreach ($w in $workers) {
-            $wg = Get-VmWorkerGuid -CommandLine ([string]$w.CommandLine)
+            # A worker whose command line could not be read cannot be told
+            # to be a Cowork one or not, and a Cowork worker with no start
+            # time cannot be told to be the live one or not. Until 6.3.1
+            # either was passed over: if it was the live VM's worker, the
+            # live VM was taken for a stale one and killed. Now nothing is
+            # killed while any worker is unread.
+            $cmd = [string]$w.CommandLine
+            if (-not $cmd) { $unread++; continue }
+            $wg = Get-VmWorkerGuid -CommandLine $cmd
+            if (-not $wg) { continue }
+            if (-not $w.CreationDate) {
+                if ($vmGuids -contains $wg) { $unread++ }
+                continue
+            }
             # In UTC: in the hour the clocks go back, a worker started later
-            # can show an earlier local time.
-            if ($wg -and $w.CreationDate) { $started[$wg] = ([datetime]$w.CreationDate).ToUniversalTime() }
+            # can show an earlier local time. Measured 2026-11-22 on 5.1:
+            # Win32_Process.CreationDate comes from CIM as a local DateTime
+            # holding the same instant as Process.StartTime, and one in the
+            # repeated hour keeps which of the two it is, so this UTC time is
+            # exact (2026-10-25 00:30Z read as 01:30 and went back to 00:30Z).
+            $started[$wg] = ([datetime]$w.CreationDate).ToUniversalTime()
+        }
+        if ($unread -gt 0) {
+            if (Test-CheckErrorDue -Check 'stale VMs' -Message 'a worker could not be read' -Now ([datetime]::UtcNow)) {
+                Write-WatchLog ("HCS: $($vmGuids.Count) cowork-vm compute systems, and the command line or start time of $unread VM worker " +
+                    "process(es) (vmwp.exe) could not be read to tell the live one by; none killed; the same error is logged at most once an hour")
+            }
+            return
         }
         $live = $null
         foreach ($guid in $vmGuids) {
@@ -3352,19 +4091,44 @@ function Test-ClaudeCodeActive {
         # minutes old, or the other way round. Until 6.3.0 these were local.
         $nowUtc = [datetime]::UtcNow
 
+        # What could not be read is gathered. A recent sign anywhere answers
+        # yes whatever else could not be read; without one, a read that
+        # failed answers yes too, through the catch below. Until 6.3.1 a
+        # folder that could not be read was passed over as one with nothing
+        # recent in it, and the answer was "no session".
+        $unread = @($cands.Errors)
+
         # Check 1: Claude Code session persistence files, written as Code works,
         # under <data root>\claude-code-sessions\{accountId}\{orgId}\.
         $sessionDirsSeen = 0
         foreach ($root in @($cands.DataRoots)) {
             $codeSessionDir = Join-Path $root.Path "claude-code-sessions"
-            if (-not (Test-Path -LiteralPath $codeSessionDir -PathType Container)) { continue }
+            try {
+                $sessionDir = Get-ClaudeItemOrNull -LiteralPath $codeSessionDir
+            } catch {
+                $unread += "$codeSessionDir could not be read: $(Get-ClaudeErrorText $_)"
+                continue
+            }
+            if (-not $sessionDir -or -not $sessionDir.PSIsContainer) { continue }
             $sessionDirsSeen++
-            $recentFiles = Get-ChildItem -LiteralPath $codeSessionDir -Filter "*.json" -Recurse -File -ErrorAction SilentlyContinue |
+            $walkErrors = $null
+            $recentFiles = Get-ChildItem -LiteralPath $codeSessionDir -Filter "*.json" -Recurse -File `
+                    -ErrorAction SilentlyContinue -ErrorVariable walkErrors |
                 Where-Object { ($nowUtc - $_.LastWriteTimeUtc).TotalMinutes -lt 10 } |
                 Select-Object -First 1
             if ($recentFiles) { return $true }
+            # A folder that went away during the walk (PathNotFound) is a
+            # session that ended. @($null) holds one element, so a $null is
+            # passed over.
+            foreach ($we in @($walkErrors)) {
+                if ($null -eq $we) { continue }
+                if (-not (Test-ClaudeNotFoundError -ErrorRecord $we -ErrorId 'PathNotFound' `
+                        -ExceptionType 'System.Management.Automation.ItemNotFoundException')) {
+                    $unread += "$codeSessionDir could not be read in full: $(Get-ClaudeErrorText $we)"
+                }
+            }
         }
-        if ($sessionDirsSeen -eq 0 -and -not $Silent -and -not $script:NoCodeSessionDirLogged) {
+        if ($sessionDirsSeen -eq 0 -and $unread.Count -eq 0 -and -not $Silent -and -not $script:NoCodeSessionDirLogged) {
             # Said once: either Code has never run here, or the app has moved
             # its data somewhere Get-ClaudeDataCandidates does not look.
             $script:NoCodeSessionDirLogged = $true
@@ -3378,7 +4142,19 @@ function Test-ClaudeCodeActive {
         foreach ($ld in @($cands.LogDirs)) {
             if (-not $ld.Newest -or ($nowUtc - $ld.Newest.ToUniversalTime()).TotalMinutes -ge 10) { continue }
             foreach ($pattern in @('unknown-window*.log', 'claude.ai-web*.log', 'remote-control*.log')) {
-                foreach ($rLog in @(Get-ChildItem -LiteralPath $ld.Path -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+                # A folder that went away since it was listed holds nothing.
+                try {
+                    $rLogs = @(Get-ChildItem -LiteralPath $ld.Path -Filter $pattern -File -ErrorAction Stop)
+                } catch {
+                    if (-not (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' `
+                            -ExceptionType 'System.Management.Automation.ItemNotFoundException')) {
+                        $unread += "$($ld.Path) could not be read: $(Get-ClaudeErrorText $_)"
+                    }
+                    # The folder's other logs are not listed either: it is
+                    # said once, and a folder gone holds none of them.
+                    break
+                }
+                foreach ($rLog in $rLogs) {
                     if (($nowUtc - $rLog.LastWriteTimeUtc).TotalMinutes -lt 10) { return $true }
                 }
             }
@@ -3393,11 +4169,18 @@ function Test-ClaudeCodeActive {
         # foreground command, because a tool call writes nothing there until
         # it returns.
         if (Test-ClaudeCodeTranscriptRecent -Minutes 35) { return $true }
+
+        if ($unread.Count -gt 0) {
+            throw "no recent sign of a session, and what could not be read may hold one: $($unread -join '; ')"
+        }
     } catch {
         # Fails CLOSED. Test-UserActivity calls this to decide whether a repair
         # may proceed, so an unknown answer must not read as "no session".
+        # At most once an hour for the same error (Write-CheckError); until
+        # 6.3.1 on each call.
         if (-not $Silent) {
-            Write-WatchLog "Test-ClaudeCodeActive failed ($($_.Exception.Message)); assuming a Code session IS active"
+            Write-CheckError -Check 'Code session' -ErrorRecord $_ `
+                -Text "Test-ClaudeCodeActive failed ({0}); assuming a Code session IS active"
         }
         return $true
     }
@@ -3432,8 +4215,10 @@ function Test-UserActivity {
     try {
         # Every process named claude, the Claude Code CLI included: a busy
         # project thread or terminal session is activity, and this only ever
-        # holds a repair back.
-        $claudeProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+        # holds a repair back. A list that could not be read throws to the
+        # catch below, which answers yes. Until 6.3.1 it was empty, and the
+        # answer was "not in use".
+        $claudeProcs = @(Get-ClaudeProcessByName -Name $ProcessName)
         if ($claudeProcs.Count -eq 0) { return $false }
 
         if ($script:IsInteractiveSession -and $script:Win32ActivityLoaded) {
@@ -3447,17 +4232,17 @@ function Test-UserActivity {
                     foreach ($cp in $claudeProcs) {
                         if ($cp.Id -eq $fgPid) { return $true }
                     }
-                    # Electron renderer -> main process: check parent PID
-                    try {
-                        $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$fgPid" -ErrorAction SilentlyContinue).ParentProcessId
+                    # Electron renderer -> main process: check parent PID.
+                    # A window whose process exited since it was read has no
+                    # entry, and is not Claude's: checks 2 to 6 follow. A read
+                    # that fails throws to the catch below, which answers yes.
+                    # Until 6.3.1 it was passed over, as a window not Claude's.
+                    $fgProc = @(Get-CimInstance Win32_Process -Filter "ProcessId=$fgPid" -ErrorAction Stop)
+                    if ($fgProc.Count -gt 0) {
+                        $parentId = $fgProc[0].ParentProcessId
                         foreach ($cp in $claudeProcs) {
                             if ($cp.Id -eq $parentId) { return $true }
                         }
-                    } catch {
-                        # The window's process exited since it was read, and
-                        # under StrictMode its parent is then no property of
-                        # nothing: it is not Claude's, and checks 2 to 6 follow.
-                        $null = $_
                     }
                 }
             }
@@ -3509,9 +4294,10 @@ function Test-UserActivity {
         $cpuBefore = @{}
         foreach ($cp in $claudeProcs) {
             # A process that exited since the list was read has no CPU time
-            # to read, and is not busy.
+            # to read, and is not busy. Any other failure throws to the catch
+            # below, which answers yes: until 6.3.1 it read as not busy.
             try { $cpuBefore[$cp.Id] = $cp.TotalProcessorTime.TotalMilliseconds }
-            catch { $null = $_ }
+            catch { if (-not [bool]$cp.HasExited) { throw } }
         }
         if ($cpuBefore.Count -gt 0) {
             Start-Sleep -Milliseconds 500
@@ -3523,8 +4309,9 @@ function Test-UserActivity {
                         return $true
                     }
                 } catch {
-                    # Exited during the sample: not busy.
-                    $null = $_
+                    # Exited during the sample: not busy. Anything else, as
+                    # above.
+                    if (-not [bool]$cp.HasExited) { throw }
                 }
             }
         }
@@ -3547,9 +4334,11 @@ function Test-UserActivity {
         # possible answer to give when the truth is unknown.
         #
         # The error is logged rather than swallowed, because the previous empty
-        # catch is why nobody knew this could happen.
+        # catch is why nobody knew this could happen. At most once an hour for
+        # the same error (Write-CheckError); until 6.3.1 on each call.
         if (-not $Silent) {
-            Write-WatchLog "Test-UserActivity failed ($($_.Exception.Message)); assuming the user IS active"
+            Write-CheckError -Check 'user activity' -ErrorRecord $_ `
+                -Text "Test-UserActivity failed ({0}); assuming the user IS active"
         }
         return $true
     }
@@ -3580,10 +4369,27 @@ function Test-CoworkSessionActive {
     # [vmOneShot] line for every command coworkd runs, so nothing is lost.
     $vmLogFile = $null
     if ($script:ClaudeLogDir) { $vmLogFile = Join-Path $script:ClaudeLogDir 'cowork_vm_node.log' }
-    if (-not $vmLogFile -or -not (Test-Path -LiteralPath $vmLogFile)) { return $false }
+    if (-not $vmLogFile) { return $false }
+    # Only read the last 200 lines to stay fast.
+    #
+    # A log that is not there gives PathNotFound with ObjectNotFound and
+    # ItemNotFoundException (measured 2026-11-22): no session. Any other
+    # error is said through the hourly throttle, and the answer is $true.
+    # Every caller holds something back on an active session (a staleness
+    # warning, an HCS trigger, a repair), so not knowing holds it back too.
+    # Until 6.3.1 the log was read with SilentlyContinue after a Test-Path,
+    # and a log that could not be read read as no session.
     try {
-        # Only read the last 200 lines to stay fast
-        $lines = @(Get-Content -LiteralPath $vmLogFile -Tail 200 -ErrorAction SilentlyContinue)
+        $lines = @(Get-Content -LiteralPath $vmLogFile -Tail 200 -ErrorAction Stop)
+    } catch {
+        if (Test-ClaudeNotFoundError -ErrorRecord $_ -ErrorId 'PathNotFound' -ExceptionType 'System.Management.Automation.ItemNotFoundException') {
+            return $false
+        }
+        Write-CheckError -Check 'Cowork session' -ErrorRecord $_ `
+            -Text "The Cowork VM log $vmLogFile could not be read ({0}), so a Cowork session is taken to be active and nothing that would end one is done"
+        return $true
+    }
+    try {
         if ($lines.Count -eq 0) { return $false }
 
         # Liveness comes from recent VM activity tags, not from pairing
@@ -3623,10 +4429,12 @@ function Test-CoworkSessionActive {
             return (($now - $ts).TotalSeconds -le $windowSec)
         }
     } catch {
-        # Unparseable log. Report no active session, which leaves the other
-        # guards in Test-UserActive to decide.
-        $null = $_
-        return $false
+        # Lines that could not be read through. Said, and taken as an active
+        # session, as a log that could not be read is. Until 6.3.1 this
+        # answered no session without a word.
+        Write-CheckError -Check 'Cowork session' -ErrorRecord $_ `
+            -Text "The Cowork VM log $vmLogFile could not be read through ({0}), so a Cowork session is taken to be active and nothing that would end one is done"
+        return $true
     }
     return $false
 }
@@ -3730,6 +4538,32 @@ function Get-HeldBackRetryWait {
     return [int][math]::Min(60, 2 * [math]::Pow(2, [math]::Max(0, $RetriesHeld)))
 }
 
+function Get-ProcessStartUtc {
+    <#
+    .SYNOPSIS
+        A process's start time as UTC; $null for one that has exited since
+        it was listed; throws for one still running whose start time could
+        not be read.
+    .DESCRIPTION
+        PowerShell reads a getter that throws as nothing (measured on 5.1,
+        2026-11-22), so a start time that reads as nothing is either a
+        process that has exited, routine with Electron's short-lived
+        helpers, or one this monitor may not open, as one running with
+        rights it lacks. HasExited tells them apart: its getter answers
+        $true for a process that is gone, and for one this monitor may not
+        open it throws Access is denied, which reads as nothing too, and
+        [bool] makes that $false (measured on 5.1, 2026-11-22, for System,
+        csrss and lsass). The getter method is then asked again, and throws
+        the reason. Until 6.3.1 both were passed over, as if every one had
+        exited.
+    #>
+    param($Process)
+    $st = $Process.StartTime
+    if ($null -ne $st) { return ([datetime]$st).ToUniversalTime() }
+    if ([bool]$Process.HasExited) { return $null }
+    return $Process.get_StartTime().ToUniversalTime()
+}
+
 function Get-ClaudeAppStartTime {
     <#
     .SYNOPSIS
@@ -3742,17 +4576,31 @@ function Get-ClaudeAppStartTime {
         not count. StartTime is read per process inside a try, as DEFERRED
         reads it: it throws for a process that has just exited.
     #>
+    # A list that could not be read is said, at most once an hour, and the
+    # answer is $null, which ends no held-back repair. Until 6.3.1 the list
+    # could not fail here: one that could not be read was empty.
     try { $procs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv) }
-    catch { return $null }
+    catch {
+        Write-CheckError -Check 'app start time' -ErrorRecord $_ `
+            -Text "When Claude Desktop started could not be read ({0}), so a held-back repair is not ended on it"
+        return $null
+    }
+    # A process that has exited since the list was read is not the main
+    # process, and is passed over. One still running whose start time could
+    # not be read is said, and the answer is $null: until 6.3.1 it was passed
+    # over too, so if it was the main process the start of a younger helper
+    # was taken for the app's, and could end a held-back repair.
     $oldest = $null
     foreach ($p in $procs) {
         try {
-            $st = $p.StartTime.ToUniversalTime()
-            if ($null -eq $oldest -or $st -lt $oldest) { $oldest = $st }
+            $st = Get-ProcessStartUtc -Process $p
         } catch {
-            # Exited since the list was read: not the main process.
-            $null = $_
+            Write-CheckError -Check 'app start time' -ErrorRecord $_ `
+                -Text "When Claude Desktop started could not be read ({0}), so a held-back repair is not ended on it"
+            return $null
         }
+        if ($null -eq $st) { continue }
+        if ($null -eq $oldest -or $st -lt $oldest) { $oldest = $st }
     }
     return $oldest
 }
@@ -3996,16 +4844,18 @@ function Get-ClaudeCodeSessionHold {
         Fails closed, as Fix's gate does for the app's sessions: a list or a
         folder that cannot be read is a reason too.
     #>
+    # Each reason that could not be read says why, as Fix's gate does. Until
+    # 6.3.1 the monitor's said only that it could not.
     try {
         $appCli = @(Get-ClaudeAppCliProcess -Environment $script:ClaudeEnv)
         if ($appCli.Count -gt 0) { return "$($appCli.Count) Claude Code session(s) the app started are running" }
     } catch {
-        return "the Claude Code sessions the app started could not be listed"
+        return "the Claude Code sessions the app started could not be listed ($(Get-ClaudeErrorText $_))"
     }
     try {
         if (Test-ClaudeCodeTranscriptRecent -Minutes 35) { return "a Claude Code transcript was written in the last 35 minutes" }
     } catch {
-        return "the Claude Code transcripts could not be read"
+        return "whether a Claude Code transcript was written in the last 35 minutes could not be read ($(Get-ClaudeErrorText $_))"
     }
     return $null
 }
@@ -4257,27 +5107,52 @@ function Invoke-AutoFix {
     # the app starts a fresh Claude Code CLI process for project threads as they
     # run, so counting those would read every thread wake as an app launch and
     # could defer a repair for as long as threads keep waking.
-    $claudeStartupProcs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
-    if ($claudeStartupProcs.Count -gt 0) {
-        # .StartTime is read per process inside a try.
-        #
-        # A process that exited between the Get-Process above and this line
-        # has no start time, and with sixteen short-lived Electron helpers
-        # around, that is a routine occurrence rather than an edge case.
-        # PowerShell reads it as nothing rather than throwing (measured on
-        # 5.1), and a process with none is passed over; the try is for
-        # anything else. Unprotected, one exited helper abandoned the whole
-        # repair for that cycle.
-        $youngest = $null
+    #
+    # A list that could not be read defers the repair, as a start too recent
+    # does: whether the app has just started is not known. Until 6.3.1 such a
+    # list was empty, and the repair went ahead.
+    $claudeStartupProcs = @()
+    $startupUnread = $null
+    $retryWhen = 'once they can be listed'
+    try {
+        $claudeStartupProcs = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv)
+    } catch {
+        $startupUnread = "Claude's processes could not be listed ($(Get-CheckErrorText -ErrorRecord $_))"
+    }
+    # Each start time through Get-ProcessStartUtc. A process that exited
+    # between the list and this line has none, and with sixteen short-lived
+    # Electron helpers around, that is a routine occurrence rather than an
+    # edge case: it is passed over. One still running whose start time could
+    # not be read defers the repair, as a list that could not be read does:
+    # it may be the app, just started. Until 6.3.1 it was passed over too.
+    # UTC, for the same reason as Test-ClaudeCodeActive's ages: at the
+    # change to summer time a process started a minute ago read as an hour
+    # and a minute old.
+    $youngest = $null
+    if (-not $startupUnread) {
         foreach ($sp in $claudeStartupProcs) {
             try {
-                $st = $sp.StartTime
-                if ($null -eq $youngest -or $st -gt $youngest) { $youngest = $st }
-            } catch { $null = $_ }
+                $st = Get-ProcessStartUtc -Process $sp
+            } catch {
+                $startupUnread = "the start time of one of Claude's processes could not be read ($(Get-CheckErrorText -ErrorRecord $_))"
+                $retryWhen = 'once it can be read'
+                break
+            }
+            if ($null -ne $st -and ($null -eq $youngest -or $st -gt $youngest)) { $youngest = $st }
         }
-        # UTC, for the same reason as Test-ClaudeCodeActive's ages: at the
-        # change to summer time a process started a minute ago read as an
-        # hour and a minute old.
+    }
+    if ($startupUnread) {
+        Write-WatchLog ">>> DEFERRED: $Reason, $startupUnread, so whether it has just started is not known"
+        $script:LastFixTime = $now.AddMinutes(-($Cooldown - 1))
+        $script:CooldownFromHold = $true
+        if ($keepOnHold) {
+            Register-HeldBackRepair -Reason $pendingReason -HeldAt $now
+            Save-WatchState
+            Write-WatchLog "    It is tried again $retryWhen, for up to 4 hours"
+        }
+        return
+    }
+    if ($claudeStartupProcs.Count -gt 0) {
         $procAge = if ($youngest) { ([datetime]::UtcNow - $youngest.ToUniversalTime()).TotalSeconds } else { [double]::MaxValue }
         if ($procAge -lt 120) {
             Write-WatchLog ">>> DEFERRED: $Reason, Claude launched $([math]::Round($procAge))s ago (waiting for startup to complete)"
@@ -4334,8 +5209,16 @@ function Invoke-AutoFix {
     $cancelFix = $false
     $cancelReason = ""
     # Every process named claude, the Claude Code CLI included: this can only
-    # cancel the repair, and erring that way is safe.
-    $claudeProcs = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    # cancel the repair, and erring that way is safe. A list that could not
+    # be read cancels it, as does each read below that fails: until 6.3.1
+    # each read as nothing, and the repair went ahead.
+    $claudeProcs = @()
+    try {
+        $claudeProcs = @(Get-ClaudeProcessByName -Name $ProcessName)
+    } catch {
+        $cancelFix = $true
+        $cancelReason = "Claude's processes could not be listed ($(Get-CheckErrorText -ErrorRecord $_))"
+    }
     if ($claudeProcs.Count -gt 0) {
         # Cancel if Claude is the foreground window
         if ($script:IsInteractiveSession -and $script:Win32ActivityLoaded) {
@@ -4348,16 +5231,17 @@ function Invoke-AutoFix {
                         foreach ($cp in $claudeProcs) {
                             if ($cp.Id -eq $fgPid) { $cancelFix = $true; $cancelReason = "Claude is now in focus"; break }
                         }
+                        # A window whose process exited since it was read
+                        # has no entry, and is not Claude's. A read that
+                        # fails goes to the catch below, which says so.
+                        # Until 6.3.1 it was passed over in silence.
                         if (-not $cancelFix) {
-                            try {
-                                $parentId = (Get-CimInstance Win32_Process -Filter "ProcessId=$fgPid" -ErrorAction SilentlyContinue).ParentProcessId
+                            $fgProc = @(Get-CimInstance Win32_Process -Filter "ProcessId=$fgPid" -ErrorAction Stop)
+                            if ($fgProc.Count -gt 0) {
+                                $parentId = $fgProc[0].ParentProcessId
                                 foreach ($cp in $claudeProcs) {
                                     if ($cp.Id -eq $parentId) { $cancelFix = $true; $cancelReason = "Claude is now in focus"; break }
                                 }
-                            } catch {
-                                # The window's process exited since it was
-                                # read: it is not Claude's.
-                                $null = $_
                             }
                         }
                     }
@@ -4382,8 +5266,23 @@ function Invoke-AutoFix {
                         $cpu2 = $cp.TotalProcessorTime.TotalMilliseconds
                         if (($cpu2 - $cpu1) -gt 50) { $cancelFix = $true; $cancelReason = "Claude CPU active (sample $sample/3)"; break }
                     } catch {
-                        # Exited during the sample: not busy.
-                        $null = $_
+                        # Exited during the sample: not busy. Anything else,
+                        # or an end that cannot be read, cancels, and the
+                        # reason names both. get_HasExited(), not
+                        # .HasExited: a getter that throws reads as nothing
+                        # (measured 2026-11-23 on Windows PowerShell 5.1),
+                        # so until 6.3.1 the catch here never ran and an end
+                        # that could not be read was not said.
+                        $sampleError = Get-CheckErrorText -ErrorRecord $_
+                        $sampleGone = $false
+                        $endError = $null
+                        try { $sampleGone = [bool]$cp.get_HasExited() } catch { $endError = $_ }
+                        if (-not $sampleGone) {
+                            $cancelFix = $true
+                            $cancelReason = "whether claude process $($cp.Id) is using CPU could not be read ($sampleError)"
+                            if ($endError) { $cancelReason += ", nor whether it has ended ($(Get-CheckErrorText -ErrorRecord $endError))" }
+                            break
+                        }
                     }
                 }
             }
@@ -4393,8 +5292,13 @@ function Invoke-AutoFix {
     # Cancel if VM log became active during the 30s window
     if (-not $cancelFix) {
         # Any VM log, read now: the same test as Test-UserActivity's check 3.
-        $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir
-        if ($null -ne $ageSec -and $ageSec -lt 120) { $cancelFix = $true; $cancelReason = "VM log became active" }
+        try {
+            $ageSec = Get-ClaudeVmLogAge -LogDir $script:ClaudeLogDir
+            if ($null -ne $ageSec -and $ageSec -lt 120) { $cancelFix = $true; $cancelReason = "VM log became active" }
+        } catch {
+            $cancelFix = $true
+            $cancelReason = "the VM logs could not be read ($(Get-CheckErrorText -ErrorRecord $_))"
+        }
     }
 
     # Cancel if a Claude Code session is active
@@ -4756,6 +5660,12 @@ function Sync-ClaudeDataPaths {
     try {
         $p = Resolve-ClaudeDataPaths -PackageFamilyName $script:ClaudeEnv.PackageFamilyName `
                                      -AppDataDir $ClaudeAppData
+        # A candidate that could not be read may be the live folder, or may
+        # make an old one look the freshest, so nothing is followed while one
+        # stands. Until 6.3.1 it looked the same as a folder not there.
+        if (@($p.Errors).Count -gt 0) {
+            throw "$(@($p.Errors).Count) candidate folder(s) could not be read: $(@($p.Errors) -join '; ')"
+        }
         if ($p.DataRoot -and $p.DataRootSource -ne 'fallback' -and
             $p.DataRoot -ne $script:ClaudeEnv.DataRoot) {
             Write-WatchLog "Claude data root moved: $($script:ClaudeEnv.DataRoot) -> $($p.DataRoot) ($($p.DataRootSource))"
@@ -4791,7 +5701,9 @@ function Sync-ClaudeDataPaths {
             }
         }
     } catch {
-        Write-WatchLog "Looking for the app's folders again failed: $($_.Exception.Message)"
+        # At most once an hour for the same error; until 6.3.1 on each look.
+        Write-CheckError -Check 'data folders' -ErrorRecord $_ `
+            -Text "Looking for the app's folders again failed ({0}); nothing was moved"
     }
 }
 
@@ -4842,6 +5754,24 @@ if ($script:SessionReadError) {
     Write-CheckError -Check 'session' -ErrorRecord $script:SessionReadError `
         -Text "The session this monitor runs in could not be read ({0}), so the foreground-window and input checks are skipped, as in Session 0"
 }
+if ($script:Win32ActivityError) {
+    Write-CheckError -Check 'activity checks' -ErrorRecord $script:Win32ActivityError `
+        -Text "The foreground-window and input checks could not be loaded ({0}), so they are skipped, as in Session 0"
+}
+if ($script:LogCleanupError) {
+    Write-CheckError -Check 'old logs' -ErrorRecord $script:LogCleanupError `
+        -Text "The watch logs older than 30 days in $WatchLogDir could not all be deleted ({0}); they are tried again at the next rollover"
+}
+# Each read the discovery at start could not make, once (ReadErrors). Until
+# 6.3.1 one that failed looked the same as one that found nothing.
+foreach ($readError in @($script:ClaudeEnv.ReadErrors)) {
+    Write-WatchLog "READ ERROR at start: $readError"
+}
+# Its own check: a poll that cannot read it either says so as well.
+if ($script:SeedReadError) {
+    Write-CheckError -Check 'Claude processes at start' -ErrorRecord $script:SeedReadError `
+        -Text "Whether Claude is running could not be read at start ({0}); the first poll that reads it starts from there"
+}
 
 try {
     while ($true) {
@@ -4853,7 +5783,18 @@ try {
             # terminal session) kept this true after the app had gone, so the
             # exit below was never seen, a stealth update was never relaunched,
             # and the checks under it ran against an app that was not there.
-            $claudeRunning = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0
+            #
+            # A list that could not be read ends the poll, said at most once
+            # an hour: every check below turns on whether the app runs, and
+            # the relaunch below starts it. Until 6.3.1 such a list was
+            # empty, "Claude is not running".
+            try {
+                $claudeRunning = @(Get-ClaudeDesktopProcess -Environment $script:ClaudeEnv).Count -gt 0
+            } catch {
+                Write-CheckError -Check 'Claude processes' -ErrorRecord $_ `
+                    -Text "Whether Claude is running could not be read ({0}), so this poll checked nothing and did nothing"
+                continue
+            }
 
             # An app that has just started may be a new version that keeps its
             # files somewhere else, so look at once rather than at the next
@@ -4878,10 +5819,22 @@ try {
             # Whether the service is still up is recorded alongside it: Close
             # mode stops the service, so a live service with no Claude leans
             # towards an unexpected exit rather than a clean shutdown.
-            if ($claudeRunning -ne $script:ClaudeWasRunning) {
+            #
+            # Not read at start: seeded by the first poll that reads it, with
+            # no transition to report.
+            if ($null -eq $script:ClaudeWasRunning) {
+                $script:ClaudeWasRunning = $claudeRunning
+            } elseif ($claudeRunning -ne $script:ClaudeWasRunning) {
                 if (-not $claudeRunning) {
-                    $svcNow = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-                    $svcState = if ($svcNow) { "$($svcNow.Status)" } else { "absent" }
+                    # Not registered and could not be read are told apart
+                    # (Get-ClaudeServiceOrNull). Until 6.3.1 both said
+                    # "absent".
+                    try {
+                        $svcNow = Get-ClaudeServiceOrNull -Name $ServiceName
+                        $svcState = if ($svcNow) { "$($svcNow.Status)" } else { "absent" }
+                    } catch {
+                        $svcState = "not known, it could not be read: $(Get-CheckErrorText -ErrorRecord $_)"
+                    }
                     if ($NoStealthRelaunch) {
                         Write-WatchLog "Claude is no longer running (service: $svcState). Not acting: stealth relaunch is off (-NoStealthRelaunch)."
                     } elseif (Get-StealthRelaunchMarker) {
@@ -4943,10 +5896,16 @@ try {
                 }
 
                 # Check 4b: workspace storage readable and not out of room.
-                # Warning only: a restart does not create disk space.
+                # Warning only: a restart does not create disk space. Each
+                # different text is said at most once an hour, with no cap
+                # on how many (Test-StorageWarningDue), so a new warning, or
+                # one whose text changes to one not said in that hour, is
+                # said at once. Until 6.3.1 it was written on every poll
+                # while it lasted, about 120 identical lines an hour in logs
+                # kept 30 days.
                 $storageIssue = Test-WorkspaceStorage
-                if ($storageIssue) {
-                    Write-WatchLog "STORAGE WARNING: $storageIssue"
+                if ($storageIssue -and (Test-StorageWarningDue -Message $storageIssue -Now ([datetime]::UtcNow))) {
+                    Write-WatchLog "STORAGE WARNING: $storageIssue; the same warning is logged at most once an hour"
                 }
 
                 # Check 5 was the Hyper-V heartbeat, removed in 6.3.0. It read

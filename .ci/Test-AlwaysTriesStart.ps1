@@ -49,13 +49,21 @@ function Get-FunctionSource {
 $ServiceName   = 'CoworkVMService'
 $ServiceExe    = 'cowork-svc'
 $StartPollMax  = 4
+$ServiceTimeout = 1
 $script:IsAdmin = $true
 
 $script:StartCalls   = 0
 $script:ServiceState = 'Stopped'
+$script:AfterStopState = 'Stopped'
 $script:PrereqBlocked = $true
+$script:KillCalls    = 0
+$script:LogLines     = @()
 
-function Log { param([string]$Message, [string]$Colour = 'White', [switch]$Indent) }
+# The region's helpers (Get-ClaudeServiceOrNull, Get-ClaudeProcessByName,
+# Get-ClaudeErrorText), which Fix's own helpers call.
+. (Join-Path $PSScriptRoot 'ClaudeEnv.region.ps1')
+
+function Log { param([string]$Message, [string]$Colour = 'White', [switch]$Indent) $script:LogLines += $Message }
 
 function Test-CoworkServicePrereq {
     return @{
@@ -69,11 +77,27 @@ function Test-CoworkServicePrereq {
 # [CmdletBinding()] already supplies -ErrorAction. Declaring it again as a
 # parameter throws "A parameter with the name 'ErrorAction' was defined multiple
 # times", which is a harness fault and says nothing about the code under test.
+#
+# No service with the name gives the identity Get-Service gives, measured
+# 2026-11-22 (Get-Service -Name NoSuchSvc_cf): NoServiceFoundForGivenName,
+# ObjectNotFound, ServiceCommandException. Unread gives any other identity,
+# here access denied. Asking the service to stop moves it to AfterStopState.
 function Get-Service {
     [CmdletBinding()]
     param([string]$Name)
-    if ($script:ServiceState -eq 'Absent') { return $null }
-    return [pscustomobject]@{ Name = $Name; Status = $script:ServiceState }
+    if ($script:ServiceState -eq 'Absent') {
+        $ex = New-Object Microsoft.PowerShell.Commands.ServiceCommandException "Cannot find any service with service name '$Name'."
+        $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord($ex, 'NoServiceFoundForGivenName', 'ObjectNotFound', $Name)))
+        return
+    }
+    if ($script:ServiceState -eq 'Unread') {
+        $ex = New-Object System.ComponentModel.Win32Exception 5
+        $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord($ex, 'CouldNotGetServiceInfo', 'PermissionDenied', $Name)))
+        return
+    }
+    $o = [pscustomobject]@{ Name = $Name; Status = $script:ServiceState }
+    $o | Add-Member -MemberType ScriptMethod -Name Stop -Value { $script:ServiceState = $script:AfterStopState }
+    return $o
 }
 
 function Start-Service {
@@ -85,10 +109,15 @@ function Start-Service {
 }
 
 function Stop-Service { [CmdletBinding()] param([string]$Name, [switch]$Force) }
-function Stop-Process { [CmdletBinding()] param([string]$Name, [switch]$Force) }
-function Start-Process { [CmdletBinding()] param($FilePath, $ArgumentList, [switch]$NoNewWindow, [switch]$Wait) }
+function Stop-Process { [CmdletBinding()] param([string]$Name, [switch]$Force) $script:KillCalls++ }
+function Start-Process { [CmdletBinding()] param($FilePath, $ArgumentList, [switch]$NoNewWindow, [switch]$Wait) $script:KillCalls++ }
 function Start-Sleep { [CmdletBinding()] param([int]$Seconds, [int]$Milliseconds) }
 
+# Get-FixServiceState is new in 6.3.1. Lifted when it is there, so the
+# gate also runs against the code from before it, to prove its cases red.
+if ([System.IO.File]::ReadAllText($fixPath) -match '(?m)^function Get-FixServiceState \{') {
+    Invoke-Expression (Get-FunctionSource -Path $fixPath -Name 'Get-FixServiceState')
+}
 Invoke-Expression (Get-FunctionSource -Path $fixPath -Name 'Restart-CoworkService')
 
 # ------------------------------------------------------------------
@@ -134,6 +163,43 @@ $script:StartCalls    = 0
 $result = Restart-CoworkService
 Assert "a start was still attempted"   ($script:StartCalls -ge 1) "StartCalls=$($script:StartCalls)"
 Assert "the restart reports failure"   ($result -eq $false)       "got $result"
+
+# ------------------------------------------------------------------
+Write-Host ""
+Write-Host "--- a service that could not be read" -ForegroundColor Cyan
+# Not "not installed", and not stopped. Until 6.3.1 the first read as
+# "Service not found", and a stop poll that could not read the service took
+# it for stopped, so the start below ran on a service still running.
+$script:PrereqBlocked = $false
+$script:ServiceState  = 'Unread'
+$script:StartCalls    = 0
+$script:KillCalls     = 0
+$script:LogLines      = @()
+$result = Restart-CoworkService
+Assert "unread at the start: not restarted, and said" `
+    ($result -eq $false -and $script:StartCalls -eq 0 -and $script:KillCalls -eq 0 -and
+     ($script:LogLines -join ' | ') -match 'CoworkVMService could not be read \(.*\), so it was not restarted') `
+    "got $result start=$($script:StartCalls) kill=$($script:KillCalls) log=$($script:LogLines -join ' | ')"
+
+$script:ServiceState   = 'Running'
+$script:AfterStopState = 'Unread'
+$script:StartCalls     = 0
+$script:KillCalls      = 0
+$script:LogLines       = @()
+$result = Restart-CoworkService
+Assert "a stop that could not be confirmed: no force-kill, no start, and said" `
+    ($result -eq $false -and $script:StartCalls -eq 0 -and $script:KillCalls -eq 0 -and
+     ($script:LogLines -join ' | ') -match 'Whether CoworkVMService stopped could not be read \(.*\), so cowork-svc was not force-killed') `
+    "got $result start=$($script:StartCalls) kill=$($script:KillCalls) log=$($script:LogLines -join ' | ')"
+
+$script:ServiceState   = 'Absent'
+$script:AfterStopState = 'Stopped'
+$script:StartCalls     = 0
+$script:LogLines       = @()
+$result = Restart-CoworkService
+Assert "a service that is not there: not found, as before" `
+    ($result -eq $false -and $script:StartCalls -eq 0 -and ($script:LogLines -join ' | ') -match '\[!\] Service not found') `
+    "got $result log=$($script:LogLines -join ' | ')"
 
 # ------------------------------------------------------------------
 Write-Host ""
