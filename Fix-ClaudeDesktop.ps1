@@ -76,7 +76,7 @@
     Show what would happen without actually doing anything.
 
 .NOTES
-    Version : 6.3.1
+    Version : 6.3.2
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -1609,7 +1609,7 @@ function Get-W32tmOffsetSeconds {
 $script:ClaudeEnv = Get-ClaudeEnvironment
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion  = "6.3.1"
+$ToolkitVersion  = "6.3.2"
 $ServiceName     = $script:ClaudeEnv.ServiceName
 $ServiceExe      = $script:ClaudeEnv.ServiceProcessName
 $ProcessName     = $script:ClaudeEnv.ProcessName

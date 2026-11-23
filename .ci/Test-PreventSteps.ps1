@@ -1520,6 +1520,11 @@ function New-AdvProp {
     if ($null -ne $Default) { $d = [string[]]@($Default) }
     $vv = $null
     if ($null -ne $Valid) { $vv = [string[]]@($Valid) }
+    # Windows lists every option that has a display name with a display
+    # value, its value's own or its default's; only a hidden one has none.
+    if (-not $DisplayValue -and $DisplayName) {
+        if ($null -ne $v) { $DisplayValue = $v -join ',' } elseif ($null -ne $d) { $DisplayValue = $d -join ',' } else { $DisplayValue = 'Not Present' }
+    }
     return [pscustomobject]@{
         Name                 = $Adapter
         DisplayName          = $DisplayName
@@ -1646,13 +1651,30 @@ function Get-NetAdapterAdvancedProperty {
     }
     return $out
 }
+# Bound as Windows' own is, measured on PowerShell 5.1: InputObject from the
+# pipeline by value, and DisplayValue and RegistryValue, in every parameter
+# set, by property name from the same object, each refusing an empty value.
+# So an option piped in brings its own DisplayValue and RegistryValue, and a
+# hidden option's empty DisplayValue fails the call before it writes, as it
+# failed PowerDownPll and bFwCtrlLPS in 6.3.1. A call that ends up with both
+# writes the RegistryValue: 6.3.1 piped each visible option it turned off,
+# with its old DisplayValue, beside the off RegistryValue, and on the PC this
+# was measured on every one of them read back off. The provider is handed
+# both and cannot tell which one was asked for, so a DisplayValue asked for
+# beside a piped RegistryValue is lost the same way.
 function Set-NetAdapterAdvancedProperty {
-    [CmdletBinding()]
-    param([Parameter(ValueFromPipeline)]$InputObject, [string[]]$RegistryValue, [string]$DisplayValue, [switch]$NoRestart,
-          [Parameter(Position = 0)][string[]]$Name, [string[]]$RegistryKeyword, [string[]]$DisplayName)
+    [CmdletBinding(DefaultParameterSetName = 'ByName')]
+    param(
+        [Parameter(ParameterSetName = 'InputObject (cdxml)', Mandatory, ValueFromPipeline)][ValidateNotNull()]$InputObject,
+        [Parameter(ParameterSetName = 'ByName', Position = 0, ValueFromPipelineByPropertyName)][string[]]$Name,
+        [Parameter(ParameterSetName = 'ByName', ValueFromPipelineByPropertyName)][string[]]$RegistryKeyword,
+        [Parameter(ParameterSetName = 'ByName', ValueFromPipelineByPropertyName)][string[]]$DisplayName,
+        [Parameter(ValueFromPipelineByPropertyName)][ValidateNotNullOrEmpty()][string]$DisplayValue,
+        [Parameter(ValueFromPipelineByPropertyName)][ValidateNotNullOrEmpty()][string[]]$RegistryValue,
+        [switch]$NoRestart)
     process {
         $targets = @()
-        if ($null -ne $InputObject) {
+        if ($PSCmdlet.ParameterSetName -eq 'InputObject (cdxml)') {
             $targets = @($InputObject)
         } else {
             foreach ($n in (Select-FakeNicKey -Keys @($script:Adv.Keys) -Name $Name)) {
@@ -1664,7 +1686,7 @@ function Set-NetAdapterAdvancedProperty {
             }
         }
         foreach ($t in $targets) {
-            if ($PSBoundParameters.ContainsKey('DisplayValue')) {
+            if ($PSBoundParameters.ContainsKey('DisplayValue') -and -not $PSBoundParameters.ContainsKey('RegistryValue')) {
                 [void]$script:NicCalls.Add("Set-AdvDisplay $($t.Name)|$($t.DisplayName)=$DisplayValue NoRestart=$([bool]$NoRestart)")
                 if ($script:AdvDisplayFault) { throw 'The parameter is incorrect.'; return }
                 $t.DisplayValue = $DisplayValue
@@ -1680,8 +1702,10 @@ function Set-NetAdapterAdvancedProperty {
     }
 }
 function Reset-NetAdapterAdvancedProperty {
-    [CmdletBinding()]
-    param([Parameter(ValueFromPipeline)]$InputObject, [switch]$NoRestart, [string[]]$Name, [string[]]$RegistryKeyword)
+    [CmdletBinding(DefaultParameterSetName = 'ByName')]
+    param([Parameter(ParameterSetName = 'InputObject (cdxml)', Mandatory, ValueFromPipeline)][ValidateNotNull()]$InputObject, [switch]$NoRestart,
+          [Parameter(ParameterSetName = 'ByName', Position = 0, ValueFromPipelineByPropertyName)][string[]]$Name,
+          [Parameter(ParameterSetName = 'ByName')][string[]]$RegistryKeyword)
     process {
         [void]$script:NicCalls.Add("Reset-Adv $($InputObject.Name)|$($InputObject.RegistryKeyword) NoRestart=$([bool]$NoRestart)")
         $InputObject.RegistryValue = $null
@@ -1698,12 +1722,14 @@ function Get-NetAdapterPowerManagement {
     return $out
 }
 function Set-NetAdapterPowerManagement {
-    [CmdletBinding()]
-    param([Parameter(ValueFromPipeline)]$InputObject, [Parameter(Position = 0)][string[]]$Name, [switch]$NoRestart,
-          [string]$SelectiveSuspend, [string]$DeviceSleepOnDisconnect, [string]$D0PacketCoalescing)
+    [CmdletBinding(DefaultParameterSetName = 'ByName')]
+    param([Parameter(ParameterSetName = 'InputObject (cdxml)', Mandatory, ValueFromPipeline)][ValidateNotNull()]$InputObject,
+          [Parameter(ParameterSetName = 'ByName', Mandatory, Position = 0, ValueFromPipelineByPropertyName)][string[]]$Name, [switch]$NoRestart,
+          [ValidateNotNullOrEmpty()][string]$SelectiveSuspend, [ValidateNotNullOrEmpty()][string]$DeviceSleepOnDisconnect,
+          [ValidateNotNullOrEmpty()][string]$D0PacketCoalescing)
     process {
         $targets = @()
-        if ($null -ne $InputObject) {
+        if ($PSCmdlet.ParameterSetName -eq 'InputObject (cdxml)') {
             $targets = @($InputObject)
         } else {
             foreach ($n in (Select-FakeNicKey -Keys @($script:Pm.Keys) -Name $Name)) { $targets += $script:Pm[$n] }
@@ -1714,6 +1740,10 @@ function Set-NetAdapterPowerManagement {
                 $val = $PSBoundParameters[$prop]
                 [void]$script:NicCalls.Add("Set-Pm $($t.Name)|$prop=$val NoRestart=$([bool]$NoRestart)")
                 if ($script:PmFault.ContainsKey($prop)) { throw 'The request is not supported.'; return }
+                # $script:PmIgnored: the setting is taken without an error and
+                # nothing changes, as -SelectiveSuspend Disabled did on the
+                # measured Realtek, whose driver has no *SelectiveSuspend.
+                if ($script:PmIgnored.ContainsKey($prop)) { continue }
                 $t.$prop = $val
             }
         }
@@ -1813,6 +1843,7 @@ function Reset-State {
     $script:Pm             = @{}
     $script:PmReadThrows   = @()
     $script:PmFault        = @{}
+    $script:PmIgnored      = @{}
     $script:Services       = @{}
     $script:StartServiceThrows = $false
     $script:ScFails        = $false
@@ -2026,7 +2057,7 @@ if ($hits -eq 1) {
     . ([scriptblock]::Create("function Invoke-W32tm { throw 'Invoke-W32tm was not lifted' }"))
 }
 foreach ($left in @('$GuidPattern', '$UltimateTemplateGuid', '$HighPerfGuid', '$BalancedGuid', '$PowerOptions',
-                    '$NicPowerOff', '$NicHiddenPowerOff', '$script:StatusRank')) {
+                    '$NicPowerOff', '$NicHiddenPowerOff', '$NicPmKeyword', '$script:StatusRank')) {
     $as = Find-TopAssignment $pAst $left
     if ($null -eq $as) { $notLifted += "Prevent:$left"; continue }
     . ([scriptblock]::Create($as.Extent.Text))
@@ -3252,6 +3283,38 @@ Invoke-Section 'Network adapter power saving: the framework idle power-down, hid
     $ok = Restore-PreventUndoItem -Item $pllItem -CreatedPlan $null
     Assert-Case "-Undo puts a hidden option back on its own, without a restart" ($ok -eq $true -and (Get-FakeAdv 'Ethernet' 'PowerDownPll') -eq '1' -and
         ($script:NicCalls -join ',') -eq 'Set-Adv Ethernet|PowerDownPll=1 NoRestart=True') "$ok; $($script:NicCalls -join ',')"
+
+    # The fake binds as Windows does, so a hidden option piped in fails on
+    # its empty DisplayValue, as PowerDownPll and bFwCtrlLPS did in 6.3.1,
+    # and a visible one piped in brings its own RegistryValue beside the
+    # DisplayValue asked for.
+    Reset-State
+    Set-NicMoreFixture
+    $advAll = @(Get-NetAdapterAdvancedProperty -Name 'Ethernet' -AllProperties | Where-Object { $_.RegistryKeyword -eq 'PowerDownPll' })
+    $pipeErr = ''
+    try { $advAll[0] | Set-NetAdapterAdvancedProperty -RegistryValue '0' -NoRestart -ErrorAction Stop } catch { $pipeErr = $_.Exception.Message }
+    Assert-Case "the fake refuses a hidden option piped in, on its empty DisplayValue, as Windows does" (
+        $pipeErr -match "parameter 'DisplayValue'" -and (Get-FakeAdv 'Ethernet' 'PowerDownPll') -eq '1') "$pipeErr | $(Get-FakeAdv 'Ethernet' 'PowerDownPll')"
+    Set-NetAdapterAdvancedProperty -InputObject $advAll[0] -RegistryValue '0' -NoRestart -ErrorAction Stop
+    Assert-Case "and takes it given as -InputObject" ((Get-FakeAdv 'Ethernet' 'PowerDownPll') -eq '0')
+    $eee = @(Get-NetAdapterAdvancedProperty -Name 'Ethernet' | Where-Object { $_.RegistryKeyword -eq '*EEE' })
+    $script:NicCalls = New-Object System.Collections.ArrayList
+    $pipeErr = ''
+    try { $eee[0] | Set-NetAdapterAdvancedProperty -DisplayValue 'Disabled' -NoRestart -ErrorAction Stop } catch { $pipeErr = $_.Exception.Message }
+    Assert-Case "and writes the RegistryValue a visible option piped in brings, not the DisplayValue asked for" (
+        $pipeErr -eq '' -and ($script:NicCalls -join ',') -eq 'Set-Adv Ethernet|*EEE=1 NoRestart=True' -and (Get-FakeAdv 'Ethernet' '*EEE') -eq '1') "$pipeErr | $($script:NicCalls -join ',')"
+
+    # No adapter write in Prevent takes its object from a pipeline.
+    $tok = $null; $perr = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'Prevent-ClaudeIssues.ps1'), [ref]$tok, [ref]$perr)
+    $writers = @('Set-NetAdapterAdvancedProperty', 'Reset-NetAdapterAdvancedProperty', 'Set-NetAdapterPowerManagement')
+    $calls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $writers -contains $n.GetCommandName() }, $true))
+    $piped = @($calls | Where-Object { $_.Parent -is [System.Management.Automation.Language.PipelineAst] -and $_.Parent.PipelineElements.IndexOf($_) -gt 0 } |
+        ForEach-Object { "$($_.GetCommandName()) at line $($_.Extent.StartLineNumber)" })
+    $noIo = @($calls | Where-Object { -not ($_.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'InputObject' }) } |
+        ForEach-Object { "$($_.GetCommandName()) at line $($_.Extent.StartLineNumber)" })
+    Assert-Case "every adapter write in Prevent names its object with -InputObject, and none is piped one" (
+        $calls.Count -eq 6 -and $piped.Count -eq 0 -and $noIo.Count -eq 0) "$($calls.Count) write(s); piped: $($piped -join ', '); without -InputObject: $($noIo -join ', ')"
 }
 
 # =====================================================================
@@ -3315,6 +3378,75 @@ Invoke-Section 'Network adapter power saving: the framework idle power-down, hid
     Assert-Case "a hidden option with no value, and one with two, are left alone" (
         @($script:NicCalls | Where-Object { $_ -match 'PowerDownPll|bFwCtrlLPS' }).Count -eq 0 -and
         (Get-FakeAdv 'WiFi' 'bFwCtrlLPS') -eq '1,2' -and (Get-StepStatus) -eq 'Done') "$(Get-StepStatus): $($script:NicCalls -join ' / ')"
+
+    # Selective suspend on a driver with no *SelectiveSuspend option, as on
+    # the measured Realtek: the cmdlet takes it and nothing changes. Where
+    # the driver framework's idle power-down is off, that is not a failure,
+    # and nothing is left in the record.
+    Reset-State
+    Set-NicMoreFixture
+    $script:PmIgnored['SelectiveSuspend'] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    $notes = Get-StepNotes
+    Assert-Case "selective suspend, which the driver has no option for, with the framework's idle power-down off: Done, not Failed, and not said" (
+        (Get-StepStatus) -eq 'Done' -and $notes -notmatch 'SelectiveSuspend' -and (Get-FakeRegValue $wdfEth 'IdleInWorkingState') -eq 0 -and
+        $script:Pm['Ethernet'].SelectiveSuspend -eq 'Enabled') "$(Get-StepStatus): $notes"
+    Assert-Case "and it is not in the record" ($null -eq (Find-Undo 'NicPowerManagement' "$ethPnp|SelectiveSuspend"))
+
+    # A record an earlier version made of it is dropped: it was never changed.
+    Reset-State
+    Set-NicMoreFixture
+    $script:PmIgnored['SelectiveSuspend'] = $true
+    Add-PreventUndoItem -Kind NicPowerManagement -Key "$ethPnp|SelectiveSuspend" -Original 'Enabled'
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a record of it from an earlier run is dropped" ($null -eq (Find-Undo 'NicPowerManagement' "$ethPnp|SelectiveSuspend") -and (Get-StepStatus) -eq 'Done') "$(Get-StepStatus): $(Get-StepNotes)"
+
+    # With no framework power-down to turn off, it is said, as a warning
+    # that names the option the driver lacks.
+    Reset-State
+    Set-NicMoreFixture
+    (Add-FakeRegKey $wdfEth).Vals.Remove('IdleInWorkingState')
+    $script:PmIgnored['SelectiveSuspend'] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    $notes = Get-StepNotes
+    Assert-Case "with no framework idle power-down: a warning that the driver has no *SelectiveSuspend option, not a failure" (
+        (Get-StepStatus) -eq 'Warning' -and $notes -match 'SelectiveSuspend reads Enabled, and the driver has no \*SelectiveSuspend option' -and
+        $null -eq (Find-Undo 'NicPowerManagement' "$ethPnp|SelectiveSuspend")) "$(Get-StepStatus): $notes"
+
+    # The same for sleep on disconnect, which has no framework stand-in.
+    Reset-State
+    Set-NicMoreFixture
+    $script:Pm['Ethernet'].DeviceSleepOnDisconnect = 'Enabled'
+    $script:PmIgnored['DeviceSleepOnDisconnect'] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    $notes = Get-StepNotes
+    Assert-Case "sleep on disconnect, which the driver has no option for: a warning naming *DeviceSleepOnDisconnect, even with the framework's power-down off" (
+        (Get-StepStatus) -eq 'Warning' -and $notes -match 'DeviceSleepOnDisconnect reads Enabled, and the driver has no \*DeviceSleepOnDisconnect option') "$(Get-StepStatus): $notes"
+
+    # A driver that does list *SelectiveSuspend, where the setting still does
+    # not take: a failure, as before, and the record kept for -Undo.
+    Reset-State
+    Set-NicMoreFixture
+    $script:Adv['Ethernet'] += (New-AdvProp 'Ethernet' '*SelectiveSuspend' 'Selective Suspend' '1' @('0', '1'))
+    $script:PmIgnored['SelectiveSuspend'] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "a driver that lists *SelectiveSuspend, where it does not take: Failed, saying it still reads Enabled" (
+        (Get-StepNotes) -match 'SelectiveSuspend still reads Enabled' -and $null -ne (Find-Undo 'NicPowerManagement' "$ethPnp|SelectiveSuspend")) "$(Get-StepStatus): $(Get-StepNotes)"
+
+    # The driver's options cannot be read: whether it has the option is not
+    # known, so a setting that does not take fails, as before.
+    Reset-State
+    Set-NicMoreFixture
+    $script:AdvReadThrows = @('Ethernet')
+    $script:PmIgnored['SelectiveSuspend'] = $true
+    Step 6 19 'nic' -Name 'Network adapter power saving'
+    Disable-NicPowerSaving
+    Assert-Case "the driver's options cannot be read: selective suspend that does not take fails" ((Get-StepNotes) -match 'SelectiveSuspend still reads Enabled') "$(Get-StepStatus): $(Get-StepNotes)"
 
     Reset-State
     Set-NicMoreFixture
