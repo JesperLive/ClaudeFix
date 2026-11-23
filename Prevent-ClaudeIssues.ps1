@@ -57,7 +57,7 @@
     -Undo also exits 1 while a setting is still in the undo record.
     -WhatIf is refused: this script cannot preview its changes.
 
-    Version : 6.3.1
+    Version : 6.3.2
     Author  : Jesper Driessen
     Licence : MIT
 #>
@@ -1569,7 +1569,7 @@ function Get-W32tmOffsetSeconds {
 $script:ClaudeEnv = Get-ClaudeEnvironment -SkipCacheInventory
 
 # -- Constants -------------------------------------------------------
-$ToolkitVersion   = "6.3.1"
+$ToolkitVersion   = "6.3.2"
 $TaskName         = "ClaudeCoworkWatchdog"
 # The logon-time fix task, retired in 6.3.0. Setup removes it where an older
 # version installed it, and so does -Undo.
@@ -1731,6 +1731,19 @@ $NicPowerOff = [ordered]@{
 $NicHiddenPowerOff = [ordered]@{
     'PowerDownPll' = '0'
     'bFwCtrlLPS'   = '0'
+}
+
+# The driver option, by its standardized keyword, that each power saving
+# setting of Set-NetAdapterPowerManagement is kept in. A driver that lists
+# none for a setting gives the cmdlet nowhere to write it: on the PC this was
+# measured on, the Realtek 2.5GbE driver, rt25cx21, lists no
+# *SelectiveSuspend, and Set-NetAdapterPowerManagement -SelectiveSuspend
+# Disabled returned without an error, wrote nothing to its driver key and
+# read back Enabled.
+$NicPmKeyword = [ordered]@{
+    'SelectiveSuspend'        = '*SelectiveSuspend'
+    'DeviceSleepOnDisconnect' = '*DeviceSleepOnDisconnect'
+    'D0PacketCoalescing'      = '*PacketCoalescing'
 }
 
 # Reads Claude.exe's icon group as a data file and writes it out as an .ico.
@@ -3569,7 +3582,13 @@ function Disable-NicPowerSaving {
            to the value that turns it off, and the hidden ones in
            $NicHiddenPowerOff, each only from its on value.
         5. Selective suspend, sleep on disconnect and D0 packet coalescing,
-           through Set-NetAdapterPowerManagement.
+           through Set-NetAdapterPowerManagement. Each is kept in a driver
+           option, $NicPmKeyword; a driver that has none for a setting
+           leaves the cmdlet nowhere to write it, so a setting that does not
+           take there is not a failure: nothing is recorded, and it is a
+           warning. Selective suspend there is not even that where step 2
+           turned the framework's idle power-down off: that is the switch a
+           driver built on the framework is powered down by while idle.
 
         Adapters that are not physical have the first switch too: hidden
         ones, such as the Wi-Fi Direct virtual adapters that a Wi-Fi driver
@@ -3666,8 +3685,10 @@ function Disable-NicPowerSaving {
             #    never created.
             $wdfKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$pnp\Device Parameters\WDF"
             $idle = Get-RegistryValue -Path $wdfKey -Name 'IdleInWorkingState'
+            $idleOff = $false
             if ($idle -is [int]) {
                 $res = Write-RecordedDword -Path $wdfKey -Name 'IdleInWorkingState' -Value 0
+                if ($res -eq 'Done' -or $res -eq 'Unchanged') { $idleOff = $true }
                 if ($res -eq 'Done') {
                     $wrote = $true
                     $null = $changed.Add("the driver framework may no longer power it down while the PC is running (IdleInWorkingState 0)")
@@ -3705,8 +3726,10 @@ function Disable-NicPowerSaving {
 
             # 4. The driver's own power saving options
             $props = @()
+            $propsRead = $false
             try {
                 $props = @(Get-PreventNicAdvanced -Name $nic.Name)
+                $propsRead = $true
             } catch {
                 $null = $failed.Add("could not read the driver's options: $($_.Exception.Message)")
             }
@@ -3731,7 +3754,14 @@ function Disable-NicPowerSaving {
                 if (-not $shown) { $shown = $kw }
                 Add-PreventUndoItem -Kind NicAdvanced -Key "$pnp|$kw" -Original $orig
                 try {
-                    $p | Set-NetAdapterAdvancedProperty -RegistryValue $off -NoRestart -ErrorAction Stop
+                    # The option is given as -InputObject, never piped: piped,
+                    # it also binds its own DisplayValue and RegistryValue by
+                    # name, and a hidden option's empty DisplayValue fails the
+                    # cmdlet before it writes. Until 6.3.2 that failed every
+                    # hidden option, PowerDownPll and bFwCtrlLPS among them,
+                    # with "Cannot validate argument on parameter
+                    # 'DisplayValue'".
+                    Set-NetAdapterAdvancedProperty -InputObject $p -RegistryValue $off -NoRestart -ErrorAction Stop
                     $wrote = $true
                     $chk = @(Get-PreventNicAdvanced -Name $nic.Name | Where-Object { $_.RegistryKeyword -eq $kw })
                     $now = @()
@@ -3766,14 +3796,30 @@ function Disable-NicPowerSaving {
                     try {
                         $splat = @{ NoRestart = $true; ErrorAction = 'Stop' }
                         $splat[$prop] = 'Disabled'
-                        $pm | Set-NetAdapterPowerManagement @splat
-                        $wrote = $true
+                        Set-NetAdapterPowerManagement -InputObject $pm @splat
                         $pmNow = ''
                         $pm2 = @(Get-PreventNicPower -Name $nic.Name)
                         if ($pm2.Count -gt 0) { $pmNow = [string]$pm2[0].$prop }
+                        $pmKw = [string]$NicPmKeyword[$prop]
                         if ($pmNow -eq 'Disabled') {
+                            $wrote = $true
                             $null = $changed.Add("$prop off")
+                        } elseif ($propsRead -and @($props | Where-Object { [string]$_.RegistryKeyword -eq $pmKw }).Count -eq 0) {
+                            # The driver has no option for it, so nothing was
+                            # written: there is nothing to put back, and a
+                            # record an earlier run made of it goes too. For
+                            # selective suspend that is not a failure where the
+                            # driver framework's idle power-down is off (step 2
+                            # above): a driver built on the framework is
+                            # powered down while idle by that alone, and
+                            # Windows' reading of selective suspend does not
+                            # show it. Anywhere else it is said.
+                            Clear-PreventUndoItem -Kind NicPowerManagement -Key "$pnp|$prop"
+                            if ($prop -ne 'SelectiveSuspend' -or -not $idleOff) {
+                                $null = $warned.Add("$prop reads $pmNow, and the driver has no $pmKw option for Windows to turn it off with")
+                            }
                         } else {
+                            $wrote = $true
                             $null = $failed.Add("$prop still reads $pmNow")
                         }
                     } catch {
@@ -4029,9 +4075,10 @@ function Restore-PreventUndoItem {
             }
             $want = ConvertTo-StringArray $orig
             if ($want.Count -eq 0) {
-                $p[0] | Reset-NetAdapterAdvancedProperty -NoRestart -ErrorAction Stop
+                Reset-NetAdapterAdvancedProperty -InputObject $p[0] -NoRestart -ErrorAction Stop
             } else {
-                $p[0] | Set-NetAdapterAdvancedProperty -RegistryValue $want -NoRestart -ErrorAction Stop
+                # -InputObject, not piped: see Disable-NicPowerSaving.
+                Set-NetAdapterAdvancedProperty -InputObject $p[0] -RegistryValue $want -NoRestart -ErrorAction Stop
             }
             Log "$($nic.Name): $kw put back" -Colour Green -Indent
             Add-StepResult -Status Done -Reboot
@@ -4056,7 +4103,7 @@ function Restore-PreventUndoItem {
             if ($pmNow.Count -eq 0) { throw "Windows lists no power management settings for $($nic.Name)" }
             $splat = @{ NoRestart = $true; ErrorAction = 'Stop' }
             $splat[$prop] = [string]$orig
-            $pmNow[0] | Set-NetAdapterPowerManagement @splat
+            Set-NetAdapterPowerManagement -InputObject $pmNow[0] @splat
             Log "$($nic.Name): $prop put back to $orig" -Colour Green -Indent
             Add-StepResult -Status Done -Reboot
             return $true
@@ -4441,7 +4488,10 @@ if ($Undo) {
                 foreach ($dn in @('Wake on Magic Packet', 'Wake on Pattern Match')) {
                     foreach ($wp in @($advAll | Where-Object { [string]$_.DisplayName -eq $dn })) {
                         if ([string]$wp.DisplayValue -eq 'Disabled') {
-                            $wp | Set-NetAdapterAdvancedProperty -DisplayValue 'Enabled' -NoRestart -ErrorAction Stop
+                            # -InputObject, not piped: piped, the option's own
+                            # RegistryValue, the off one, is bound beside the
+                            # DisplayValue asked for.
+                            Set-NetAdapterAdvancedProperty -InputObject $wp -DisplayValue 'Enabled' -NoRestart -ErrorAction Stop
                         }
                     }
                 }

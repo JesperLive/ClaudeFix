@@ -8,6 +8,55 @@ the one the release title claimed, not something the tag encodes.
 From 6.0.0 onward there is one version for the whole toolkit, and tags are
 semver. The old tags stay where they are.
 
+## [6.3.2] - 2026-11-23
+
+Prevent's step 6, network adapter power saving, no longer fails on the
+Realtek drivers it was written for. Run `Prevent-ClaudeIssues.bat` again,
+then restart Windows.
+
+### Fixed
+
+- The hidden Realtek options are turned off.
+
+  `PowerDownPll` (Ethernet) and `bFwCtrlLPS` (Wi-Fi) failed with "Cannot
+  validate argument on parameter 'DisplayValue'. The argument is null or
+  empty." Each option was piped to `Set-NetAdapterAdvancedProperty`, which
+  binds the piped option's own DisplayValue and RegistryValue by name, and a
+  hidden option has no display value, so the cmdlet refused it before it
+  wrote anything. Every adapter write now names its option with
+  `-InputObject`. The same binding made `-Undo`'s turning wake back on, for
+  adapters a version before 6.3.0 touched, send the off value it read beside
+  the `Enabled` it asked for; that write names its option the same way.
+
+- Selective suspend on a driver that has no option for it.
+
+  On the Realtek 2.5GbE driver, `rt25cx21`, `Set-NetAdapterPowerManagement
+  -SelectiveSuspend Disabled` returns without an error and writes nothing:
+  the driver has no `*SelectiveSuspend` option to write it to, and Windows
+  goes on reading it as `Enabled`. Step 6 failed with "SelectiveSuspend still
+  reads Enabled". Such a driver is powered down while idle by the driver
+  framework's own switch, `IdleInWorkingState`, which step 6 already turns
+  off, and its selective suspend reading does not follow that switch. A
+  setting that does not take on a driver with no option for it is now left
+  as it is, with nothing recorded for `-Undo` and a record an earlier run
+  made of it dropped, and the step warns that the driver has no option for
+  it; for selective suspend it says nothing where `IdleInWorkingState` is
+  off. A driver that has the option and does not take the setting still
+  fails the step.
+
+### Tests
+
+- The test stand-ins for `Set-NetAdapterAdvancedProperty`,
+  `Reset-NetAdapterAdvancedProperty` and `Set-NetAdapterPowerManagement` now
+  bind their parameters as Windows' own do, measured on PowerShell 5.1 from
+  the cmdlets' own parameter blocks: a hidden option piped in fails on its
+  empty DisplayValue, and a visible one brings its RegistryValue. Visible
+  options in the test adapters carry a display value, as Windows lists them.
+  A check fails if any adapter write in Prevent is piped or does not name
+  its option with `-InputObject`. Seven cases cover selective suspend and
+  sleep on disconnect on a driver with no option for them. 850 cases in
+  Prevent's steps, up from 839; run against 6.3.1, 28 fail.
+
 ## [6.3.1] - 2026-11-23
 
 A read that fails is no longer taken as an answer. Many of the toolkit's reads
