@@ -413,9 +413,13 @@ if ($swapped) {
         Assert-Case "an empty list before the kill: hcsdiag answered" `
             ($r -eq 0 -and $script:LastHcsListOk -eq $true) "got $r, LastHcsListOk $($script:LastHcsListOk)"
     } finally {
+        # A fake that was never made is the one way this fails, and then
+        # there is nothing to remove.
         Remove-Item Function:\Invoke-HcsDiagMissing -ErrorAction SilentlyContinue
     }
 }
+# Clean-up of this script's stand-in folder: every case is counted by
+# now, and a folder left in %TEMP% changes nothing.
 Remove-Item -LiteralPath $standDir -Recurse -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------
@@ -445,6 +449,12 @@ if ($workerDef -and $exitedDef) {
             if ($this.Throws) { throw 'Access is denied' }
             return $this.Exited
         }
+        # As a Process: the getter's method throws where the getter reads as
+        # nothing (measured 2026-11-23). Test-WorkerExited asks the method.
+        $o | Add-Member -MemberType ScriptMethod -Name get_HasExited -Value {
+            if ($this.Throws) { throw 'Access is denied' }
+            return $this.Exited
+        }
         $o | Add-Member -MemberType ScriptMethod -Name Kill -Value {
             $script:Kills += $this.Id
             if ($this.Killable) { $this.Exited = $true }
@@ -460,8 +470,11 @@ if ($workerDef -and $exitedDef) {
         return $o
     }
     function Reset-Workers {
-        param([object[]]$Cim = @(), [object[]]$Procs = @(), [string[]]$Seen = @(), [switch]$HcsKillWorks, [bool]$Admin = $true)
+        param([object[]]$Cim = @(), [object[]]$Procs = @(), [string[]]$Seen = @(), [switch]$HcsKillWorks, [bool]$Admin = $true,
+            [switch]$LookupDenied, [switch]$CimFails)
         $script:FakeCim  = @($Cim)
+        $script:LookupDenied = [bool]$LookupDenied
+        $script:CimFails = [bool]$CimFails
         $script:FakeProcs = @{}
         foreach ($fp in $Procs) { $script:FakeProcs[[int]$fp.Id] = $fp }
         $script:CoworkGuidsSeen = @{}
@@ -475,12 +488,38 @@ if ($workerDef -and $exitedDef) {
         $script:Slept    = 0
     }
     $workerResult = & {
-        function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) $null = $ClassName, $Filter, $ErrorAction; return $script:FakeCim }
+        function Get-CimInstance {
+            [CmdletBinding()]
+            param($ClassName, $Filter)
+            $null = $ClassName, $Filter
+            if ($script:CimFails) {
+                $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord(
+                    (New-Object System.UnauthorizedAccessException 'Access denied'),
+                    'HRESULT 0x80041003,Microsoft.Management.Infrastructure.CimCmdlets.GetCimInstanceCommand', 'PermissionDenied', $null)))
+                return
+            }
+            return $script:FakeCim
+        }
+        # The errors Get-Process gives. No process with the id, measured
+        # 2026-11-22 with Get-Process -Id 999999: id NoProcessFoundForGivenId,
+        # category ObjectNotFound, ProcessCommandException. A process that
+        # cannot be opened gives any other identity, here access denied.
         function Get-Process {
-            param([int]$Id, $ErrorAction)
-            $null = $ErrorAction
+            [CmdletBinding()]
+            param([int]$Id)
+            if ($script:LookupDenied) {
+                $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord(
+                    (New-Object System.ComponentModel.Win32Exception 5),
+                    'CouldNotOpenProcess', 'PermissionDenied', $Id)))
+                return
+            }
             $fp = $script:FakeProcs[$Id]
-            if ($null -eq $fp -or $fp.Exited) { throw "Cannot find a process with the process identifier $Id." }
+            if ($null -eq $fp -or $fp.Exited) {
+                $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord(
+                    (New-Object Microsoft.PowerShell.Commands.ProcessCommandException "Cannot find a process with the process identifier $Id."),
+                    'NoProcessFoundForGivenId', 'ObjectNotFound', $Id)))
+                return
+            }
             return $fp
         }
         function Invoke-HcsDiag {
@@ -562,6 +601,20 @@ if ($workerDef -and $exitedDef) {
         $res['exited-same'] = Test-WorkerExited -Held $noHandle -ProcessId 40 -StartTime $started
         Reset-Workers
         $res['exited-none'] = Test-WorkerExited -Held $noHandle -ProcessId 40 -StartTime $started
+        # A lookup that is refused is not "no process": not exited, and said.
+        Reset-Workers -LookupDenied
+        $res['exited-denied'] = "$(Test-WorkerExited -Held $noHandle -ProcessId 40 -StartTime $started)|$($script:LogLines -join ' | ')"
+
+        # A worker that could not be opened is left alone, counted left, and said.
+        Reset-Workers -Cim $cimA -Procs (New-FakeWorker -Id 40 -StartTime $started) -Seen $guidA -HcsKillWorks -LookupDenied
+        $r = Stop-HungCoworkWorker
+        $res['denied'] = "$($r.Stopped)/$($r.Left)|$($script:HcsKills -join ',')|$($script:Kills -join ',')|$($script:LogLines -join ' | ')"
+
+        # The worker list could not be read: it throws, and nothing is touched.
+        Reset-Workers -Cim $cimA -Procs (New-FakeWorker -Id 40 -StartTime $started) -Seen $guidA -HcsKillWorks -CimFails
+        $cimThrew = ''
+        try { $null = Stop-HungCoworkWorker } catch { $cimThrew = "$_" }
+        $res['cimfails'] = "$cimThrew|$($script:HcsKills -join ',')|$($script:Kills -join ',')|$($script:LogLines -join ' | ')"
 
         # -WhatIf touches nothing.
         Reset-Workers -Cim $cimA -Procs (New-FakeWorker -Id 40 -StartTime $started) -Seen $guidA -HcsKillWorks
@@ -593,6 +646,15 @@ if ($workerDef -and $exitedDef) {
     Assert-Case "no handle, the PID now a later process: exited" ($w['exited-reused'] -eq $true) "got $($w['exited-reused'])"
     Assert-Case "no handle, the same process still there: not exited" ($w['exited-same'] -eq $false) "got $($w['exited-same'])"
     Assert-Case "no handle, no process with the PID: exited" ($w['exited-none'] -eq $true) "got $($w['exited-none'])"
+    # Until 6.3.1 any error from the lookup read as "exited", and an
+    # unopenable worker as "had exited before it was stopped".
+    Assert-Case "no handle, the lookup refused: not exited, and said" `
+        ($w['exited-denied'] -match '^False\|\[!\] Whether vmwp\.exe PID 40 has exited could not be read') "got $($w['exited-denied'])"
+    Assert-Case "a worker that could not be opened: left alone, counted left, and said" `
+        ($w['denied'] -match '^0/1\|\|\|\[!\] vmwp\.exe PID 40 could not be opened \(.*\), so it was left alone' -and
+         $w['denied'] -notmatch 'had exited') "got $($w['denied'])"
+    Assert-Case "the worker list could not be read: thrown, nothing touched" `
+        ($w['cimfails'] -match '^the VM worker processes could not be listed \(.*Access denied.*\), so none were stopped\|\|\|$') "got $($w['cimfails'])"
     Assert-Case "-WhatIf touches nothing" ($w['whatif'] -eq '0/0||') "got $($w['whatif'])"
 }
 
@@ -651,7 +713,23 @@ function Get-DstFile {
     }
 }
 function Get-ChildItem { $script:DstFile }
-function Get-Item { $script:DstFile }
+# Since 6.3.1 the region reads the projects folder and each VM log through
+# Get-ClaudeItemOrNull, so this fake answers as Get-Item does: the folder,
+# the one log, and for anything else the error Get-Item writes for a path
+# with nothing there (PathNotFound, ObjectNotFound, ItemNotFoundException,
+# measured 2026-11-22).
+function Get-Item {
+    [CmdletBinding()]
+    param([string]$LiteralPath, [switch]$Force)
+    $null = $Force
+    if ($LiteralPath -eq (Join-Path $dstRoot 'projects')) {
+        return [pscustomobject]@{ FullName = $LiteralPath; PSIsContainer = $true }
+    }
+    if ($LiteralPath -eq (Join-Path $dstRoot 'coworkd.log')) { return $script:DstFile }
+    $ex = New-Object System.Management.Automation.ItemNotFoundException "Cannot find path '$LiteralPath' because it does not exist."
+    $PSCmdlet.WriteError((New-Object System.Management.Automation.ErrorRecord($ex, 'PathNotFound',
+        [System.Management.Automation.ErrorCategory]::ObjectNotFound, $LiteralPath)))
+}
 try {
     $script:DstFile = Get-DstFile -UtcMinutes 20 -LocalMinutes 80
     Assert-Case "transcript 20 min old (80 by the local clock): recent" (Test-ClaudeCodeTranscriptRecent -Minutes 35)
@@ -663,6 +741,8 @@ try {
 } finally {
     Remove-Item Function:\Get-ChildItem
     Remove-Item Function:\Get-Item
+    # Clean-up: a variable that is not set, the one way the first fails, is
+    # what it is for, and a folder left in %TEMP% changes nothing.
     if ($savedCfgDir) { $env:CLAUDE_CONFIG_DIR = $savedCfgDir } else { Remove-Item Env:\CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $dstRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -748,6 +828,8 @@ if (Test-Path $script:WatchLogFile) {
     Assert-Case "the brace message reached the log intact" ($written -match [regex]::Escape($braceMsg))
     Assert-Case "no UTF-8 BOM in the watch log" `
         (-not ((([System.IO.File]::ReadAllBytes($script:WatchLogFile))[0] -eq 0xEF)))
+    # Clean-up of this script's own temp log: both cases are counted, and a
+    # file left in %TEMP% changes nothing.
     Remove-Item $script:WatchLogFile -Force -ErrorAction SilentlyContinue
 } else {
     Assert-Case "watch log was created" $false "file missing"
